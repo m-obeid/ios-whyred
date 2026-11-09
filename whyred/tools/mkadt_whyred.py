@@ -44,8 +44,20 @@ def prune(n):
 EMMC, EMMC_SIZE = 0x0c0c4000, 0x1000
 
 
+def set_canvas(n, w, h):
+    for c in n.children:
+        if c.name == 'disp0':
+            c.props = [(k, f, mkadt.u32(w) if k == 'canvas-width' else mkadt.u32(h) if k == 'canvas-height' else v)
+                       for k, f, v in c.props]
+        set_canvas(c, w, h)
+
+
 def build():
     root = prune(mkadt.build(highmem=True))
+    # WHYRED_NATIVE=1 (with boot-arg sweetfb_native=1): iOS renders the real 1080x2160 panel instead of
+    # the iPhone X canvas (1125x2436), whose centered crop hides the status bar and home indicator.
+    if os.environ.get('WHYRED_NATIVE'):
+        set_canvas(root, mkadt.FB_W, mkadt.FB_H)
     props = [
         ('AAPL,phandle', mkadt.u32(900)),
         ('compatible', mkadt.cstr('qcom,sdhci-msm-v5')),
