@@ -141,6 +141,21 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   date "Wednesday, December 31" (no RTC), live clock, camera shortcut. Clock drawn red over a black
   wallpaper. CPU rendering (no GPU), console text still on.
 
+## USB networking from XNU (2026-11-09)
+
+- Kernel: CI run 42699162243 (patch 0963: whyred USB constants, real dcache ops for eMMC and USB DMA).
+- sweetusb=1 report (cache test root, no disp0): GDSC usb30_prim 0xa0222000 on, all 7 clocks on
+  (master 0x2000c221 ...), DWC3 GSNPSID 0x5533300a (3.00a), GCTL 0x..2000 device mode, DALEPENA 0xf,
+  DCTL run/stop clear, ABL event buffer at 0x9ad74000. QUSB2 PLL locked (0x38 bit 5), TUNE1 0xf8,
+  TUNE2 0xb3, POWERDOWN 0x22, TEST1 0x04 (8-bit registers read byte-replicated).
+- sweetusb=2: the laptop enumerates 1209:0001 (CDC-ECM) 38 s after fastboot boot, MAC
+  02:00:5e:77:ee:01. NetworkManager profile "whyred-usb" (static 192.168.7.1/24, matched by MAC)
+  configures it without sudo. ping 192.168.7.2: 5/5, 1-2 ms.
+- Live kernel log: udp/5140 on 192.168.7.1, read with whyred/tools/udplog.py (no netcat installed).
+- whyred/tools/whyred-init.S (cache test root) reboots after 60 s; Linux is back ~100 s after boot.
+- Display boots: the console moves into AppleCLCD's double buffer, so lines after that only show on
+  frame flips. CTL0 layer0 0x1000005 top 0x20: ABL scans VIG0 out through CTL0 to INTF1.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
