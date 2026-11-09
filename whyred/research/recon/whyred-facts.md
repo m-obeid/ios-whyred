@@ -156,6 +156,20 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Display boots: the console moves into AppleCLCD's double buffer, so lines after that only show on
   frame flips. CTL0 layer0 0x1000005 top 0x20: ABL scans VIG0 out through CTL0 to INTF1.
 
+## SSH into iOS (2026-11-10)
+
+- Root image: ios16-root.img + whyred/tools/add-ssh.sh (palera1n rootful Procursus bootstrap 1800, dropbear
+  2020.81 + libtomcrypt1/libtommath1, root key = laptop id_ed25519.pub), pushed (sha256 a3538b0b...).
+  Snapshot of the previous phone copy: whyred/ipsw/iosroot-snapshot-20261109.img (sha256 85c55e19...).
+- launchd only starts compiled-list jobs keyed under /System/Library: the dropbear job is
+  /System/Library/LaunchDaemons/com.whyred.dropbear.plist (first try under /Library/LaunchDaemons never ran).
+- Boot image: whyred/out/xnu-ios-ssh.img = kernel 42699162243 + root-extents + disp0 + boot-args of the
+  userland boot + sweetusb=2.
+- Result: USB net up 39 s after fastboot boot, `ssh root@192.168.7.2` works (try 10, ~70 s):
+  Darwin 22.6.0 xnu-8796.141.3 iPhone10,3, iOS 16.7.16 (20H392), uid 0. 174 processes incl. SpringBoard,
+  backboardd; / is /dev/emmcroot0 (16 GiB, 12 GiB used). First boot of a fresh root sits on the Apple
+  logo for a long time (first-boot migration, load average ~60).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
