@@ -77,6 +77,18 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Pixel bytes in memory: B, G, R, x. That is xRGB8888 as a little-endian word, the same as topaz.
 - ABL moves the DTB (seen at 0x83200000, 385696 bytes) and keeps both memory banks.
 
+## First XNU boot (2026-11-09)
+
+- Kernel: CI run 42669291638 (macos-15-intel, Xcode 16), topaz patches + 0960 (early console at 0x9d400000).
+  No LSE/ldapr in the kernel. arm64 runners were out of capacity, Intel built in 20 min.
+- Image: whyred/mkboot.sh = mkadt_whyred.py ADT (RAM 0xa2000000 + 0xdc000000, no disp0/sweet-ufs)
+  + tools/sweet-init RAM disk (mockfs) + shim m2. 17 MB, fastboot boot works.
+- Boot-args: debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam rd=md0 sweetcpufreq=0 sweetbattery=0
+- Result: shim hands off Silver -> Gold 0x100, XNU early console + kernel log on screen,
+  init runs as PID 1 and prints "SWEET init: still alive" every 5 s.
+- cpus=4 (Gold 0x100-0x103) also reaches PID 1 with the heartbeat. The m2 shim's GIC setup for
+  0x101-0x103 is enough. Image: whyred/out/xnu-boot-cpus4.img.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
