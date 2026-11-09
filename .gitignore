@@ -8,3 +8,10 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+
+# whyred: keep notes and the shim DTB, not raw dumps (live DT and boot.img hold the serial)
+!whyred/research/
+whyred/research/recon/*
+!whyred/research/recon/whyred-facts.md
+!whyred/shim/dtb/
+whyred/shim/out/
