@@ -39,8 +39,18 @@ def prune(n):
     return n
 
 
+# bsd/dev/sweet_emmc.c (patch 0961): SDCC1 host, absolute physical reg like /sweet-ufs.
+EMMC, EMMC_SIZE = 0x0c0c4000, 0x1000
+
+
 def build():
-    return prune(mkadt.build(highmem=True))
+    root = prune(mkadt.build(highmem=True))
+    root.children.append(mkadt.node('sweet-emmc', [
+        ('AAPL,phandle', mkadt.u32(900)),
+        ('compatible', mkadt.cstr('qcom,sdhci-msm-v5')),
+        ('reg', mkadt.u64(EMMC, EMMC_SIZE)),
+    ]))
+    return root
 
 
 if __name__ == '__main__':

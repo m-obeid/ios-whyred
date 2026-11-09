@@ -16,3 +16,4 @@ whyred/research/recon/*
 !whyred/shim/dtb/
 whyred/shim/out/
 whyred/out/
+whyred/backup/

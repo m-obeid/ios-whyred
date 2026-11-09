@@ -2,6 +2,7 @@
 # Build a whyred fastboot image that boots XNU.
 #
 #   whyred/mkboot.sh KERNEL [RAMDISK]          boot with the default boot-args below
+#   whyred/mkboot.sh KERNEL none               no RAM disk (pass rd=emmcroot0 in CMDLINE)
 #   CMDLINE="..." whyred/mkboot.sh KERNEL       override the boot-args
 #   whyred/mkboot.sh --fetch RUN_ID             download the xnu-kernel artifact of a CI run
 #
@@ -31,8 +32,10 @@ if [ ! -f "$RAMDISK" ] && [ "$RAMDISK" = "$OUT/sweet-init" ]; then
 fi
 
 python3 "$ROOT/whyred/tools/mkadt_whyred.py" "$OUT/whyred.adt"
+rdargs=()
+[ "$RAMDISK" = none ] || rdargs=(--ramdisk "$RAMDISK")
 python3 "$ROOT/tools/mkpayload.py" "$KERNEL" "$OUT/whyred.adt" "$OUT/payload.bin" \
-	--cmdline "$CMDLINE" --ramdisk "$RAMDISK"
+	--cmdline "$CMDLINE" "${rdargs[@]}"
 "$ROOT/whyred/shim/build.sh" "$OUT/payload.bin"
 cp "$ROOT/whyred/shim/out/shim-boot.img" "$OUT/xnu-boot.img"
 echo "boot-args: $CMDLINE"
