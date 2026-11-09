@@ -39,7 +39,7 @@ diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,762 @@
 +/*
 + * whyred internal eMMC root device (SDM636 SDCC1, sdhci-msm v5).
 + *
@@ -50,7 +50,12 @@ new file mode 100644
 + *
 + * It finds one GPT partition by name (boot-arg emmcroot=, default "cache") and exposes it
 + * as the BSD disk emmcroot0 (remmcroot0) with the card's 512-byte sectors. Root on it with
-+ * rd=emmcroot0. Read-only.
++ * rd=emmcroot0. If /sweet-emmc has a "root-extents" property (u64 pairs: first sector inside
++ * the partition, sector count), the disk is those extents chained in order instead: a file
++ * that Linux allocated on its ext4 userdata, found with filefrag.
++ *
++ * Writes need boot-arg emmcrw=1. Every write is checked against the extent map again right
++ * before it is issued, so nothing outside the exposed range can be written.
 + *
 + * DMA goes through one physically contiguous allocation (descriptor table and a 1 MiB
 + * bounce buffer). The host is not cache coherent, so caches are maintained around each
@@ -68,6 +73,7 @@ new file mode 100644
 +#include <miscfs/devfs/devfs.h>
 +#include <kern/locks.h>
 +#include <kern/clock.h>
++#include <kern/kalloc.h>
 +#include <machine/machine_routines.h>
 +#include <arm/caches_internal.h>
 +#include <vm/pmap.h>
@@ -114,6 +120,8 @@ new file mode 100644
 +#define CMD_R1(idx)             (((uint32_t)(idx) << 8) | 0x1a)
 +#define CMD_R1B(idx)            (((uint32_t)(idx) << 8) | 0x1b)
 +#define CMD_DATA(idx)           (((uint32_t)(idx) << 8) | 0x3a)
++#define PRESENT_DAT0            (1u << 20)
++#define MAX_EXTENTS             8192
 +
 +#define ADMA_VALID              (1u << 0)
 +#define ADMA_END                (1u << 1)
@@ -141,8 +149,14 @@ new file mode 100644
 +	vm_offset_t dma;
 +	uint64_t dma_pa;
 +	uint32_t rca;
-+	uint64_t first, nsect;          /* partition, in 512-byte sectors */
++	uint64_t first, nsect;          /* exposed disk: partition start, total sectors */
++	uint64_t part_nsect;            /* partition size */
 +	uint64_t card_sectors;          /* last GPT LBA + 1 */
++	uint32_t next;                  /* root-extents: count, and per extent */
++	uint64_t *ext_start;            /* sector inside the partition */
++	uint64_t *ext_len;
++	uint64_t *ext_logical;          /* first logical sector of the extent */
++	bool writable;
 +	int bmajor, cmajor;
 +	dev_t bdev;
 +	bool ready;
@@ -255,9 +269,23 @@ new file mode 100644
 +	printf("SWEET eMMC: card did not return to tran (status 0x%x)\n", st);
 +}
 +
-+/* Read count sectors at lba (absolute) into the bounce buffer. */
++/* Card busy after a write: DAT0 is held low until programming finishes. */
 +static int
-+emmc_read(uint64_t lba, uint32_t count)
++wait_not_busy(void)
++{
++	uint64_t until = deadline_in(XFER_TIMEOUT_NS);
++	while (!(hc_rd(PRESENT) & PRESENT_DAT0)) {
++		if (mach_absolute_time() > until) {
++			return ETIMEDOUT;
++		}
++		delay(10);
++	}
++	return 0;
++}
++
++/* Move count sectors at lba (absolute) between the card and the bounce buffer. */
++static int
++emmc_xfer(uint64_t lba, uint32_t count, bool write)
 +{
 +	uint32_t sts;
 +	if (count == 0 || count > BOUNCE_SIZE / SECTOR || lba + count > se.card_sectors ||
@@ -275,7 +303,7 @@ new file mode 100644
 +		d[n].addr_hi = (uint32_t)(pa >> 32);
 +	}
 +	clean_dcache64((addr64_t)(se.dma_pa + DMA_DESC), (unsigned)(n * sizeof(struct adma_desc)), TRUE);
-+	/* No dirty line may be written back over the incoming data. */
++	/* Reads: no dirty line may be written back over the incoming data. Writes: data to RAM. */
 +	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
 +	__builtin_arm_dsb(0xf);
 +
@@ -291,8 +319,10 @@ new file mode 100644
 +	hc_wr(ADMA_HI, (uint32_t)(desc_pa >> 32));
 +	hc_wr(BLKSZ_CNT, (count << 16) | 0x7000u | SECTOR);
 +	hc_wr(ARG, (uint32_t)lba);
-+	uint32_t mode = TM_DMA | TM_READ | TM_BLKCNT_EN | (count > 1 ? TM_MULTI | TM_AUTO_CMD12 : 0);
-+	hc_wr(XFER_CMD, (CMD_DATA(count > 1 ? 18 : 17) << 16) | mode);
++	uint32_t mode = TM_DMA | TM_BLKCNT_EN | (write ? 0 : TM_READ) |
++	    (count > 1 ? TM_MULTI | TM_AUTO_CMD12 : 0);
++	uint32_t idx = write ? (count > 1 ? 25 : 24) : (count > 1 ? 18 : 17);
++	hc_wr(XFER_CMD, (CMD_DATA(idx) << 16) | mode);
 +
 +	error = wait_int(INT_CMD_DONE, CMD_TIMEOUT_NS, &sts);
 +	if (!error) {
@@ -300,16 +330,73 @@ new file mode 100644
 +		error = wait_int(INT_XFER_DONE, XFER_TIMEOUT_NS, &sts);
 +	}
 +	if (error) {
-+		printf("SWEET eMMC: read of %u at 0x%llx failed: %d status 0x%x adma 0x%x present 0x%x\n",
-+		    count, lba, error, sts, hc_rd(ADMA_ERR), hc_rd(PRESENT));
++		printf("SWEET eMMC: %s of %u at 0x%llx failed: %d status 0x%x adma 0x%x present 0x%x\n",
++		    write ? "write" : "read", count, lba, error, sts, hc_rd(ADMA_ERR), hc_rd(PRESENT));
 +		hc_wr(INTSTS, 0xffffffffu);
 +		recover();
 +		return EIO;
 +	}
 +	hc_wr(INTSTS, INT_XFER_DONE);
 +	__builtin_arm_dsb(0xf);
-+	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++	if (write) {
++		if (wait_not_busy()) {
++			printf("SWEET eMMC: card busy after write at 0x%llx\n", lba);
++			recover();
++			return EIO;
++		}
++	} else {
++		flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++	}
 +	return 0;
++}
++
++static int
++emmc_read(uint64_t lba, uint32_t count)
++{
++	return emmc_xfer(lba, count, false);
++}
++
++/*
++ * Map a logical sector of the exposed disk to a sector inside the partition, and how many
++ * sectors follow it contiguously. Returns false past the end.
++ */
++static bool
++map_sector(uint64_t ls, uint64_t *ps, uint64_t *run)
++{
++	if (ls >= se.nsect) {
++		return false;
++	}
++	if (!se.next) {
++		*ps = ls;
++		*run = se.nsect - ls;
++		return true;
++	}
++	uint32_t lo = 0, hi = se.next;
++	while (hi - lo > 1) {
++		uint32_t mid = (lo + hi) / 2;
++		if (se.ext_logical[mid] <= ls) {
++			lo = mid;
++		} else {
++			hi = mid;
++		}
++	}
++	uint64_t in = ls - se.ext_logical[lo];
++	*ps = se.ext_start[lo] + in;
++	*run = se.ext_len[lo] - in;
++	return true;
++}
++
++/* The only place data goes out: the range must be one mapped run of the exposed disk. */
++static int
++emmc_write_mapped(uint64_t ls, uint32_t count)
++{
++	uint64_t ps, run;
++	if (!se.writable || count == 0 || !map_sector(ls, &ps, &run) || count > run ||
++	    ps + count > se.part_nsect) {
++		printf("SWEET eMMC: refusing write of %u at logical 0x%llx\n", count, ls);
++		return EPERM;
++	}
++	return emmc_xfer(se.first + ps, count, true);
 +}
 +
 +static int
@@ -405,11 +492,49 @@ new file mode 100644
 +			return ENXIO;
 +		}
 +		se.first = first;
-+		se.nsect = last - first + 1;
++		se.part_nsect = last - first + 1;
++		se.nsect = se.part_nsect;
 +		return 0;
 +	}
 +	printf("SWEET eMMC: no GPT partition named \"%s\"\n", want);
 +	return ENOENT;
++}
++
++/* Optional /sweet-emmc root-extents: <u64 start-in-partition, u64 sectors>... */
++static int
++load_extents(DTEntry node)
++{
++	uint64_t const *e = NULL;
++	unsigned int size = 0;
++	if (SecureDTGetProperty(node, "root-extents", (void const **)&e, &size) != kSuccess) {
++		return 0;
++	}
++	uint32_t n = size / 16;
++	if (n == 0 || n > MAX_EXTENTS || size % 16) {
++		printf("SWEET eMMC: bad root-extents (%u bytes)\n", size);
++		return EINVAL;
++	}
++	se.ext_start = (uint64_t *)kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
++	se.ext_len = (uint64_t *)kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
++	se.ext_logical = (uint64_t *)kalloc_data(n * sizeof(uint64_t), Z_WAITOK);
++	if (!se.ext_start || !se.ext_len || !se.ext_logical) {
++		return ENOMEM;
++	}
++	uint64_t total = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		uint64_t start = e[2 * i], len = e[2 * i + 1];
++		if (len == 0 || start >= se.part_nsect || len > se.part_nsect - start) {
++			printf("SWEET eMMC: root extent %u (0x%llx+0x%llx) outside the partition\n", i, start, len);
++			return EINVAL;
++		}
++		se.ext_start[i] = start;
++		se.ext_len[i] = len;
++		se.ext_logical[i] = total;
++		total += len;
++	}
++	se.next = n;
++	se.nsect = total;
++	return 0;
 +}
 +
 +static int
@@ -418,7 +543,7 @@ new file mode 100644
 +	if (!se.ready) {
 +		return ENXIO;
 +	}
-+	return (flags & FWRITE) ? EROFS : 0;
++	return ((flags & FWRITE) && !se.writable) ? EROFS : 0;
 +}
 +
 +static int
@@ -434,14 +559,15 @@ new file mode 100644
 +	caddr_t vaddr = NULL;
 +	uint64_t off = (uint64_t)buf_blkno(bp) * SECTOR;
 +	uint32_t count = buf_count(bp);
-+	uint64_t part_bytes = se.nsect * SECTOR;
++	uint64_t disk_bytes = se.nsect * SECTOR;
++	bool rd = buf_flags(bp) & B_READ;
 +
 +	buf_setresid(bp, count);
-+	if (!(buf_flags(bp) & B_READ)) {
++	if (!rd && !se.writable) {
 +		error = EROFS;
 +		goto done;
 +	}
-+	if (off > part_bytes || count > part_bytes - off) {
++	if (off > disk_bytes || count > disk_bytes - off) {
 +		error = EINVAL;
 +		goto done;
 +	}
@@ -455,15 +581,35 @@ new file mode 100644
 +
 +	lck_mtx_lock(&sweet_emmc_lock);
 +	for (uint32_t done = 0; done < count;) {
-+		uint64_t pos = off + done;
++		uint64_t pos = off + done, ls = pos / SECTOR, ps, run;
 +		uint32_t skip = (uint32_t)(pos % SECTOR);
-+		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		if (!map_sector(ls, &ps, &run)) {
++			error = EINVAL;
++			break;
++		}
++		/* Stay inside one extent and the bounce buffer. */
++		uint64_t room = MIN((uint64_t)BOUNCE_SIZE, run * SECTOR) - skip;
++		uint32_t want = (uint32_t)MIN((uint64_t)(count - done), room);
 +		uint32_t sectors = (skip + want + SECTOR - 1) / SECTOR;
-+		error = emmc_read(se.first + pos / SECTOR, sectors);
++		char *bounce = (char *)(se.dma + DMA_BOUNCE);
++		if (rd) {
++			error = emmc_read(se.first + ps, sectors);
++			if (!error) {
++				memcpy(vaddr + done, bounce + skip, want);
++			}
++		} else {
++			/* Partial sectors at either end: read, merge, write back. */
++			if (skip || ((skip + want) % SECTOR)) {
++				error = emmc_read(se.first + ps, sectors);
++			}
++			if (!error) {
++				memcpy(bounce + skip, vaddr + done, want);
++				error = emmc_write_mapped(ls, sectors);
++			}
++		}
 +		if (error) {
 +			break;
 +		}
-+		memcpy(vaddr + done, (const char *)(se.dma + DMA_BOUNCE) + skip, want);
 +		done += want;
 +		buf_setresid(bp, count - done);
 +	}
@@ -495,7 +641,7 @@ new file mode 100644
 +		*o = se.nsect;
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*f = 0;
++		*f = se.writable;
 +		return 0;
 +	case DKIOCSYNCHRONIZE:
 +	case DKIOCSYNCHRONIZECACHE:
@@ -504,7 +650,7 @@ new file mode 100644
 +		*o = BOUNCE_SIZE / SECTOR;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = 0;
++		*o = se.writable ? BOUNCE_SIZE / SECTOR : 0;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
@@ -540,9 +686,12 @@ new file mode 100644
 +}
 +
 +static int
-+sweet_emmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++sweet_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return EROFS;
++	if (!se.writable) {
++		return EROFS;
++	}
++	return physio(sweet_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)SECTOR);
 +}
 +
 +static const struct bdevsw sweet_emmc_bdevsw = {
@@ -588,6 +737,8 @@ new file mode 100644
 +		return ENXIO;
 +	}
 +	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	uint32_t rw = 0;
++	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
 +
 +	se.regs = ml_io_map(reg[0], reg[1]);
 +	se.gcc = ml_io_map(GCC_SDCC1_PA, 0x1000);
@@ -607,6 +758,9 @@ new file mode 100644
 +	if (!error) {
 +		error = find_partition(want);
 +	}
++	if (!error) {
++		error = load_extents(node);
++	}
 +	lck_mtx_unlock(&sweet_emmc_lock);
 +	if (error) {
 +		return error;
@@ -623,9 +777,12 @@ new file mode 100644
 +	se.bdev = makedev(se.bmajor, 0);
 +	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
 +	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++	/* Only now, with the bounds known, can writes be allowed. */
++	se.writable = (rw == 1);
 +	se.ready = true;
-+	printf("SWEET eMMC: \"%s\": RCA %u, first sector 0x%llx, %llu MiB, read-only, DMA at 0x%llx\n",
-+	    want, se.rca, se.first, se.nsect * SECTOR >> 20, se.dma_pa);
++	printf("SWEET eMMC: \"%s\": RCA %u, first sector 0x%llx, %llu MiB in %u extent(s), %s, DMA at 0x%llx\n",
++	    want, se.rca, se.first, se.nsect * SECTOR >> 20, se.next ? se.next : 1,
++	    se.writable ? "read-write" : "read-only", se.dma_pa);
 +	return 0;
 +}
 +

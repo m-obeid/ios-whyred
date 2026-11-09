@@ -6,6 +6,7 @@
 Overrides topaz's module constants with whyred addresses (whyred/research/recon/whyred-facts.md)
 and drops nodes for hardware whyred lacks. Everything else (identity, /chosen policy) stays topaz's.
 """
+import json
 import os
 import sys
 
@@ -45,11 +46,17 @@ EMMC, EMMC_SIZE = 0x0c0c4000, 0x1000
 
 def build():
     root = prune(mkadt.build(highmem=True))
-    root.children.append(mkadt.node('sweet-emmc', [
+    props = [
         ('AAPL,phandle', mkadt.u32(900)),
         ('compatible', mkadt.cstr('qcom,sdhci-msm-v5')),
         ('reg', mkadt.u64(EMMC, EMMC_SIZE)),
-    ]))
+    ]
+    # File-backed root: extents of the iOS root file inside userdata (tools/extents.py).
+    ext_file = os.environ.get('WHYRED_EXTENTS')
+    if ext_file:
+        ext = json.load(open(ext_file))
+        props.append(('root-extents', mkadt.u64(*[v for pair in ext for v in pair])))
+    root.children.append(mkadt.node('sweet-emmc', props))
     return root
 
 
