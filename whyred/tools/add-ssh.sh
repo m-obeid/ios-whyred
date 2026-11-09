@@ -51,7 +51,8 @@ sudo install -d -m 0700 -o 0 -g 0 "$mnt/private/var/root/.ssh"
 sudo install -m 0600 -o 0 -g 0 "$PUB" "$mnt/private/var/root/.ssh/authorized_keys"
 sudo install -d -m 0755 -o 0 -g 0 "$mnt/private/etc/dropbear" "$mnt/private/var/log"
 
-# launchd on iOS starts daemons from its compiled list, not from /Library/LaunchDaemons.
+# launchd on iOS starts daemons from its compiled list, and only for jobs keyed under
+# /System/Library (a /Library/LaunchDaemons key was ignored on the first boot).
 sudo python3 - "$mnt" <<'EOF'
 import os, plistlib, sys
 root = sys.argv[1]
@@ -62,18 +63,27 @@ job = {
     'KeepAlive': True,
     'UserName': 'root',
     'POSIXSpawnType': 'Interactive',
+    'LimitLoadToSessionType': 'System',
+    'EnableTransactions': False,
     'StandardErrorPath': '/private/var/log/dropbear.log',
 }
-key = '/Library/LaunchDaemons/com.whyred.dropbear.plist'
+key = '/System/Library/LaunchDaemons/com.whyred.dropbear.plist'
+old = '/Library/LaunchDaemons/com.whyred.dropbear.plist'
 path = os.path.join(root, 'System/Library/xpc/launchd.plist')
 st = os.stat(path)
 plist = plistlib.load(open(path, 'rb'))
+plist['LaunchDaemons'].pop(old, None)
 plist['LaunchDaemons'][key] = job
 plistlib.dump(plist, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
 os.chown(path, st.st_uid, st.st_gid)
 os.chmod(path, st.st_mode & 0o7777)
-os.makedirs(os.path.join(root, 'Library/LaunchDaemons'), exist_ok=True)
+for k in (old, key):
+    try:
+        os.remove(os.path.join(root, k.lstrip('/')))
+    except FileNotFoundError:
+        pass
 plistlib.dump(job, open(os.path.join(root, key.lstrip('/')), 'wb'))
+os.chmod(os.path.join(root, key.lstrip('/')), 0o644)
 print('launchd.plist: added', job['Label'], ' '.join(job['ProgramArguments']))
 EOF
 
