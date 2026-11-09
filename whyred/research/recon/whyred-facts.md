@@ -170,6 +170,14 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   backboardd; / is /dev/emmcroot0 (16 GiB, 12 GiB used). First boot of a fresh root sits on the Apple
   logo for a long time (first-boot migration, load average ~60).
 
+- First boot of a fresh root: lock screen after ~17-18 min (uptime). ~15 min of it is lsd building the
+  LaunchServices database while SpringBoard waits; then load average spikes to ~180. Wallpaper (blue
+  gradient) renders, clock drawn red: red/blue channel order still to verify.
+- Speed: a 200k-iteration dash loop takes 8.1 s on iOS (5.5 user, 2.5 sys) vs 0.58 s on the laptop.
+  Suspects: Gold cores at a low clock (no cpufreq under XNU) and kernel emulation of ARMv8.1 LSE/LDAPR
+  used by the iPhone X userland (patch 0081). Compare the same loop under Linux on whyred.
+- iOS has no scp/sftp-server: read files with `ssh ... cat`.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
