@@ -1,12 +1,16 @@
 #!/bin/bash
-# Small HFS+ root for testing the XNU eMMC driver: /sbin/launchd = tools/sweet-init.S, plus /dev.
+# Small HFS+ root for test boots: /sbin/launchd = whyred/tools/whyred-init.S (heartbeat, then a
+# reboot after 60 s so the phone returns to Linux by itself), plus /dev. INIT=... overrides.
 #   sudo whyred/tools/mktestroot.sh [OUT]        (default whyred/out/testroot-hfs.img, 32 MiB)
 # Needs hfsprogs (mkfs.hfsplus, fsck.hfsplus) and root for the loop mount.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${1:-$ROOT/whyred/out/testroot-hfs.img}
-INIT=$ROOT/whyred/out/sweet-init
-[ -f "$INIT" ] || { echo "build $INIT first (whyred/mkboot.sh does it)" >&2; exit 1; }
+INIT=${INIT:-$ROOT/whyred/out/whyred-init}
+if [ ! -f "$INIT" ]; then
+	clang -target arm64-apple-ios16.0 -c "$ROOT/whyred/tools/whyred-init.S" -o "$ROOT/whyred/out/whyred-init.o"
+	python3 "$ROOT/tools/mkinit.py" "$ROOT/whyred/out/whyred-init.o" "$INIT"
+fi
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
 
 rm -f "$OUT"
