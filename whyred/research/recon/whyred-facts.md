@@ -133,6 +133,14 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Next: port SweetFramebuffer/AppleCLCD to the whyred MDP (VIG0 0xc905000, CTL0 0xc902000) or
   to a CPU copy into the splash buffer at 0x9d400000, then give the ADT a disp0 again.
 
+## iOS lock screen on whyred (2026-11-09)
+
+- Kernel: CI run 42692786657 (patch 0962: AppleCLCD/SweetFramebuffer on the MDP5, VIG0 0xc905000,
+  CTL0 0xc902000, INTF 0xc96b000, DSI only with sweetdsi=1). ADT has disp0 again (1125x2436 canvas).
+- Same boot-args as the userland boot. SpringBoard shows the iOS 16 lock screen 60-150 s after boot:
+  date "Wednesday, December 31" (no RTC), live clock, camera shortcut. Clock drawn red over a black
+  wallpaper. CPU rendering (no GPU), console text still on.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
