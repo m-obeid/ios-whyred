@@ -31,8 +31,8 @@ mkadt.FB_W, mkadt.FB_H, mkadt.FB_STRIDE = 1080, 2160, 4320
 mkadt.SWEET_ECID = 0x5748595245440001	# 'WHYRED' + 1, synthetic
 
 # Nodes for SM6225 hardware that whyred does not have at these addresses.
-# disp0 starts AppleCLCD, which writes the topaz MDP/DSI registers (0x5e0xxxx).
-DROP = {'sweet-ufs', 'disp0'}
+# disp0 (AppleCLCD) stays: patch 0962 points it at the whyred MDP5. WHYRED_NODISP=1 drops it.
+DROP = {'sweet-ufs'} | ({'disp0'} if os.environ.get('WHYRED_NODISP') else set())
 
 
 def prune(n):
