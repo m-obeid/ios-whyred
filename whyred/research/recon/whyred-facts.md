@@ -104,6 +104,18 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   boot = part 58, LBA 0x160000, 64 MiB. system = part 61, LBA 0x220000.
   userdata = part 64, LBA 0xdc0000 to 0x747bfde, 52599 MiB.
 
+## XNU root on the eMMC (2026-11-09)
+
+- Kernel: CI run 42679394416 (macos-15-intel, 12.5 min with ccache), patch 0961 (bsd/dev/sweet_emmc.c).
+- Test root: whyred/tools/mktestroot.sh (32 MiB HFSX, /sbin/launchd = sweet-init), flashed with
+  `fastboot flash cache`. The cache backup is whyred/backup/cache-mmcblk0p60.img.gz (sha256 177a543e...).
+  Linux boots fine with it: Halium's f2fs/ext4 mounts of mmcblk0p60 fail and /cache stays unmounted.
+- Boot-args: debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam rd=emmcroot0
+  emmcroot=cache panicreset=60 sweetcpufreq=0 sweetbattery=0
+- Result: `SWEET eMMC: "cache": RCA 2, first sector 0x1a0000, 256 MiB, read-only, DMA at 0xa5fd4000`,
+  `BSD root: emmcroot0`, `hfs: mounted WhyredTest on device b(1, 0)`, root volume unsealed (error 25,
+  expected), init runs as PID 1 from the eMMC.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
