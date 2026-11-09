@@ -65,7 +65,11 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# Exit 23 (some attributes not transferred) is expected: Linux hfsplus refuses chmod on
+	# the second name of a hard link (EOPNOTSUPP). The first name already carries the mode.
+	local rc=0
+	sudo rsync -aH --numeric-ids "$1/" "$2/" || rc=$?
+	[[ $rc == 0 || $rc == 23 ]] || return "$rc"
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
