@@ -30,13 +30,17 @@ mkadt.FB_W, mkadt.FB_H, mkadt.FB_STRIDE = 1080, 2160, 4320
 mkadt.SWEET_ECID = 0x5748595245440001	# 'WHYRED' + 1, synthetic
 
 # Nodes for SM6225 hardware that whyred does not have at these addresses.
-DROP = {'sweet-ufs'}
+# disp0 starts AppleCLCD, which writes the topaz MDP/DSI registers (0x5e0xxxx).
+DROP = {'sweet-ufs', 'disp0'}
+
+
+def prune(n):
+    n.children = [prune(c) for c in n.children if c.name not in DROP]
+    return n
 
 
 def build():
-    root = mkadt.build(highmem=True)
-    root.children = [c for c in root.children if c.name not in DROP]
-    return root
+    return prune(mkadt.build(highmem=True))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,31 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -13,12 +13,15 @@
+ 
+ #if defined(TOPAZ_4K)
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x5c000000;  /* topaz splash */
++#define EARLY_FB_PA 0x5c000000u
+ #else
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++/* whyred splash: 0x9d400000, inside the 32MB block start.s maps at 0x9c000000 */
++#define EARLY_FB_PA 0x9d400000u
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_FB_PA;
+ #endif
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
++#define EARLY_HEIGHT 2160u	/* whyred panel */
+ #define EARLY_STRIDE (4320u / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+@@ -133,7 +136,8 @@
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	/* base maps the 32MB block holding the framebuffer: keep the offset into it. */
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + (EARLY_FB_PA & 0x1ffffffu));
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
