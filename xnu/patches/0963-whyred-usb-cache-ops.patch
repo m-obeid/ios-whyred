@@ -1,0 +1,159 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -32,6 +32,7 @@
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -41,6 +42,12 @@
+ #include <libkern/libkern.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/caches.c: clean_dcache64/flush_dcache64 are no-ops in this kernel (__ARM_COHERENT_IO__) */
++extern void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++extern void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++extern void sweet_usb_probe(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /* GCC SDCC1 branch clocks: bit 31 = CLK_OFF */
+@@ -260,9 +267,9 @@
+ 		d[n].addr_lo = (uint32_t)pa;
+ 		d[n].addr_hi = (uint32_t)(pa >> 32);
+ 	}
+-	clean_dcache64((addr64_t)(se.dma_pa + DMA_DESC), (unsigned)(n * sizeof(struct adma_desc)), TRUE);
++	sweet_dcache_clean(se.dma + DMA_DESC, (unsigned)(n * sizeof(struct adma_desc)));
+ 	/* Reads: no dirty line may be written back over the incoming data. Writes: data to RAM. */
+-	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++	sweet_dcache_flush(se.dma + DMA_BOUNCE, bytes);
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	int error = lines_idle(3);
+@@ -303,7 +310,8 @@
+ 			return EIO;
+ 		}
+ 	} else {
+-		flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++		/* Drop lines the CPU may have speculatively fetched during the transfer. */
++		sweet_dcache_flush(se.dma + DMA_BOUNCE, bytes);
+ 	}
+ 	return 0;
+ }
+@@ -744,6 +752,13 @@
+ 	return 0;
+ }
+ 
++/* USB (bsd/dev/sweet_usb.c) in its own thread: a bus hang there must not stop the root mount. */
++static void
++sweet_emmc_usb_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	sweet_usb_probe();
++}
++
+ /* Root device for rd=emmcroot0 (IOFindBSDRoot). */
+ int sweet_emmc_rootdev(dev_t *dev);
+ 
+@@ -757,6 +772,14 @@
+ 		}
+ 	}
+ 	*dev = se.bdev;
++	static bool usb_started;
++	if (!usb_started) {
++		usb_started = true;
++		thread_t t;
++		if (kernel_thread_start(sweet_emmc_usb_thread, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,8 +39,9 @@
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
++/* whyred (SDM636): GCC size from the DT, CBCR offsets from Linux gcc-sdm660.c */
+ #define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
++#define GCC_SIZE                0x00094000
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+@@ -48,19 +49,20 @@
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
++	{ "master", 0x0f008 },
++	{ "sleep", 0x0f00c },
++	{ "utmi", 0x0f010 },
++	{ "cfg-noc-axi", 0x05018 },
++	{ "aggre-axi", 0x0f03c },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x88018 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
++/* whyred: ssusb@a800000 (dwc3 core size 0xc8d0), qusb@c012000 (QUSB2 v1, 0x180 bytes) */
++#define DWC3_PA                 0x0a800000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
++#define QUSB2_PA                0x0c012000
++#define QUSB2_SIZE              0x00001000
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -124,11 +126,10 @@
+ 	if (phy == 0) {
+ 		return;
+ 	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	/* whyred QUSB2 v1 (Linux phy-qcom-qusb2.c msm8996 layout): PLL_STATUS 0x38 (bit 5 locked),
++	 * PORT_TUNE1/2 0x80/0x84, POWERDOWN 0xb4, TEST1 0xb8. */
++	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x TUNE1 0x%08x TUNE2 0x%08x POWERDOWN 0x%08x TEST1 0x%08x\n",
++	    usb_rd(phy, 0x38), usb_rd(phy, 0x80), usb_rd(phy, 0x84), usb_rd(phy, 0xb4), usb_rd(phy, 0xb8));
+ }
+ 
+ /*
+@@ -164,7 +165,7 @@
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             0x0a8f8800      /* whyred: core + 0xf8800 (dwc3-msm layout, unverified) */
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -248,10 +249,13 @@
+ 	return usb_rd(ud.dwc, off);
+ }
+ 
++/* flush_dcache64 is a no-op in this kernel (__ARM_COHERENT_IO__): do real dc civac. */
++extern void sweet_dcache_flush(vm_offset_t addr, unsigned length);
++
+ static void
+ ud_sync(uint32_t off, uint32_t len)
+ {
+-	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
++	sweet_dcache_flush(ud.dma + off, len);
+ }
+ 
+ static void
