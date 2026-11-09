@@ -28,6 +28,8 @@ uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3);
 uint64_t now(void);
 void delay_ms(uint64_t ms);
 void con_newline(void);
+void con_putc(char c);
+void con_putc_safe(char c);
 void puts_(const char *s);
 void hex(uint64_t v, int digits);
 void dec(int64_t v);
@@ -35,6 +37,9 @@ void kv(const char *k, uint64_t v, int digits);
 uint32_t be32(const volatile uint8_t *p);
 int streq(const volatile uint8_t *a, const char *b);
 const volatile uint8_t *align4(const volatile uint8_t *p);
+
+/* emmc.c */
+void emmc_probe(void);
 
 /* xnu.c */
 int payload_find(uintptr_t dtb, uintptr_t *start, uintptr_t *end);

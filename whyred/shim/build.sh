@@ -3,6 +3,7 @@
 # the same layout as the stock whyred boot.img. Run with: fastboot boot out/shim-boot.img
 # ./build.sh                 diagnostics only (milestone 1)
 # ./build.sh PAYLOAD.bin     boot XNU: the payload (tools/mkpayload.py) becomes the ramdisk
+# EMMC=1 ./build.sh          read-only eMMC probe instead of the diagnostics
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,15 +20,16 @@ mkdir -p out
 [ -f font.h ] || python3 gen_font.py "$FONT"
 
 $CC $CFLAGS -c start.S -o out/start.o
-$CC $CFLAGS -c main.c -o out/main.o
+$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} -c main.c -o out/main.o
 $CC $CFLAGS -c xnu.c -o out/xnu.o
+$CC $CFLAGS -c emmc.c -o out/emmc.o
 
 # The image runs wherever ABL loads it. Only the header's image_size may be absolute.
-abs=$($READELF -r out/main.o out/xnu.o | grep -c ABS64 || true)
+abs=$($READELF -r out/main.o out/xnu.o out/emmc.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 
 $CC $CFLAGS -static -no-pie -T shim.ld -Wl,--build-id=none -Wl,-N -Wl,--no-warn-rwx-segments \
-	out/start.o out/main.o out/xnu.o -o out/shim.elf
+	out/start.o out/main.o out/xnu.o out/emmc.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # Pad to image_size so .bss and the stacks are part of the loaded file.
 size=$((16#$($NM out/shim.elf | awk '$3=="_end"{print $1}')))

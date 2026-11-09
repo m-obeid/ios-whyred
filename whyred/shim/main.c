@@ -127,7 +127,7 @@ void con_newline(void)
 		cy = 0;
 }
 
-static void con_putc(char c)
+void con_putc(char c)
 {
 	if (c == '\n') {
 		con_newline();
@@ -146,6 +146,11 @@ static void con_putc(char c)
 							put_px(x0 + b * SCALE + sx, y0 + r * SCALE + sy, 0xff);
 	}
 	cx++;
+}
+
+void con_putc_safe(char c)
+{
+	con_putc(c >= 0x20 && c < 0x7f ? c : '.');
 }
 
 void puts_(const char *s)
@@ -525,6 +530,19 @@ void shim_main(uint64_t dtb)
 		dec(r);
 		con_newline();
 	} else {
+#ifdef EMMC_PROBE
+		puts_("emmc probe (read-only)");
+		con_newline();
+		con_newline();
+		emmc_probe();
+		con_newline();
+		puts_("reset in ");
+		dec(REBOOT_AFTER_S);
+		puts_(" s (hold vol- for fastboot)");
+		con_newline();
+		delay_ms(REBOOT_AFTER_S * 1000);
+		reboot_to_fastboot();
+#endif
 		puts_("no xnu payload: diagnostics only");
 		con_newline();
 	}

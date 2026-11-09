@@ -89,6 +89,21 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - cpus=4 (Gold 0x100-0x103) also reaches PID 1 with the heartbeat. The m2 shim's GIC setup for
   0x101-0x103 is enough. Image: whyred/out/xnu-boot-cpus4.img.
 
+## eMMC from bare metal (shim probe, 2026-11-09)
+
+- GCC SDCC1 clocks on after ABL: APPS CBCR (0x116004) 0x00004221, AHB CBCR (0x116008) 0x20008001.
+- SDHCI at 0xc0c4000: host version 0x6b02 (spec 3.00), caps 0x742dc8b2 / 0x0000808f (ADMA2, 64-bit).
+  ABL leaves: host ctl 0x0b38 (ADMA2 64-bit, 8-bit bus, 1.8 V power on), clock ctl 0x000f0007
+  (SD clock on), host ctl2 0x0003 (HS200), int enable 0x07ff003f, signal enable 0, CQE off (cqcfg 0, cqver 0x510).
+- Card RCA is 2 (Qualcomm LK convention), not 1. CMD13 -> 0x00000900, state 4 (tran).
+- PIO is broken on this host: after a block the buffer-read-enable flag never clears (4096 extra
+  data-port reads), and Transfer Complete never comes. Use ADMA2 only.
+- ADMA2 (64-bit, 96-bit descriptors, desc address at 0x58/0x5c, transfer mode bit 0) works:
+  CMD17 and CMD18 + auto CMD12. 64 blocks in 1.09 ms (~29 MB/s with overhead).
+- GPT: last LBA 0x747bfde, 64 entries x 128 bytes at LBA 2.
+  boot = part 58, LBA 0x160000, 64 MiB. system = part 61, LBA 0x220000.
+  userdata = part 64, LBA 0xdc0000 to 0x747bfde, 52599 MiB.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
