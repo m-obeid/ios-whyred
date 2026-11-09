@@ -116,6 +116,23 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   `BSD root: emmcroot0`, `hfs: mounted WhyredTest on device b(1, 0)`, root volume unsealed (error 25,
   expected), init runs as PID 1 from the eMMC.
 
+## iOS 16 userland from the eMMC (2026-11-09)
+
+- Root: whyred/tools/build-iosroot.sh (iPhone X 16.7.16 20H392, 16 GiB HFSX, sha256 639fc7ab...),
+  copied by whyred/tools/push-root.sh into /userdata/iosroot.img (fallocate, 11 extents, first sector
+  0x2aa8000 inside userdata). Raw eMMC sectors verified against the image.
+  userdata is ext4 data=journal: check raw sectors after copying, not the copy's exit status.
+- Kernel: CI run 42684503166 (0961 with root-extents and writes). ADT: WHYRED_EXTENTS=whyred/out/root-extents.json.
+- Boot-args: debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress -enable_kprintf_spam rd=emmcroot0
+  emmcroot=userdata emmcrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1
+  wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetbattery=0 panicreset=60
+- Result: launchd and the system daemons run (securityd, cryptexd, symptomsd, dataaccessd, biomed,
+  backupd, webbookmarksd, ...). SpringBoard starts and crashes with SIGTRAP:
+  "failed to find the main CADisplay". Expected: disp0 is not in the ADT, so AppleCLCD /
+  IOMobileFramebuffer never start (they write topaz MDP/DSI registers at 0x5e0xxxx).
+- Next: port SweetFramebuffer/AppleCLCD to the whyred MDP (VIG0 0xc905000, CTL0 0xc902000) or
+  to a CPU copy into the splash buffer at 0x9d400000, then give the ADT a disp0 again.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
