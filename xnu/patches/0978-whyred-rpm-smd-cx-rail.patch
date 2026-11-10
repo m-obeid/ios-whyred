@@ -1,0 +1,253 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6739,6 +6739,233 @@
+ 	}
+ }
+ 
++/*
++ * whyred: a minimal RPM-SMD client, enough to vote one regulator on. The PMIC arbiter refuses
++ * direct writes to pm660 l5 (the WCN3990 vdd-cx-mx), so it goes through the RPM like Linux does:
++ * GLINK over RPM message RAM (Linux qcom_glink_rpm.c: TOC "grt0" at the end of the 28 KB RAM,
++ * FIFOs "ap2r" / "r2ap" with tail and head words in front), intentless, channel "rpm_requests",
++ * doorbell APCS IPC bit 0 (DT rpm-glink mboxes <apcs 0>); then an smd-rpm request
++ * ("req", {msg_id, set, type, id, len} + {key, len, value} pairs).
++ */
++#define RPM_RAM_PA          0x00778000ull
++#define RPM_RAM_SIZE        0x7000u
++#define RPM_TOC_SIZE        256u
++#define RPM_IPC_BIT         0
++
++struct rpm_pipe { volatile uint32_t *tail, *head; volatile uint8_t *fifo; uint32_t len; };
++static struct rpm_pipe rpm_rx, rpm_tx;
++static uint32_t rpm_lcid = 1, rpm_rcid, rpm_msg_id = 1;
++static bool rpm_up;
++
++static void
++rpm_kick(void)
++{
++	mb();
++	*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << RPM_IPC_BIT;
++	mb();
++}
++
++/* Word copies only: message RAM is device memory. Offsets and lengths stay 4-byte aligned. */
++static void
++rpm_copy_out(uint32_t off, const void *src, uint32_t n)
++{
++	const uint32_t *s = (const uint32_t *)src;
++	for (uint32_t i = 0; i < n; i += 4) {
++		*(volatile uint32_t *)(rpm_tx.fifo + (off + i) % rpm_tx.len) = s[i / 4];
++	}
++}
++
++static void
++rpm_copy_in(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t *d = (uint32_t *)dst;
++	for (uint32_t i = 0; i < n; i += 4) {
++		d[i / 4] = *(volatile uint32_t *)(rpm_rx.fifo + (off + i) % rpm_rx.len);
++	}
++}
++
++static bool
++rpm_send(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t total = (hlen + dlen + 7) & ~7u;
++	uint32_t head = *rpm_tx.head, tail = *rpm_tx.tail;
++	uint32_t avail = tail <= head ? rpm_tx.len - head + tail : tail - head;
++	if (total + 8 > avail || hlen % 4 || total > 512) {
++		LOG("rpm: tx full (head %x tail %x len %x)", head, tail, rpm_tx.len);
++		return false;
++	}
++	uint32_t buf[128] = {};
++	memcpy(buf, hdr, hlen);
++	if (dlen) {
++		memcpy((uint8_t *)buf + hlen, data, dlen);
++	}
++	rpm_copy_out(head, buf, total);
++	mb();
++	*rpm_tx.head = (head + total) % rpm_tx.len;
++	rpm_kick();
++	return true;
++}
++
++static void
++rpm_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { (uint32_t)cmd | (uint32_t)p1 << 16, p2 };
++	(void)rpm_send(m, 8, NULL, 0);
++}
++
++/* One message from the RPM, or 0 when nothing arrived within ms. Returns its GLINK command + 1. */
++static int
++rpm_recv(unsigned ms, uint32_t *out, uint32_t max)
++{
++	for (unsigned t = 0; t <= ms * 10; t++) {
++		uint32_t head = *rpm_rx.head, tail = *rpm_rx.tail;
++		uint32_t avail = head >= tail ? head - tail : rpm_rx.len - tail + head;
++		if (avail >= 8) {
++			uint32_t m[2];
++			rpm_copy_in(tail, m, 8);
++			uint16_t cmd = (uint16_t)m[0];
++			uint32_t len = 8;
++			if (cmd == 2) {                              /* OPEN: name follows */
++				len = (8 + m[1] + 7) & ~7u;
++			} else if (cmd == 9 || cmd == 12) {         /* TX_DATA: chunk_size, left_size, data */
++				uint32_t sz[2];
++				rpm_copy_in((tail + 8) % rpm_rx.len, sz, 8);
++				len = (16 + sz[0] + 7) & ~7u;
++			}
++			if (avail < len || len > max * 4) {
++				IODelay(100);
++				continue;
++			}
++			rpm_copy_in(tail, out, len);
++			mb();
++			*rpm_rx.tail = (tail + len) % rpm_rx.len;
++			return cmd + 1;
++		}
++		IODelay(100);
++	}
++	return 0;
++}
++
++static bool
++rpm_open(void)
++{
++	volatile uint8_t *ram = (volatile uint8_t *)ml_io_map(RPM_RAM_PA, RPM_RAM_SIZE);
++	if (ram == NULL || apcs == NULL) {
++		return false;
++	}
++	volatile uint32_t *toc = (volatile uint32_t *)(ram + RPM_RAM_SIZE - RPM_TOC_SIZE);
++	if (toc[0] != 0x67727430) {                         /* "grt0" */
++		LOG("rpm: no TOC (magic %08x)", toc[0]);
++		return false;
++	}
++	for (uint32_t i = 0; i < toc[2] && i < 20; i++) {
++		uint32_t id = toc[3 + 3 * i], off = toc[4 + 3 * i], size = toc[5 + 3 * i];
++		struct rpm_pipe *p = id == 0x61703272 ? &rpm_tx : id == 0x72326170 ? &rpm_rx : NULL;  /* ap2r, r2ap */
++		if (p != NULL && off + size <= RPM_RAM_SIZE) {
++			p->tail = (volatile uint32_t *)(ram + off);
++			p->head = (volatile uint32_t *)(ram + off + 4);
++			p->fifo = ram + off + 8;
++			p->len = size;
++		}
++	}
++	if (rpm_tx.fifo == NULL || rpm_rx.fifo == NULL) {
++		LOG("rpm: FIFOs not in the TOC");
++		return false;
++	}
++	LOG("rpm: tx %x bytes (head %x tail %x), rx %x bytes (head %x tail %x)", rpm_tx.len, *rpm_tx.head,
++	    *rpm_tx.tail, rpm_rx.len, *rpm_rx.head, *rpm_rx.tail);
++	rpm_cmd(0, 1, 0);                                   /* VERSION 1, no features */
++	uint32_t m[64];
++	bool ver = false, ack = false, ropen = false;
++	static const char name[] = "rpm_requests";
++	for (int n = 0; n < 16; n++) {
++		int c = rpm_recv(1000, m, 64);
++		if (c == 0) {
++			break;
++		}
++		uint16_t cmd = (uint16_t)(c - 1), p1 = (uint16_t)(m[0] >> 16);
++		if (cmd == 0) {                                 /* VERSION from the RPM */
++			rpm_cmd(1, 1, 0);
++		}
++		if (cmd == 1 || cmd == 0) {
++			if (!ver) {
++				uint32_t o[2 + 4] = { 2u | (rpm_lcid << 16), sizeof(name) };
++				memcpy(&o[2], name, sizeof(name));
++				(void)rpm_send(o, (8 + sizeof(name) + 3) & ~3u, NULL, 0);   /* OPEN */
++			}
++			ver = true;
++		}
++		if (cmd == 4 && p1 == rpm_lcid) {               /* OPEN_ACK */
++			ack = true;
++		}
++		if (cmd == 2) {                                 /* the RPM opens its side */
++			rpm_rcid = p1;
++			rpm_cmd(4, p1, 0);
++			ropen = true;
++		}
++		LOG("rpm: glink cmd %u p1 %u p2 %u", cmd, p1, m[1]);
++		if (ack && ropen) {
++			break;
++		}
++	}
++	rpm_up = ver && ack;
++	LOG("rpm: version %s, open_ack %s, remote open %s (rcid %u)", ver ? "ok" : "NO", ack ? "ok" : "NO",
++	    ropen ? "yes" : "no", rpm_rcid);
++	return rpm_up;
++}
++
++/* smd-rpm request for one resource and set (0 active, 1 sleep): key/value pairs of 4 bytes */
++static bool
++rpm_request(uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, unsigned pairs)
++{
++	uint32_t p[5 + 2 + 12] = {};
++	uint32_t dlen = pairs * 12, n = 0;
++	p[n++] = 0x00716572;                                /* "req" */
++	p[n++] = 20 + dlen;
++	p[n++] = rpm_msg_id++;
++	p[n++] = set;
++	p[n++] = type;
++	p[n++] = id;
++	p[n++] = dlen;
++	for (unsigned i = 0; i < pairs; i++) {
++		p[n++] = kv[2 * i];
++		p[n++] = 4;
++		p[n++] = kv[2 * i + 1];
++	}
++	uint32_t tx[4] = { 9u | (rpm_lcid << 16), 0, n * 4, 0 };  /* TX_DATA, liid 0 (intentless) */
++	if (!rpm_send(tx, 16, p, n * 4)) {
++		return false;
++	}
++	uint32_t m[64];
++	for (int k = 0; k < 8; k++) {
++		int c = rpm_recv(500, m, 64);
++		if (c == 0) {
++			LOG("rpm: no answer to msg %u", p[2]);
++			return false;
++		}
++		if (c - 1 == 9) {
++			/* m[4..]: "req" header, then {msg_type "msg", len, msg_id, ["err", len, text]} */
++			LOG("rpm: answer: svc %08x len %u type %08x len %u id %u %08x %08x", m[4], m[5], m[6], m[7], m[8], m[9], m[10]);
++			return m[6] == 0x0067736d && m[8] == p[2] && m[9] != 0x00727265;   /* "msg", no "err" */
++		}
++		LOG("rpm: glink cmd %u while waiting", c - 1);
++	}
++	return false;
++}
++
++static void
++wlan_cx_rail_on(void)
++{
++	if (!rpm_open()) {
++		return;
++	}
++	/* pm660_l5: qcom,resource-name "ldoa", qcom,resource-id 5; icnss qcom,vdd-cx-mx-config 848000 */
++	static const uint32_t kv[] = { 0x00007675, 848000, 0x6e657773, 1 };   /* "uv", "swen" */
++	bool a = rpm_request(0, 0x616f646c, 5, kv, 2);       /* "ldoa" active set */
++	bool b = rpm_request(1, 0x616f646c, 5, kv, 2);       /* sleep set */
++	LOG("rpm: ldoa 5 on: active %s, sleep %s", a ? "ok" : "FAILED", b ? "ok" : "FAILED");
++}
++
+ static void
+ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -6761,9 +6988,14 @@
+ 	if (wifi_enabled()) {
+ 		uint8_t en = 0;
+ 		if (whyred_spmi_read(1, 0x4446, &en) == 0 && !(en & 0x80)) {
++			/* direct write first (refused so far: RPM-owned), then the RPM vote */
+ 			int r = whyred_spmi_write(1, 0x4446, (uint8_t)(en | 0x80));
+ 			IODelay(1000);
+-			LOG("rails: pm660 l5 (vdd-cx-mx) on: %d", r);
++			LOG("rails: pm660 l5 (vdd-cx-mx) direct write: %d", r);
++			if (r != 0) {
++				wlan_cx_rail_on();
++				IODelay(2000);
++			}
+ 			wlan_rails_dump("after l5 on");
+ 		}
+ 	}
