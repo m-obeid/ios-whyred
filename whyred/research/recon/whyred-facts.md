@@ -199,6 +199,18 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Result: unlock by swipe and home screen interaction work. Power locks; the backlight stays on because
   whyred's backlight is PM660L WLED (DSI DCS disabled): needs an SPMI-write WLED driver.
 
+## Speed baseline (2026-11-10)
+
+- Linux on whyred: Gold cpufreq 1113600/1401600/1747200/1804800 kHz (schedutil), Silver max 1612800.
+  Pinned to cpu4 at 1.8048 GHz: `dd if=/dev/zero bs=1M count=200 | md5sum` 0.99 s real / 0.68 s user;
+  dash 100k-iteration loop 0.44 s user, 0 sys.
+- iOS (kernel 42729844526, sweetfb_noconsole=1 sweetfb_hz=30, 2 min after boot): md5sum 2.37 s real /
+  1.91 s user / 0.76 sys; dash loop 3.97 s real / 2.69 user / 1.26 sys.
+- So: user CPU time 2.8x slower on md5 (no atomics, no syscalls) -> Gold cores probably at a low OPP
+  (~650 MHz); XNU has no CPU clock driver and SDM660 uses OSM, not cpufreq-hw (topaz's shim fix does not
+  apply). The extra sys time on the dash loop is the ARMv8.1 LSE/LDAPR emulation (patch 0081).
+- USB unplug/replug: patch 0966 (CI run 42729844526) ends active transfers and re-arms ep0 SETUP.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
