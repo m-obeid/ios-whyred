@@ -225,7 +225,7 @@ diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/whyred_spmi.c
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +/*
 + * whyred: read-only PMIC register access over the SPMI arbiter v3 (live DT qcom,spmi@800f000:
 + * core 0x800f000, obsrvr 0x9400000, cnfg 0x800a000, EE 0). One observer channel per APID at
@@ -235,6 +235,7 @@ new file mode 100644
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
