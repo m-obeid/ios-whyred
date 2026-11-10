@@ -346,6 +346,20 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   drained 98 -> 95 % at +166..174 mA raw, charger state 3 (full-on), 38-40 C: the port loses to the
   load at 1804.8 MHz. Fix: sign back to raw positive = discharging; IsCharging needs current in.
 
+## Status bar fixed: whyred_ui.dylib (2026-11-10)
+
+- Idea from danstronics/ios-s9plus-exynos core/userland/src/display_native.c (hooks the provider choice
+  and returns _UIStatusBarVisualProvider_LegacyPhone).
+- whyred/userland/whyred_ui.c, built by build.sh without an SDK (clang + ld64.lld, text stubs for
+  libobjc/libSystem, ad-hoc signed). Installed at /usr/lib/whyred_ui.dylib on the iOS root.
+  Loaded by kern.exec_inject: boot-arg topaz_inject=/usr/lib/whyred_ui.dylib,SpringBoard,Preferences,MobileSafari.
+- Measured: SpringBoard calls the selector on _iOS, _Phone and _Split; _Split returns nil for 360x720 pt
+  (not Fallback) and UIKit draws the rdar placeholder. The dylib wraps +visualProviderSubclassForScreen:
+  visualProviderInfo: on _iOS/_Phone/_Split/_DynamicSplit and turns nil (Split/DynamicSplit) or Fallback
+  into LegacyPhone. Result: iPhone 8 bar with carrier "iPhone", 92 % and the charging bolt (webcam).
+- Battery fix confirmed in the same boot (kernel run 42854797661): 91 % 4234 mV +114 mA charging=1.
+- Default image whyred/out/xnu-ios-fast6.img = kernel 42854797661 + sweetbattery=2 + topaz_inject.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
