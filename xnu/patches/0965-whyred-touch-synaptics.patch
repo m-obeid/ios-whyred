@@ -1,0 +1,596 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_emmc.c			standard
++bsd/dev/sweet_syna.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,8 @@
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/* whyred: panel size from the boot framebuffer (1080x2160), not topaz's 1080x2400. */
++static int sPanelW = 1080, sPanelH = 2400;
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -433,15 +435,21 @@
+ 		return false;
+ 	}
+ 	int native = 0;
++	PE_Video video;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = ((fLogicalW - 1080) / 2) & ~3;           /* as SweetFramebuffer.cpp */
+-	fOffY = (fLogicalH - 2400) / 2;
++	PE_current_console(&video);
++	if (video.v_width > 0 && video.v_height > 0) {
++		sPanelW = (int)video.v_width;
++		sPanelH = (int)video.v_height;
++	}
++	fLogicalW = native ? sPanelW : 1125;
++	fLogicalH = native ? sPanelH : 2436;
++	fOffX = ((fLogicalW - sPanelW) / 2) & ~3;        /* as SweetFramebuffer.cpp */
++	fOffY = (fLogicalH - sPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceHeight", (unsigned long long)((151 * sPanelH / 2400) << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -458,8 +466,8 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > sPanelW - 1 ? sPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > sPanelH - 1 ? sPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -472,8 +480,8 @@
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > sPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > sPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -47,6 +47,7 @@
+ extern void sweet_dcache_flush(vm_offset_t addr, unsigned length);
+ extern void sweet_usb_probe(void);
+ extern void sweet_keys_init(void);
++extern void sweet_syna_init(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -765,6 +766,7 @@
+ sweet_emmc_keys_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	sweet_keys_init();
++	sweet_syna_init();      /* touch: starts its own thread, 20 s later */
+ }
+ 
+ /* Root device for rd=emmcroot0 (IOFindBSDRoot). */
+diff --git a/bsd/dev/sweet_syna.c b/bsd/dev/sweet_syna.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_syna.c
+@@ -0,0 +1,500 @@
++/*
++ * whyred touch: Synaptics TD4310 (TDDI, RMI4) at I2C 0x20 on BLSP1 QUP1 (0xc175000), polled.
++ *
++ * ABL never uses touch, so this enables the BLSP1 AHB vote and the QUP1 I2C clock (XO, div 1),
++ * puts GPIO2/3 on function 3 (blsp_i2c1) and runs the QUP v2 in FIFO mode with tags, the same
++ * sequence as Linux drivers/i2c/busses/i2c-qup.c. The panel shares the touch supply (pm660 L11),
++ * so the chip is powered while the display is on. Reset (GPIO66) and the panel pins are never
++ * touched. RMI4: page 0, PDT scan, F01 (device control) and F12 (2D sensor), objects polled at
++ * 100 Hz from F12 data1 (8 bytes each: type, x lo/hi, y lo/hi, z, wx, wy).
++ *
++ * boot-args: sweetsyna=0 off, 1 log only (default), 2 also report to SweetHID.
++ *            sweetsyna_maxx / sweetsyna_maxy: sensor range (default 1080 / 2160).
++ *            sweetsyna_flip: bit 0 mirror x, bit 1 mirror y, bit 2 swap axes.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_syna_init(void);
++
++/* GCC (gcc-sdm660.c) */
++#define GCC_PA                  0x00100000u
++#define GCC_SIZE                0x00060000u
++#define GCC_BLSP1_AHB_VOTE      0x52004u        /* APCS clock branch enable vote, bit 17 */
++#define GCC_BLSP1_AHB_CBCR      0x17004u
++#define GCC_QUP1_I2C_CBCR       0x19008u
++#define GCC_QUP1_I2C_CMD_RCGR   0x19020u
++#define GCC_QUP1_I2C_CFG_RCGR   0x19024u
++#define CBCR_OFF                (1u << 31)
++
++/* TLMM tiles (pinctrl-sdm660.c): GPIO n config at tile + 0x1000*n, IO at +4 */
++#define TLMM_SOUTH              0x03100000u
++#define TLMM_NORTH              0x03900000u
++
++/* QUP v2 (i2c-qup.c) */
++#define QUP_PA                  0x0c175000u
++#define QUP_CONFIG              0x000
++#define QUP_STATE               0x004
++#define QUP_IO_MODE             0x008
++#define QUP_SW_RESET            0x00c
++#define QUP_OPERATIONAL         0x018
++#define QUP_ERROR_FLAGS         0x01c
++#define QUP_HW_VERSION          0x030
++#define QUP_MX_OUTPUT_CNT       0x100
++#define QUP_OUT_FIFO            0x110
++#define QUP_MX_WRITE_CNT        0x150
++#define QUP_MX_INPUT_CNT        0x200
++#define QUP_MX_READ_CNT         0x208
++#define QUP_IN_FIFO             0x218
++#define QUP_I2C_CLK_CTL         0x400
++#define QUP_I2C_STATUS          0x404
++#define QUP_I2C_MASTER_GEN      0x408
++
++#define ST_RESET                0
++#define ST_RUN                  1
++#define ST_PAUSE                3
++#define ST_VALID                (1u << 2)
++#define ST_MASTER               (1u << 4)
++#define OP_IN_NOT_EMPTY         (1u << 5)
++#define OP_OUT_DONE             (1u << 10)
++#define OP_IN_DONE              (1u << 11)
++#define CFG_I2C                 ((2u << 8) | 7u)        /* mini core I2C, N = 8 bits */
++#define CFG_NO_INPUT            (1u << 7)
++#define CNT_DURING_RUN          (1u << 31)
++#define I2C_ERR_MASK            0x38000fcu
++#define I2C_BUS_ACTIVE          (1u << 8)
++#define CLK_100K                0x0000035du     /* 19.2 MHz: fs_div 93, hs_div 3 */
++
++#define TAG_START               0x81u
++#define TAG_WRITE               0x82u
++#define TAG_WRITE_STOP          0x83u
++#define TAG_READ_STOP           0x87u
++
++#define SYNA_ADDR               0x20u
++#define SYNA_MAX_OBJ            10
++
++static vm_offset_t gcc, qup, tlmm_s, tlmm_n_66, tlmm_n_67;
++static unsigned in_fifo, out_fifo;
++static int syna_mode, syna_chan;
++static uint32_t maxx = 1080, maxy = 2160, flip;
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { uint32_t v = *(volatile uint32_t *)(b + o); __asm__ volatile("dmb oshld" ::: "memory"); return v; }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v) { __asm__ volatile("dmb oshst" ::: "memory"); *(volatile uint32_t *)(b + o) = v; __asm__ volatile("dsb osh" ::: "memory"); }
++
++static void
++sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&syna_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_bits(vm_offset_t b, uint32_t o, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; i++) {
++		if ((rd(b, o) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* ---- clocks and pins ---- */
++
++static bool
++clocks_on(void)
++{
++	printf("WHYRED TOUCH: before: ahb-vote %#x ahb-cbcr %#x qup1-cbcr %#x rcg cmd %#x cfg %#x\n",
++	    rd(gcc, GCC_BLSP1_AHB_VOTE), rd(gcc, GCC_BLSP1_AHB_CBCR), rd(gcc, GCC_QUP1_I2C_CBCR),
++	    rd(gcc, GCC_QUP1_I2C_CMD_RCGR), rd(gcc, GCC_QUP1_I2C_CFG_RCGR));
++	wr(gcc, GCC_BLSP1_AHB_VOTE, rd(gcc, GCC_BLSP1_AHB_VOTE) | (1u << 17));
++	if (!wait_bits(gcc, GCC_BLSP1_AHB_CBCR, CBCR_OFF, 0, 5000)) {
++		printf("WHYRED TOUCH: BLSP1 AHB clock stays off (%#x)\n", rd(gcc, GCC_BLSP1_AHB_CBCR));
++		return false;
++	}
++	wr(gcc, GCC_QUP1_I2C_CFG_RCGR, 0x1);    /* source XO 19.2 MHz, divide by 1 */
++	wr(gcc, GCC_QUP1_I2C_CMD_RCGR, rd(gcc, GCC_QUP1_I2C_CMD_RCGR) | 1u);
++	if (!wait_bits(gcc, GCC_QUP1_I2C_CMD_RCGR, 1u, 0, 5000)) {
++		printf("WHYRED TOUCH: QUP1 I2C RCG update stuck (%#x)\n", rd(gcc, GCC_QUP1_I2C_CMD_RCGR));
++		return false;
++	}
++	wr(gcc, GCC_QUP1_I2C_CBCR, rd(gcc, GCC_QUP1_I2C_CBCR) | 1u);
++	if (!wait_bits(gcc, GCC_QUP1_I2C_CBCR, CBCR_OFF, 0, 5000)) {
++		printf("WHYRED TOUCH: QUP1 I2C clock stays off (%#x)\n", rd(gcc, GCC_QUP1_I2C_CBCR));
++		return false;
++	}
++	printf("WHYRED TOUCH: after: ahb-cbcr %#x qup1-cbcr %#x rcg cfg %#x\n",
++	    rd(gcc, GCC_BLSP1_AHB_CBCR), rd(gcc, GCC_QUP1_I2C_CBCR), rd(gcc, GCC_QUP1_I2C_CFG_RCGR));
++	return true;
++}
++
++static void
++pins(void)
++{
++	printf("WHYRED TOUCH: gpio2 cfg %#x io %#x, gpio3 cfg %#x io %#x, gpio66 cfg %#x io %#x, gpio67 cfg %#x io %#x\n",
++	    rd(tlmm_s, 0x2000), rd(tlmm_s, 0x2004), rd(tlmm_s, 0x3000), rd(tlmm_s, 0x3004),
++	    rd(tlmm_n_66, 0), rd(tlmm_n_66, 4), rd(tlmm_n_67, 0), rd(tlmm_n_67, 4));
++	/* GPIO2 (SDA), GPIO3 (SCL): function 3 = blsp_i2c1, 2 mA, no pull (live DT i2c_1 pins). */
++	wr(tlmm_s, 0x2000, 3u << 2);
++	wr(tlmm_s, 0x3000, 3u << 2);
++}
++
++/* ---- QUP v2 I2C, FIFO mode ---- */
++
++static bool
++qup_state(uint32_t state)
++{
++	if (!wait_bits(qup, QUP_STATE, ST_VALID, ST_VALID, 10000)) {
++		return false;
++	}
++	wr(qup, QUP_STATE, state);
++	return wait_bits(qup, QUP_STATE, ST_VALID | 3u, ST_VALID | state, 10000);
++}
++
++static int
++qup_check(void)
++{
++	uint32_t st = rd(qup, QUP_I2C_STATUS), err = rd(qup, QUP_ERROR_FLAGS);
++	if ((st & I2C_ERR_MASK) || (err & 0x7cu)) {
++		wr(qup, QUP_I2C_STATUS, 0xfffffcu);
++		wr(qup, QUP_ERROR_FLAGS, err);
++		return (st & (1u << 3)) ? 2 : 1;        /* 2 = NACK */
++	}
++	return 0;
++}
++
++static bool
++qup_begin(void)
++{
++	wr(qup, QUP_SW_RESET, 1);
++	if (!wait_bits(qup, QUP_STATE, ST_VALID | 3u, ST_VALID | ST_RESET, 10000)) {
++		return false;
++	}
++	wr(qup, QUP_CONFIG, CFG_I2C);
++	wr(qup, QUP_I2C_MASTER_GEN, 1);         /* v2 tags */
++	if (!wait_bits(qup, QUP_STATE, ST_MASTER, ST_MASTER, 10000)) {
++		return false;
++	}
++	wr(qup, QUP_MX_OUTPUT_CNT, 0);          /* FIFO mode for both directions */
++	wr(qup, QUP_MX_INPUT_CNT, 0);
++	wr(qup, QUP_IO_MODE, 0xc000u);          /* pack/unpack */
++	return true;
++}
++
++/* Push bytes into the output FIFO as little-endian words. */
++static void
++fifo_put(const uint8_t *b, unsigned n)
++{
++	for (unsigned i = 0; i < n; i += 4) {
++		uint32_t w = 0;
++		for (unsigned j = 0; j < 4 && i + j < n; j++) {
++			w |= (uint32_t)b[i + j] << (8 * j);
++		}
++		wr(qup, QUP_OUT_FIFO, w);
++	}
++}
++
++/*
++ * One I2C transfer: write wlen bytes, then (if rlen) a repeated start and read rlen bytes,
++ * with STOP at the end. Returns 0, 1 (bus/QUP error), 2 (NACK) or 3 (timeout).
++ */
++static int
++i2c_xfer(const uint8_t *w, unsigned wlen, uint8_t *r, unsigned rlen)
++{
++	uint8_t buf[40];
++	int err = 3;
++
++	if (wlen + 4 > sizeof(buf) || wlen + 4 > out_fifo || (rlen && rlen + 2 > in_fifo)) {
++		return 1;
++	}
++	if (!qup_begin()) {
++		return 3;
++	}
++
++	/* message 1: START + address, write wlen bytes (STOP only if nothing follows) */
++	buf[0] = TAG_START;
++	buf[1] = (uint8_t)(SYNA_ADDR << 1);
++	buf[2] = rlen ? TAG_WRITE : TAG_WRITE_STOP;
++	buf[3] = (uint8_t)wlen;
++	memcpy(buf + 4, w, wlen);
++	wr(qup, QUP_MX_WRITE_CNT, wlen + 4);
++	wr(qup, QUP_CONFIG, CFG_I2C | CFG_NO_INPUT);
++	if (!qup_state(ST_RUN)) {
++		goto out;
++	}
++	wr(qup, QUP_I2C_CLK_CTL, CLK_100K);
++	if (!qup_state(ST_PAUSE)) {
++		goto out;
++	}
++	fifo_put(buf, wlen + 4);
++	if (!qup_state(ST_RUN)) {
++		goto out;
++	}
++	for (unsigned i = 0; i < 20000; i++) {
++		if ((err = qup_check()) != 0) {
++			goto out;
++		}
++		if (rd(qup, QUP_OPERATIONAL) & OP_OUT_DONE) {
++			break;
++		}
++		delay(1);
++		err = 3;
++	}
++	if (err == 3) {
++		goto out;
++	}
++	wr(qup, QUP_OPERATIONAL, OP_OUT_DONE);
++
++	if (rlen) {
++		/* message 2: repeated START + address|R, read rlen bytes, STOP */
++		if (!qup_state(ST_PAUSE)) {
++			err = 3;
++			goto out;
++		}
++		uint8_t tags[4] = { TAG_START, (uint8_t)((SYNA_ADDR << 1) | 1u), TAG_READ_STOP, (uint8_t)rlen };
++		wr(qup, QUP_MX_WRITE_CNT, CNT_DURING_RUN | 4u);
++		wr(qup, QUP_MX_READ_CNT, CNT_DURING_RUN | (rlen + 2));
++		wr(qup, QUP_CONFIG, CFG_I2C);
++		fifo_put(tags, 4);
++		if (!qup_state(ST_RUN)) {
++			err = 3;
++			goto out;
++		}
++		/* The input carries 2 tag bytes, then the data. */
++		unsigned got = 0, total = rlen + 2;
++		err = 3;
++		for (unsigned i = 0; i < 40000 && got < total; i++) {
++			int e = qup_check();
++			if (e) {
++				err = e;
++				goto out;
++			}
++			if (rd(qup, QUP_OPERATIONAL) & OP_IN_NOT_EMPTY) {
++				uint32_t word = rd(qup, QUP_IN_FIFO);
++				for (unsigned j = 0; j < 4 && got < total; j++, got++) {
++					if (got >= 2) {
++						r[got - 2] = (uint8_t)(word >> (8 * j));
++					}
++				}
++				continue;
++			}
++			delay(1);
++		}
++		if (got < total) {
++			goto out;
++		}
++		wr(qup, QUP_OPERATIONAL, OP_IN_DONE | OP_OUT_DONE);
++	}
++	err = wait_bits(qup, QUP_I2C_STATUS, I2C_BUS_ACTIVE, 0, 20000) ? 0 : 3;
++out:
++	(void)qup_state(ST_RESET);
++	return err;
++}
++
++static int
++rmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	uint8_t a = (uint8_t)addr;
++	return i2c_xfer(&a, 1, buf, len);
++}
++
++static int
++rmi_write(uint16_t addr, const uint8_t *buf, unsigned len)
++{
++	uint8_t w[8];
++	if (len + 1 > sizeof(w)) {
++		return 1;
++	}
++	w[0] = (uint8_t)addr;
++	memcpy(w + 1, buf, len);
++	return i2c_xfer(w, len + 1, NULL, 0);
++}
++
++/* ---- RMI4 ---- */
++
++struct rmi_fn {
++	uint8_t query, command, control, data, irqs, num;
++};
++
++static struct rmi_fn f01, f12;
++
++static bool
++rmi_scan(void)
++{
++	uint8_t page0 = 0;
++	int e = rmi_write(0xff, &page0, 1);
++	if (e) {
++		printf("WHYRED TOUCH: no answer at 0x%x (page select: %s)\n", SYNA_ADDR,
++		    e == 2 ? "NACK" : e == 3 ? "timeout" : "error");
++		return false;
++	}
++	for (uint16_t a = 0xe9; a >= 0x0a; a -= 6) {
++		uint8_t p[6];
++		if (rmi_read(a, p, 6)) {
++			printf("WHYRED TOUCH: PDT read at %#x failed\n", a);
++			return false;
++		}
++		if (p[5] == 0 || p[5] == 0xff) {
++			break;
++		}
++		printf("WHYRED TOUCH: PDT %#x: F%02x query %#x cmd %#x ctrl %#x data %#x irqs %u\n",
++		    a, p[5], p[0], p[1], p[2], p[3], p[4] & 7u);
++		struct rmi_fn f = { p[0], p[1], p[2], p[3], (uint8_t)(p[4] & 7u), p[5] };
++		if (p[5] == 0x01) {
++			f01 = f;
++		} else if (p[5] == 0x12) {
++			f12 = f;
++		}
++	}
++	return f01.num == 0x01 && f12.num == 0x12;
++}
++
++static void
++rmi_info(void)
++{
++	uint8_t q[21] = {0}, st = 0, ctl = 0, f12q[8] = {0};
++	if (!rmi_read(f01.query, q, sizeof(q))) {
++		char id[11];
++		for (int i = 0; i < 10; i++) {
++			id[i] = (q[11 + i] >= 0x20 && q[11 + i] < 0x7f) ? (char)q[11 + i] : '.';
++		}
++		id[10] = 0;
++		printf("WHYRED TOUCH: F01 manufacturer %u product \"%s\"\n", q[0], id);
++	}
++	(void)rmi_read(f01.data, &st, 1);
++	(void)rmi_read(f01.control, &ctl, 1);
++	printf("WHYRED TOUCH: F01 status %#x (code %u%s%s) ctrl0 %#x\n", st, st & 0xfu,
++	    (st & 0x40u) ? ", bootloader" : "", (st & 0x80u) ? ", unconfigured" : "", ctl);
++	if (st & 0x80u) {
++		uint8_t c = (uint8_t)(ctl | 0x80u);     /* configured, as rmi_f01 does after reset */
++		(void)rmi_write(f01.control, &c, 1);
++	}
++	if (!rmi_read(f12.query, f12q, sizeof(f12q))) {
++		printf("WHYRED TOUCH: F12 query %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    f12q[0], f12q[1], f12q[2], f12q[3], f12q[4], f12q[5], f12q[6], f12q[7]);
++	}
++}
++
++static void
++report(uint32_t mask, const int *x, const int *y)
++{
++	static uint32_t active;
++	static int lx[SYNA_MAX_OBJ], ly[SYNA_MAX_OBJ];
++	for (int id = 0; id < SYNA_MAX_OBJ; id++) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(active & bit) || x[id] != lx[id] || y[id] != ly[id]) {
++				sweet_hid_touch(id, 1, x[id], y[id]);
++			}
++			lx[id] = x[id];
++			ly[id] = y[id];
++		} else if (active & bit) {
++			sweet_hid_touch(id, 0, lx[id], ly[id]);
++		}
++	}
++	active = mask;
++}
++
++static void
++syna_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	sleep_ms(20000);        /* after the UDP log and SpringBoard are up */
++	if (!clocks_on()) {
++		return;
++	}
++	pins();
++	uint32_t io = rd(qup, QUP_IO_MODE);
++	static const unsigned blk[4] = { 4, 16, 32, 4 };
++	out_fifo = blk[io & 3u] * (2u << ((io >> 2) & 7u));
++	in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
++	printf("WHYRED TOUCH: QUP hw %#x io_mode %#x (fifo out %u in %u) state %#x\n",
++	    rd(qup, QUP_HW_VERSION), io, out_fifo, in_fifo, rd(qup, QUP_STATE));
++	if (!rmi_scan()) {
++		printf("WHYRED TOUCH: F01/F12 not found\n");
++		return;
++	}
++	rmi_info();
++
++	unsigned nobj = (in_fifo - 2) / 8;
++	nobj = nobj > SYNA_MAX_OBJ ? SYNA_MAX_OBJ : nobj;
++	printf("WHYRED TOUCH: polling F12 data %#x, %u objects, mode %d, range %ux%u flip %#x\n",
++	    f12.data, nobj, syna_mode, maxx, maxy, flip);
++	uint8_t prev[SYNA_MAX_OBJ * 8] = {0}, d[SYNA_MAX_OBJ * 8];
++	unsigned errors = 0;
++	for (;;) {
++		int e = rmi_read(f12.data, d, nobj * 8);
++		if (e) {
++			if ((errors++ % 500u) == 0) {
++				printf("WHYRED TOUCH: F12 read error %d\n", e);
++			}
++			sleep_ms(50);
++			continue;
++		}
++		if (memcmp(d, prev, nobj * 8) != 0) {
++			uint32_t mask = 0;
++			int x[SYNA_MAX_OBJ], y[SYNA_MAX_OBJ];
++			for (unsigned i = 0; i < nobj; i++) {
++				const uint8_t *o = d + 8 * i;
++				int rx = o[1] | o[2] << 8, ry = o[3] | o[4] << 8;
++				if (syna_mode == 1 && o[0] != 0) {
++					printf("WHYRED TOUCH: obj %u type %u x %d y %d z %u\n", i, o[0], rx, ry, o[5]);
++				}
++				if (o[0] != 1 && o[0] != 2 && o[0] != 6) {
++					continue;
++				}
++				if (flip & 4u) {
++					int t = rx; rx = ry; ry = t;
++				}
++				int px = (int)((int64_t)rx * 1080 / (int64_t)maxx);
++				int py = (int)((int64_t)ry * 2160 / (int64_t)maxy);
++				x[i] = (flip & 1u) ? 1079 - px : px;
++				y[i] = (flip & 2u) ? 2159 - py : py;
++				mask |= 1u << i;
++			}
++			if (syna_mode == 2) {
++				report(mask, x, y);
++			}
++			memcpy(prev, d, nobj * 8);
++		}
++		sleep_ms(10);
++	}
++}
++
++void
++sweet_syna_init(void)
++{
++	int mode = 1;
++	(void)PE_parse_boot_argn("sweetsyna", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("sweetsyna_maxx", &maxx, sizeof(maxx));
++	(void)PE_parse_boot_argn("sweetsyna_maxy", &maxy, sizeof(maxy));
++	(void)PE_parse_boot_argn("sweetsyna_flip", &flip, sizeof(flip));
++	if (mode == 0 || maxx == 0 || maxy == 0) {
++		return;
++	}
++	syna_mode = mode;
++	gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	qup = ml_io_map(QUP_PA, 0x1000);
++	tlmm_s = ml_io_map(TLMM_SOUTH, 0x4000);
++	tlmm_n_66 = ml_io_map(TLMM_NORTH + 0x1000u * 66, 0x1000);
++	tlmm_n_67 = ml_io_map(TLMM_NORTH + 0x1000u * 67, 0x1000);
++	if (!gcc || !qup || !tlmm_s || !tlmm_n_66 || !tlmm_n_67) {
++		printf("WHYRED TOUCH: MMIO mapping failed\n");
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(syna_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
