@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -6739,6 +6739,233 @@
+@@ -6739,6 +6739,235 @@
  	}
  }
  
@@ -124,8 +124,10 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +		LOG("rpm: no TOC (magic %08x)", toc[0]);
 +		return false;
 +	}
-+	for (uint32_t i = 0; i < toc[2] && i < 20; i++) {
-+		uint32_t id = toc[3 + 3 * i], off = toc[4 + 3 * i], size = toc[5 + 3 * i];
++	/* struct rpm_toc { magic, count, { id, offset, size }[] } */
++	LOG("rpm: TOC count %u: %08x %08x %08x | %08x %08x %08x", toc[1], toc[2], toc[3], toc[4], toc[5], toc[6], toc[7]);
++	for (uint32_t i = 0; i < toc[1] && i < 20; i++) {
++		uint32_t id = toc[2 + 3 * i], off = toc[3 + 3 * i], size = toc[4 + 3 * i];
 +		struct rpm_pipe *p = id == 0x61703272 ? &rpm_tx : id == 0x72326170 ? &rpm_rx : NULL;  /* ap2r, r2ap */
 +		if (p != NULL && off + size <= RPM_RAM_SIZE) {
 +			p->tail = (volatile uint32_t *)(ram + off);
@@ -235,7 +237,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  static void
  topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -6761,9 +6988,14 @@
+@@ -6761,9 +6990,14 @@
  	if (wifi_enabled()) {
  		uint8_t en = 0;
  		if (whyred_spmi_read(1, 0x4446, &en) == 0 && !(en & 0x80)) {
