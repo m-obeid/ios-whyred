@@ -1,0 +1,54 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -35,6 +35,8 @@
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal, fWhyred;
++	unsigned fTick;         /* whyred: 1 s ticks since the last full read */
++	int fLastUsb;           /* whyred: last USBIN plugin bit, -1 unknown */
+ 	int fLastMode;
+ 	unsigned fDesign;       /* design capacity, mAh */
+ 	int fTempCenti;         /* battery temperature, centi-degrees C */
+@@ -66,6 +68,8 @@
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = fWhyred = false;
++	fTick = 0;
++	fLastUsb = -1;
+ 	fDesign = 5020;
+ 	fTempCenti = 2500;
+ 	fTempMeasured = false;
+@@ -512,6 +516,23 @@
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
++		if (self->fWhyred) {
++			/*
++			 * whyred: the USBIN plugin bit every second, the full gauge read every 10 s or at once
++			 * when the cable comes or goes, so the charging state follows a plug within ~1 s.
++			 */
++			uint8_t usb;
++			int now = whyred_spmi_read(0, 0x1310, &usb) == 0 ? (usb & 0x10u) != 0 : -1;
++			if (++self->fTick >= 10 || (now >= 0 && now != self->fLastUsb)) {
++				self->fTick = 0;
++				self->poll();
++			}
++			if (now >= 0) {
++				self->fLastUsb = now;
++			}
++			sender->setTimeoutMS(1000);
++			return;
++		}
+ 		self->poll();
+ 		sender->setTimeoutMS(10000);
+ 	}
+@@ -540,7 +561,7 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(10000);
++			fTimer->setTimeoutMS(fWhyred ? 1000 : 10000);
+ 		} else {
+ 			fReal = fWhyred = false;
+ 			poll();
