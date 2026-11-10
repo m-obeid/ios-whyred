@@ -251,9 +251,12 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +}
 +
 +/* Boot sector, the whole FAT, the root and one level of directories. EAGAIN while eMMC is not up. */
-+static int
+ static int
+-fw_find(const char *name)
 +fat_mount(void)
-+{
+ {
+-	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
+-		if (strcmp(fw_files[i].name, name) == 0) {
 +	uint8_t b[512];
 +	int err = sweet_ufs_read_part(fw_part, 0, b, sizeof(b));
 +	if (err != 0) {
@@ -292,12 +295,9 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	return 0;
 +}
 +
- static int
--fw_find(const char *name)
++static int
 +fw_all_find(const char *path)
- {
--	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
--		if (strcmp(fw_files[i].name, name) == 0) {
++{
 +	for (unsigned i = 0; i < fat_count; i++) {
 +		if (strcmp(fat_files[i].path, path) == 0) {
  			return (int)i;
@@ -505,20 +505,20 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +
 +static volatile uint8_t *mss_gcc, *mss_q6, *mss_rmb;
 +
-+static inline uint32_t r32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
-+static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; mb(); }
++static inline uint32_t mr32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void mw32(volatile uint8_t *b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; mb(); }
 +
 +static bool
 +mss_clk_on(const char *name, uint32_t en, uint32_t bit, uint32_t cbcr)
 +{
-+	w32(mss_gcc, en, r32(mss_gcc, en) | bit);
++	mw32(mss_gcc, en, mr32(mss_gcc, en) | bit);
 +	for (int i = 0; i < 1000; i++) {
-+		if (!(r32(mss_gcc, cbcr) & (1u << 31))) {
++		if (!(mr32(mss_gcc, cbcr) & (1u << 31))) {
 +			return true;
 +		}
 +		IODelay(10);
 +	}
-+	LOG("MSS clock %s stays off (cbcr %08x)", name, r32(mss_gcc, cbcr));
++	LOG("MSS clock %s stays off (cbcr %08x)", name, mr32(mss_gcc, cbcr));
 +	return false;
 +}
 +
@@ -527,14 +527,14 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +rmb_wait(uint32_t reg, int32_t want, unsigned ms, int32_t *got)
 +{
 +	for (unsigned i = 0; i <= ms; i++) {
-+		int32_t v = (int32_t)r32(mss_rmb, reg);
++		int32_t v = (int32_t)mr32(mss_rmb, reg);
 +		if (want == 0 ? v != 0 : (v == want || v < 0)) {
 +			*got = v;
 +			return want == 0 || v == want;
 +		}
 +		IODelay(1000);
 +	}
-+	*got = (int32_t)r32(mss_rmb, reg);
++	*got = (int32_t)mr32(mss_rmb, reg);
 +	return false;
 +}
  
@@ -578,12 +578,12 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	 *    until gcc_mss_cfg_ahb runs. */
 +	bool clk = mss_clk_on("cfg_ahb", 0x8a000, 1, 0x8a000) & mss_clk_on("bimc_q6", 0x4401c, 1, 0x4401c) &
 +	    mss_clk_on("boot_rom", 0x52004, 1u << 10, 0x38004);
-+	w32(mss_gcc, 0x5200c, r32(mss_gcc, 0x5200c) | (1u << 2));      /* gpll0_out_msscc */
++	mw32(mss_gcc, 0x5200c, mr32(mss_gcc, 0x5200c) | (1u << 2));      /* gpll0_out_msscc */
 +	clk = clk & mss_clk_on("snoc", 0x8a03c, 1, 0x8a03c) & mss_clk_on("mnoc", 0x8a004, 1, 0x8a004);
 +	if (!clk) {
 +		goto out;
 +	}
-+
+ 
 +	/* 2. MBA (1 MB slot) and the modem's VM owns it */
 +	{
 +		int64_t n = fw_read("mba.mbn", mba, 0x100000);
@@ -601,49 +601,49 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +
 +	/* 3. restart pulse, keeping QDSP6SS_DBG_CFG */
 +	{
-+		uint32_t dbg = r32(mss_q6, 0x018);
-+		w32(mss_gcc, GCC_MSS_RESTART, 1);
++		uint32_t dbg = mr32(mss_q6, 0x018);
++		mw32(mss_gcc, GCC_MSS_RESTART, 1);
 +		IODelay(200);
-+		w32(mss_gcc, GCC_MSS_RESTART, 0);
++		mw32(mss_gcc, GCC_MSS_RESTART, 0);
 +		IODelay(200);
-+		w32(mss_q6, 0x018, dbg);
++		mw32(mss_q6, 0x018, dbg);
 +	}
- 
++
 +	/* 4. RMB: MBA image, no debug policy */
-+	w32(mss_rmb, RMB_MBA_IMAGE, (uint32_t)MBA_PA);
-+	w32(mss_rmb, RMB_PMI_CODE_START, 0);
-+	w32(mss_rmb, RMB_PMI_CODE_LENGTH, 0);
++	mw32(mss_rmb, RMB_MBA_IMAGE, (uint32_t)MBA_PA);
++	mw32(mss_rmb, RMB_PMI_CODE_START, 0);
++	mw32(mss_rmb, RMB_PMI_CODE_LENGTH, 0);
 +
 +	/* 5. __pil_q6v55_reset, qdsp6v62_1_5 */
 +	{
 +		uint32_t v;
-+		w32(mss_q6, 0x014, r32(mss_q6, 0x014) | 0x7);           /* CORE_ARES | BUS_ARES_ENA | STOP_CORE */
-+		w32(mss_q6, 0x038, r32(mss_q6, 0x038) | 1);             /* XO_CBCR */
-+		for (int i = 0; i < 1000 && (r32(mss_q6, 0x038) & (1u << 31)); i++) {
++		mw32(mss_q6, 0x014, mr32(mss_q6, 0x014) | 0x7);           /* CORE_ARES | BUS_ARES_ENA | STOP_CORE */
++		mw32(mss_q6, 0x038, mr32(mss_q6, 0x038) | 1);             /* XO_CBCR */
++		for (int i = 0; i < 1000 && (mr32(mss_q6, 0x038) & (1u << 31)); i++) {
 +			IODelay(1);
 +		}
-+		v = r32(mss_q6, 0x030) | (1u << 24);                    /* BHS_ON */
-+		w32(mss_q6, 0x030, v);
++		v = mr32(mss_q6, 0x030) | (1u << 24);                    /* BHS_ON */
++		mw32(mss_q6, 0x030, v);
 +		IODelay(1);
-+		for (int i = 0; i < 1000 && !(r32(mss_q6, 0x0c4) & 1); i++) {
++		for (int i = 0; i < 1000 && !(mr32(mss_q6, 0x0c4) & 1); i++) {
 +			IODelay(1);
 +		}
-+		w32(mss_q6, 0x030, v | (1u << 25));                     /* LDO_BYP */
-+		v = r32(mss_q6, 0x030) & ~(1u << 22);                   /* CLAMP_QMC_MEM off */
-+		w32(mss_q6, 0x030, v);
++		mw32(mss_q6, 0x030, v | (1u << 25));                     /* LDO_BYP */
++		v = mr32(mss_q6, 0x030) & ~(1u << 22);                   /* CLAMP_QMC_MEM off */
++		mw32(mss_q6, 0x030, v);
 +		v |= (1u << 18) | (1u << 19);                           /* L2DATA_STBY_N | SLP_RET_N */
-+		w32(mss_q6, 0x030, v);
-+		v = r32(mss_q6, 0x034);
++		mw32(mss_q6, 0x030, v);
++		v = mr32(mss_q6, 0x034);
 +		for (int b = 29; b >= 0; b--) {                         /* memory banks one at a time */
 +			v |= 1u << b;
-+			w32(mss_q6, 0x034, v);
++			mw32(mss_q6, 0x034, v);
 +			IODelay(1);
 +		}
-+		v = r32(mss_q6, 0x030) & ~(1u << 21);                   /* CLAMP_WL off */
-+		w32(mss_q6, 0x030, v);
-+		w32(mss_q6, 0x030, v & ~(1u << 20));                    /* CLAMP_IO off */
-+		w32(mss_q6, 0x014, r32(mss_q6, 0x014) & ~0x3u);         /* run */
-+		w32(mss_q6, 0x020, r32(mss_q6, 0x020) | (1u << 1));     /* GFMUX CLK_ENA */
++		v = mr32(mss_q6, 0x030) & ~(1u << 21);                   /* CLAMP_WL off */
++		mw32(mss_q6, 0x030, v);
++		mw32(mss_q6, 0x030, v & ~(1u << 20));                    /* CLAMP_IO off */
++		mw32(mss_q6, 0x014, mr32(mss_q6, 0x014) & ~0x3u);         /* run */
++		mw32(mss_q6, 0x020, mr32(mss_q6, 0x020) | (1u << 1));     /* GFMUX CLK_ENA */
 +		/* no Q6SS access from here on: it aborts once the core runs */
 +	}
 +	if (!rmb_wait(RMB_PBL_STATUS, 0, 1000, &st) || st != 1) {
@@ -690,9 +690,9 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +		mb();
 +		static const uint32_t msa[1] = { VMID_MSS_MSA };
 +		uint64_t r = scm_assign(MBA_PA + 0x100000, ((uint64_t)mdt_size + 0xfff) & ~0xfffull, msa, 1);
-+		w32(mss_rmb, RMB_PMI_CODE_LENGTH, 0);
-+		w32(mss_rmb, RMB_PMI_META_DATA, (uint32_t)(MBA_PA + 0x100000));
-+		w32(mss_rmb, RMB_MBA_COMMAND, 1);                       /* CMD_META_DATA_READY */
++		mw32(mss_rmb, RMB_PMI_CODE_LENGTH, 0);
++		mw32(mss_rmb, RMB_PMI_META_DATA, (uint32_t)(MBA_PA + 0x100000));
++		mw32(mss_rmb, RMB_MBA_COMMAND, 1);                       /* CMD_META_DATA_READY */
 +		bool hdr_ok = rmb_wait(RMB_MBA_STATUS, 3, 10000, &st);
 +		LOG("metadata %lld bytes (assign %llx): status %d%s", mdt_size, r, st, hdr_ok ? " headers OK" : "");
 +		if (!hdr_ok) {
@@ -780,13 +780,13 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  			}
  			mb();
  			m->release();
-+			uint32_t clen = r32(mss_rmb, RMB_PMI_CODE_LENGTH);
++			uint32_t clen = mr32(mss_rmb, RMB_PMI_CODE_LENGTH);
 +			if (clen == 0) {
-+				w32(mss_rmb, RMB_PMI_CODE_START, ph[i].p_paddr);
-+				w32(mss_rmb, RMB_MBA_COMMAND, 2);               /* CMD_LOAD_READY */
++				mw32(mss_rmb, RMB_PMI_CODE_START, ph[i].p_paddr);
++				mw32(mss_rmb, RMB_MBA_COMMAND, 2);               /* CMD_LOAD_READY */
 +			}
-+			w32(mss_rmb, RMB_PMI_CODE_LENGTH, clen + ph[i].p_memsz);
-+			st = (int32_t)r32(mss_rmb, RMB_MBA_STATUS);
++			mw32(mss_rmb, RMB_PMI_CODE_LENGTH, clen + ph[i].p_memsz);
++			st = (int32_t)mr32(mss_rmb, RMB_MBA_STATUS);
 +			if (st < 0) {
 +				LOG("MBA error %d after segment %u", st, i);
 +				goto out;
