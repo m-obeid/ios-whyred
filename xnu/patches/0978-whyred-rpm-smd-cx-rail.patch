@@ -26,7 +26,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +		 * the asker, then an all-zero NEW_SERVER for the end of the list.
 +		 */
 +		static const uint32_t svc[][3] = {
-+			{ 0x40, 0x101, PORT_PDM }, { 4096, 1, PORT_TFTP }, { 14, 1, PORT_RMTFS },
++			{ 0x40, 0x101, 0x4001 }, { 4096, 1, 0x4002 }, { 14, 1, 0x4003 },   /* PORT_PDM/TFTP/RMTFS */
 +		};
 +		uint32_t want = c->a, inst = c->b;
 +		unsigned hits = 0;
