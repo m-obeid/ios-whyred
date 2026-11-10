@@ -335,12 +335,16 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   Linux picks profile ascent_3450mah (batt_id 60 kOhm) but "using OTP"; the pack is 4000 mAh.
 - Patch 0973: bsd/dev/whyred_spmi.c (read-only SPMI v3 observer reads, APID cache) and SweetBattery
   sweetbattery=2: FG 0x4009/0x400a MSOC (Linux fg_get_msoc rounding), VBATT 0x41a0 (+CP 0x41a6)
-  x 122.07 uV, IBATT 0x41a2 (+CP 0x41a8) signed x 488.28 uA (positive = charging), BATT_TEMP 0x4150
+  x 122.07 uV, IBATT 0x41a2 (+CP 0x41a8) signed x 488.28 uA (positive = DISCHARGING, measured
+  unplugged: +280 mA; the Linux sysfs signs misled me), BATT_TEMP 0x4150
   (quarter K), SMB2 0x1006[2:0] charger state, 0x1310 bit 4 USB plugin. Design 4000 mAh. 10 s poll.
 - APIDs: ppid 0x40 -> 30, 0x41 -> 31, 0x10 -> 7, 0x13 -> 10.
 - First CI failed: missing kern/clock.h for delay(). Kernel run 42848264830 (sha 2d797f67...d5c7).
   First read under iOS: 100% (raw 255) 4294 mV +42 mA 36.0 C, charger state 3 (full-on), USB 1.
 - Image whyred/out/xnu-ios-batt.img = fast5 + 0973 with sweetbattery=2.
+- Unplug test: usb 0 -> +280 mA raw (discharging). Plugged into the laptop port the pack still
+  drained 98 -> 95 % at +166..174 mA raw, charger state 3 (full-on), 38-40 C: the port loses to the
+  load at 1804.8 MHz. Fix: sign back to raw positive = discharging; IsCharging needs current in.
 
 ## Not yet known
 
