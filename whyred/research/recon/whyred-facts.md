@@ -186,6 +186,19 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   volume up = GPIO7 bit 0 low. All three seen pressed and released (sweetkeys=2 log), events go to SweetHID.
 - Keep presses under ~4 s: PON S1+S2 timers reset the phone (power ~6.5 s, power + vol- ~5.5 s).
 
+## Touch (2026-11-10)
+
+- Kernel: CI run 42725187297 (patch 0965: bsd/dev/sweet_syna.c, SweetHID panel size from the boot video).
+- ABL leaves the BLSP1 AHB clock on (cbcr 0x2000c220) and QUP1 I2C off (0x80000000); the driver enables
+  QUP1 I2C from XO (rcg cfg 0x1, cbcr 0x1) and puts GPIO2/3 (cfg was 0) on function 3.
+  GPIO66 cfg 0x3c3 io 0x3, GPIO67 cfg 0x1. QUP hw 0x20070000, io_mode 0xa5 (FIFOs 64/64).
+- RMI4 at 0x20: PDT F34 (query 0x27), F01 (query 0x2f cmd 0x26 ctrl 0xd data 0x4), F12 (query 0x4c ctrl 0x13
+  data 0x6). Manufacturer 1, product "E753". Comes up unconfigured (status 0x81); driver sets configured.
+- F12 objects at data 0x06 (7 per read): raw coordinates are panel pixels, 0..1080 x 0..2160, origin top
+  left, no flips (corners (48,0) (1055,70) (1026,2083) (80,2123)). sweetsyna=2 reports to SweetHID.
+- Result: unlock by swipe and home screen interaction work. Power locks; the backlight stays on because
+  whyred's backlight is PM660L WLED (DSI DCS disabled): needs an SPMI-write WLED driver.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
