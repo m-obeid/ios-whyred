@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -181,6 +181,8 @@
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
+ #define DEPCMD_DEPSTARTCFG      9
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_FORCERM          (1u << 11)
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+ #define TRB_HWO         (1u << 0)
+@@ -226,6 +228,8 @@
+ 	bool        data_in;        /* data stage direction */
+ 	uint32_t    events;
+ 	bool        configured;
++	uint8_t     res[8];         /* transfer resource index of each physical endpoint */
++	uint32_t    active;         /* endpoints with a transfer started and not completed */
+ 	uint8_t     data_alt;       /* data interface alternate setting */
+ 	/* network */
+ 	ifnet_t     ifp;
+@@ -306,7 +310,21 @@
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0) {
++		ud.res[ep & 7] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
++		ud.active |= 1u << ep;
++	}
++}
++
++/* End the active transfer on ep (Linux dwc3_stop_active_transfer, ForceRM). */
++static void
++ud_end(unsigned ep)
++{
++	if (!(ud.active & (1u << ep))) {
++		return;
++	}
++	(void)ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.res[ep & 7] << 16), 0, 0, 0);
++	ud.active &= ~(1u << ep);
+ }
+ 
+ static void
+@@ -330,6 +348,38 @@
+ }
+ 
+ /*
++ * USB reset or disconnect (Linux dwc3_gadget_reset_interrupt / dwc3_disconnect_gadget): end
++ * every active transfer, drop the configuration and queued frames, and restart ep0 with a fresh
++ * SETUP. Without this an unplug in mid control transfer left ep0 without a SETUP buffer and the
++ * next host's SET_ADDRESS went unanswered.
++ */
++static void
++ud_bus_reset(bool clear_address)
++{
++	ud_end(EP_RX);
++	ud_end(EP_TX);
++	ud_end(EP_INT);
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;
++	ud.tx_busy = false;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
++	lck_mtx_unlock(ud.lock);
++	if (clear_address) {
++		dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++	}
++	if (ud.state != EP0_SETUP || !(ud.active & 1u)) {
++		ud_end(1);
++		ud_end(0);
++		ud_stall();             /* stall and re-arm SETUP, as dwc3_ep0_stall_and_restart */
++	}
++}
++
++/*
+  * USB descriptors: a CDC-ECM (Ethernet) function, which Linux (cdc_ether)
+  * and macOS drive without extra drivers. VID 0x1209 / PID 0x0001 =
+  * pid.codes test ID, not a product.
+@@ -678,7 +728,7 @@
+ 	if (ev & 1) {                   /* device event */
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+-			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			ud_bus_reset(true);
+ 			printf("SWEET USB: bus reset\n");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+@@ -689,6 +739,7 @@
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
++			ud_bus_reset(false);
+ 			printf("SWEET USB: disconnect\n");
+ 		}
+ 		return;
+@@ -697,6 +748,10 @@
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1) {
++		ud.active &= ~(1u << ep);       /* XferComplete: the transfer resource is free */
++	}
++
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;
