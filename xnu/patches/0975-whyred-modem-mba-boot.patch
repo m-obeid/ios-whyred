@@ -524,7 +524,41 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  		LOG("t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", g_ms, path, s->seek, s->rsize, s->blk, s->wsize, s->size);
  	}
  	if (!opts) {
-@@ -3058,7 +3245,7 @@
+@@ -2884,7 +3071,7 @@
+ }
+ 
+ /* rmtfs */
+-#define RMTFS_BUF_SIZE      0x300000            /* qcom,rmtfs_sharedmem size */
++#define RMTFS_BUF_SIZE      0x200000            /* whyred qcom,rmtfs_sharedmem size (topaz 0x300000) */
+ #define VMID_HLOS           3
+ #define VMID_MSS_MSA        15
+ #define VMID_NAV            0x2B
+@@ -3005,12 +3192,20 @@
+ 	}
+ 	case 4: {                                   /* ALLOC_BUFF */
+ 		if (rmtfs_pa == 0) {
+-			rmtfs_va = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE, &rmtfs_pa);   /* the modem owns it from now on */
+-			if (rmtfs_va == NULL) {
++			/*
++			 * whyred, as Linux msm_sharedmem: qcom,guard-memory (4 KB guard before and after),
++			 * no qcom,vm-nav-path, so HLOS + MSS_MSA only (topaz added VMID_NAV).
++			 */
++			uint64_t raw_pa = 0;
++			uint8_t *raw = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE + 0x2000, &raw_pa);
++			if (raw == NULL) {
+ 				rmtfs_pa = 0;
+ 			} else {
+-				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
+-				(void)scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 3);
++				rmtfs_va = raw + 0x1000;
++				rmtfs_pa = raw_pa + 0x1000;
++				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA };
++				uint64_t r = scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 2);
++				LOG("t=%u ms: rmtfs buffer %llx+%x to HLOS + MSS_MSA: %llx", g_ms, rmtfs_pa, RMTFS_BUF_SIZE, r);
+ 			}
+ 		}
+ 		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);
+@@ -3058,7 +3253,7 @@
  #define WLFW_MSA_INFO       0x2D
  #define WLFW_MSA_READY      0x2E
  #define WLFW_HOST_CAP       0x34
@@ -533,7 +567,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define WLFW_MSA_SIZE       0x00100000u
  #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
  #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
-@@ -3207,7 +3394,7 @@
+@@ -3207,7 +3402,7 @@
  		LOG("wlfw: no board data file");
  		return;
  	}
@@ -542,7 +576,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	w_bdf_off = 0;
  	w_bdf_seg = 0;
  	LOG("t=%u ms: wlfw: board data %s, %u bytes", g_ms, name, w_bdf_len);
-@@ -6095,7 +6282,65 @@
+@@ -6095,7 +6290,65 @@
  	}
  }
  
@@ -609,7 +643,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  static bool
  loadable(const struct elf32_phdr *p)
-@@ -6106,11 +6351,11 @@
+@@ -6106,11 +6359,11 @@
  static bool
  modem_boot(void)
  {
@@ -626,7 +660,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  	struct smem_part_hdr *part = smem_partition(0, 1);
  	LOG("SMEM apps<->modem partition %p", part);
-@@ -6121,14 +6366,103 @@
+@@ -6121,14 +6374,103 @@
  		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
  		return false;
  	}
@@ -734,7 +768,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	}
  	mdt = (uint8_t *)IOMalloc(mdt_size);
  	if (mdt == NULL || fw_read("modem.mdt", mdt, mdt_size) != mdt_size) {
-@@ -6141,75 +6475,51 @@
+@@ -6141,75 +6483,51 @@
  			LOG("modem.mdt: bad ELF header");
  			goto out;
  		}
@@ -836,7 +870,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  			}
  			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
  			int64_t got = 0;
-@@ -6219,7 +6529,7 @@
+@@ -6219,7 +6537,7 @@
  				if (got != (int64_t)ph[i].p_filesz) {
  					LOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
  					m->release();
@@ -845,7 +879,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  				}
  			}
  			if (ph[i].p_memsz > got) {
-@@ -6227,24 +6537,29 @@
+@@ -6227,24 +6545,29 @@
  			}
  			mb();
  			m->release();
@@ -887,7 +921,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	return ok;
  }
  
-@@ -6274,10 +6589,9 @@
+@@ -6274,10 +6597,9 @@
  	state = -1;
  	soc_lock = IOLockAlloc();
  	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
@@ -899,7 +933,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  		if (err == EAGAIN) {
  			IOSleep(500);
  		}
-@@ -6344,14 +6658,14 @@
+@@ -6344,14 +6666,14 @@
  topaz_part_fw_size(const char *path)
  {
  	int i = fw_all_find(path);

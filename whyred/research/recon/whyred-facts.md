@@ -418,6 +418,12 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - GLINK: descriptor 478 already made by the modem, our TX FIFO 479 (16 KB) allocated, VERSION sent
   (APCS bit 15). The modem's FIFO 480 never appears in the apps-modem partition: rx 0, chan down.
   The modem goes FATAL at 34.8 s (crash reason empty). Next: dump items 478-480 in both partitions.
+- Fix 1: topaz smem_get searched only the uncached item list; the SDM636 modem allocates FIFO 480 in
+  the cached list (from the partition end). With the cached search (kernel run 42891561610): GLINK
+  VERSION/ACK, modem opens glink_ssr + IPCRTR, QRTR HELLO from node 0, services servreg-notif 0x42
+  and ssctl 0x2b; pd-mapper asked "tms/pddump_disabled"; rmtfs opened modemst1/2, fsg, fsc (oem_1/2
+  missing), ALLOC -> FATAL 15 ms after (reads 1). topaz assigns rmtfs 3 MB to HLOS+MSS+NAV; whyred
+  Linux (msm_sharedmem, no qcom,vm-nav-path, qcom,guard-memory): 2 MB to HLOS+MSS_MSA, 4 KB guards.
 
 ## Not yet known
 
