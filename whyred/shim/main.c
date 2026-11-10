@@ -336,6 +336,14 @@ static void __attribute__((noreturn)) gold_boot(void)
 	con_newline();
 	if ((mmfr0 >> 20) & 0xf) {
 		gic_prepare();
+#ifndef GOLD_ROW
+#define GOLD_ROW 4
+#endif
+		/* Gold to OSM table row GOLD_ROW (4 = 1804.8 MHz) with CPRH open-loop voltage. */
+		if (GOLD_ROW > 0 && osm_bringup(GOLD_ROW) != 0) {
+			puts_("!! gold clock bring-up failed, booting at the current clock");
+			con_newline();
+		}
 		puts_("!! ");
 		puts_(xnu_boot(handoff_start, handoff_end));
 	} else {
@@ -358,6 +366,11 @@ void secondary_main(uint64_t slot)
 	if (slot == 4 && osm_go) {
 		osm_print_speed("gold  ", osm_speed_ticks(20000000), 20000000);
 		osm_probe();
+		osm_probe2();
+#ifdef OSM_TARGET
+		if (osm_bringup(OSM_TARGET) == 0)
+			osm_print_speed("gold now", osm_speed_ticks(20000000), 20000000);
+#endif
 		dsb();
 		osm_done = 1;
 		dsb();

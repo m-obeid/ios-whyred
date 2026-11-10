@@ -5,6 +5,8 @@
 # ./build.sh PAYLOAD.bin     boot XNU: the payload (tools/mkpayload.py) becomes the ramdisk
 # EMMC=1 ./build.sh          read-only eMMC probe instead of the diagnostics
 # OSM=1 ./build.sh           read-only Gold clock/voltage probe (OSM, CPRH, PLL)
+# OSM=1 OSM_TARGET=n          also bring up CPRH (open loop) + OSM and request table row n
+# GOLD_ROW=n ./build.sh PAYLOAD   Gold OSM row before XNU (default 4 = 1804.8 MHz, 0 = leave at 600 MHz)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -21,7 +23,7 @@ mkdir -p out
 [ -f font.h ] || python3 gen_font.py "$FONT"
 
 $CC $CFLAGS -c start.S -o out/start.o
-$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} ${OSM:+-DOSM_PROBE} -c main.c -o out/main.o
+$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} ${OSM:+-DOSM_PROBE} ${OSM_TARGET:+-DOSM_TARGET=$OSM_TARGET} ${GOLD_ROW:+-DGOLD_ROW=$GOLD_ROW} -c main.c -o out/main.o
 $CC $CFLAGS -c osm.c -o out/osm.o
 $CC $CFLAGS -c xnu.c -o out/xnu.o
 $CC $CFLAGS -c emmc.c -o out/emmc.o

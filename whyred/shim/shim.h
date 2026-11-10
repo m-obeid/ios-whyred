@@ -42,6 +42,8 @@ const volatile uint8_t *align4(const volatile uint8_t *p);
 uint64_t osm_speed_ticks(uint64_t n);
 void osm_print_speed(const char *who, uint64_t ticks, uint64_t n);
 void osm_probe(void);
+void osm_probe2(void);
+int osm_bringup(unsigned target);
 
 /* emmc.c */
 void emmc_probe(void);

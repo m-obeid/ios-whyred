@@ -228,6 +228,22 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Next: port the Linux init (cpr3-regulator.c/cprh-kbss-regulator.c, clk-cpu-osm-660.c, both in
   ~/Project/whyred-linux/src/kernel-lineage-21) into the shim, staged, checking against this dump.
 
+## Gold at 1804.8 MHz under XNU (2026-11-10)
+
+- whyred/shim/osm.c osm_bringup(row), run on Gold before XNU (GOLD_ROW, default 4): hmss_gpll0 to 300 MHz,
+  OSM clock 200 MHz, CPR clock; CPRH open loop (Linux values, 0x7f8 = 0x4080, corners from the dump,
+  ctl 0x080a00c9, loop enable 0x1c1f); SAW AVS 0x01010031 / 0x04580458; OSM normal-world registers and all
+  40 rows; 9 SCM IO writes (SMC64 0xC2000502, x1 = 2) into the TZ sequencer (MEM-ACC, APM); enable at row 0,
+  then rows 1..n.
+- Stage A (read-only, ABL state): SCM available (0xC2000601 -> x1 = 1), SCM IO reads of the sequencer work,
+  firmware defaults 7 0 b c 0 19 0 0 5b9; Gold PLL cfg_lo 0x200d4828; OSM rcg 0x105; hmss_gpll0 cfg 0x100.
+- Result: CPRH corner/mV/SAW per row 0..4: 0/700/2bc, 1/700/2bc, 2/756/2f4, 3/828/33c, 4/840/348.
+  Shim loop ratio 3.0 (1804.8/600). Under iOS: md5sum 200 MB 0.96 s real / 0.66 user (Linux 0.99 / 0.68),
+  dash loop 1.01 user + 0.45 sys (was 2.69 + 1.26). SpringBoard + SSH 47 s after fastboot boot (was 68-76).
+- Open loop runs each corner at its fused ceiling (840 mV at 1804.8, Linux closed loop: 788).
+  No LMH/thermal limits firmware is started: nothing throttles on heat under XNU.
+- Remaining speed gap: ARMv8.1 LSE/LDAPR emulation (patch 0081), visible as sys time on atomics-heavy code.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
