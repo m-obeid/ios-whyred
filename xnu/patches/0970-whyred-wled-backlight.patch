@@ -1,0 +1,324 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_syna.c			standard
+ bsd/dev/sweet_thermal.c			standard
++bsd/dev/sweet_wled.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -45,6 +45,9 @@
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ extern "C" void topaz_adreno_init(void);           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
++extern "C" int sweet_wled_init(void);               /* bsd/dev/sweet_wled.c: whyred PM660L WLED backlight */
++extern "C" int sweet_wled_enable(int on);
++extern "C" int sweet_wled_level(unsigned level);
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
+ 
+ /*
+@@ -234,6 +237,7 @@
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
++	bool          fWled;          /* whyred: backlight is PMIC WLED (no DSI commands) */
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+@@ -378,8 +382,14 @@
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+-	if (fDsi != NULL) {
+-		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++	fWled = fDsi == NULL && sweet_wled_init() == 0;
++	if (fWled) {
++		IOLog("SWEET FB: brightness and display power via PM660L WLED\n");
++	}
++	if (fDsi != NULL || fWled) {
++		if (fDsi != NULL) {
++			IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++		}
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		/*
+ 		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+@@ -1058,6 +1068,14 @@
+ void
+ AppleCLCD::setPanelOn(bool on)
+ {
++	if (fWled) {
++		/* LCD: the backlight is the whole visible state. On: the caller sends the level next. */
++		IOLockLock(fBlLock);
++		int r = sweet_wled_enable(on);
++		IOLockUnlock(fBlLock);
++		IOLog("SWEET FB: WLED %s: %s\n", on ? "on" : "off", r == 0 ? "done" : "FAILED");
++		return;
++	}
+ 	uint8_t first[4] = { (uint8_t)(on ? 0x11 : 0x28), 0, 0x05, 0x80 };
+ 	uint8_t second[4] = { (uint8_t)(on ? 0x29 : 0x10), 0, 0x05, 0x80 };
+ 	bool done = true;
+@@ -1083,7 +1101,8 @@
+ {
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+ 	IOLockLock(fBlLock);
+-	bool done = dsiDcsLong(cmd, sizeof(cmd));
++	/* WLED: panel DBV 1..0x7ff -> 12-bit sink current 3..4095. */
++	bool done = fWled ? sweet_wled_level(level * 2u + 1u) == 0 : dsiDcsLong(cmd, sizeof(cmd));
+ 	IOLockUnlock(fBlLock);
+ 	static uint32_t logs;
+ 	if (logs++ < 8 || !done) {
+@@ -1102,7 +1121,7 @@
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	sweet_bl_log("iomfb", d);
+ 	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
+-	if (n == NULL || fDsi == NULL) {
++	if (n == NULL || (fDsi == NULL && !fWled)) {
+ 		return kIOReturnUnsupported;
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
+@@ -1616,7 +1635,7 @@
+ 			}
+ 			uint32_t level = fFB->fBlLevel;
+ 			IOLockUnlock(fFB->fLock);
+-			if (changed && fFB->fDsi != NULL) {
++			if (changed && (fFB->fDsi != NULL || fFB->fWled)) {
+ 				if (off) {
+ 					fFB->setPanelOn(false);
+ 				} else {
+diff --git a/bsd/dev/sweet_wled.c b/bsd/dev/sweet_wled.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wled.c
+@@ -0,0 +1,227 @@
++/*
++ * whyred backlight: PM660L WLED (live DT qcom,leds@d800, USID 3, ctrl 0xd800, sink 0xd900,
++ * string-cfg 0x3 = strings 0 and 1). ABL leaves the WLED configured and on. This driver only
++ * switches the module and sets the 12-bit brightness, as Linux qcom-spmi-wled.c (WLED4) does:
++ *   ctrl 0x46 bit 7       module enable
++ *   sink 0x57/0x58 + 0x10n brightness LSB / MSB[3:0] of string n
++ *   sink 0x47 [3:0]       sync: clear, then set, to latch the new brightness
++ * SPMI arbiter v3 (live DT reg core 0x800f000, chnls 0x8400000, obsrvr 0x9400000, cnfg 0x800a000):
++ * writes go through the APID's channel at chnls + 0x8000 * apid, reads through its observer
++ * channel. Only the registers above can be written (allowlist).
++ *
++ * boot-arg sweetwled=0: leave the WLED alone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_wled_init(void);
++int sweet_wled_enable(int on);
++int sweet_wled_level(unsigned level);
++
++#define W_CORE_PA       0x0800f000u
++#define W_CHNLS_PA      0x08400000u
++#define W_OBS_PA        0x09400000u
++#define W_CNFG_PA       0x0800a000u
++#define W_APIDS         512u
++#define W_NO_APID       0xffffu
++#define W_CTRL_PPID     0x3d8u
++#define W_SINK_PPID     0x3d9u
++
++#define CMD             0x00u
++#define STATUS          0x08u
++#define WDATA0          0x10u
++#define RDATA0          0x18u
++#define OP_EXT_WRITEL   0u
++#define OP_EXT_READL    1u
++
++enum { W_CTRL, W_SINK };
++static vm_offset_t w_core, w_cnfg;
++static vm_offset_t w_wr[2], w_rd[2];
++static uint16_t w_apid[2] = { W_NO_APID, W_NO_APID };
++static bool w_ready, w_tried;
++static uint32_t w_errors;
++
++static uint32_t
++rd32(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* The apps-owned (EE 0) APID of a PPID, as sweet_keys.c. */
++static uint16_t
++find_apid(uint32_t ppid, uint32_t *owner)
++{
++	uint16_t found = W_NO_APID;
++	for (uint32_t i = 0; i < W_APIDS; i++) {
++		uint32_t map = rd32(w_core, 0x800u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t own = rd32(w_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == W_NO_APID || own == 0) {
++			found = (uint16_t)i;
++			*owner = own;
++		}
++	}
++	return found;
++}
++
++static bool
++wait_done(vm_offset_t ch, uint32_t *st)
++{
++	for (unsigned i = 0; i < 1000; i++) {
++		*st = rd32(ch, STATUS);
++		if (*st & 1u) {
++			return (*st & 0x0eu) == 0;      /* failure / denied / dropped */
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++w_read(int p, uint8_t addr, uint8_t *out)
++{
++	uint32_t st;
++	wr32(w_rd[p], CMD, (OP_EXT_READL << 27) | ((uint32_t)addr << 4));
++	if (!wait_done(w_rd[p], &st)) {
++		if (w_errors++ < 8) {
++			printf("WHYRED WLED: read %#x:%#x failed, status %#x\n", p == W_CTRL ? 0xd8 : 0xd9, addr, st);
++		}
++		return false;
++	}
++	*out = (uint8_t)rd32(w_rd[p], RDATA0);
++	return true;
++}
++
++static bool
++allowed(int p, uint8_t addr, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		uint8_t a = (uint8_t)(addr + i);
++		bool ok = p == W_CTRL ? a == 0x46 :
++		    (a == 0x47 || a == 0x57 || a == 0x58 || a == 0x67 || a == 0x68);
++		if (!ok) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* EXT_WRITEL of n (1..4) bytes starting at addr. */
++static bool
++w_write(int p, uint8_t addr, const uint8_t *v, unsigned n)
++{
++	uint32_t st, data = 0;
++	if (n == 0 || n > 4 || !allowed(p, addr, n)) {
++		printf("WHYRED WLED: write %#x:%#x len %u refused\n", p == W_CTRL ? 0xd8 : 0xd9, addr, n);
++		return false;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		data |= (uint32_t)v[i] << (8 * i);
++	}
++	wr32(w_wr[p], WDATA0, data);
++	wr32(w_wr[p], CMD, (OP_EXT_WRITEL << 27) | ((uint32_t)addr << 4) | (n - 1));
++	if (!wait_done(w_wr[p], &st)) {
++		if (w_errors++ < 8) {
++			printf("WHYRED WLED: write %#x:%#x failed, status %#x\n", p == W_CTRL ? 0xd8 : 0xd9, addr, st);
++		}
++		return false;
++	}
++	return true;
++}
++
++int
++sweet_wled_init(void)
++{
++	if (w_tried) {
++		return w_ready ? 0 : -1;
++	}
++	w_tried = true;
++	int on = 1;
++	(void)PE_parse_boot_argn("sweetwled", &on, sizeof(on));
++	if (!on) {
++		printf("WHYRED WLED: disabled (sweetwled=0)\n");
++		return -1;
++	}
++	w_core = ml_io_map(W_CORE_PA, 0x1000);
++	w_cnfg = ml_io_map(W_CNFG_PA, 0x1000);
++	if (!w_core || !w_cnfg) {
++		return -1;
++	}
++	uint32_t owner[2] = { 9, 9 };
++	w_apid[W_CTRL] = find_apid(W_CTRL_PPID, &owner[W_CTRL]);
++	w_apid[W_SINK] = find_apid(W_SINK_PPID, &owner[W_SINK]);
++	printf("WHYRED WLED: arb %#x, ctrl apid %u owner %u, sink apid %u owner %u\n", rd32(w_core, 0),
++	    w_apid[W_CTRL], owner[W_CTRL], w_apid[W_SINK], owner[W_SINK]);
++	for (int p = 0; p < 2; p++) {
++		if (w_apid[p] == W_NO_APID || owner[p] != 0) {
++			printf("WHYRED WLED: no apps-owned APID, backlight control off\n");
++			return -1;
++		}
++		w_wr[p] = ml_io_map(W_CHNLS_PA + 0x8000u * w_apid[p], 0x1000);
++		w_rd[p] = ml_io_map(W_OBS_PA + 0x8000u * w_apid[p], 0x1000);
++		if (!w_wr[p] || !w_rd[p]) {
++			return -1;
++		}
++	}
++	uint8_t en = 0, sinks = 0, l0 = 0, m0 = 0, l1 = 0, m1 = 0;
++	if (!w_read(W_CTRL, 0x46, &en) || !w_read(W_SINK, 0x46, &sinks) ||
++	    !w_read(W_SINK, 0x57, &l0) || !w_read(W_SINK, 0x58, &m0) ||
++	    !w_read(W_SINK, 0x67, &l1) || !w_read(W_SINK, 0x68, &m1)) {
++		return -1;
++	}
++	printf("WHYRED WLED: module %#x, sinks %#x, string 0 %u, string 1 %u\n", en, sinks,
++	    (unsigned)(m0 & 0xf) << 8 | l0, (unsigned)(m1 & 0xf) << 8 | l1);
++	w_ready = true;
++	return 0;
++}
++
++int
++sweet_wled_enable(int on)
++{
++	uint8_t v;
++	if (!w_ready || !w_read(W_CTRL, 0x46, &v)) {
++		return -1;
++	}
++	v = (uint8_t)(on ? (v | 0x80u) : (v & ~0x80u));
++	return w_write(W_CTRL, 0x46, &v, 1) ? 0 : -1;
++}
++
++/* level 0..4095, applied to strings 0 and 1, then latched. */
++int
++sweet_wled_level(unsigned level)
++{
++	if (!w_ready) {
++		return -1;
++	}
++	if (level > 0xfff) {
++		level = 0xfff;
++	}
++	if (level < 17) {
++		level = 17;                     /* WLED4 lower limit: 0.4 % of 4095 */
++	}
++	uint8_t b[2] = { (uint8_t)level, (uint8_t)(level >> 8) };
++	uint8_t s;
++	if (!w_write(W_SINK, 0x57, b, 2) || !w_write(W_SINK, 0x67, b, 2) || !w_read(W_SINK, 0x47, &s)) {
++		return -1;
++	}
++	uint8_t clr = (uint8_t)(s & ~0x0fu), set = (uint8_t)(s | 0x0fu);
++	return w_write(W_SINK, 0x47, &clr, 1) && w_write(W_SINK, 0x47, &set, 1) ? 0 : -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
