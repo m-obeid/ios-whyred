@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -3666,9 +3666,10 @@
+@@ -3667,9 +3667,10 @@
   *  - WMI (TLV): SERVICE_READY -> INIT -> READY, then a passive scan (nothing is transmitted);
   *    each BSS seen is logged once, its BSSID masked.
   */
@@ -15,7 +15,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define WLAN_SID_MASK       0x1
  #define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
  #define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
-@@ -3711,6 +3712,25 @@
+@@ -3712,6 +3713,25 @@
  	uint64_t used = 0;
  
  	LOG("smmu: sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs, page %x x%u", cr0, id0, id1, nsmr, ncb, psize, npage);
@@ -41,7 +41,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
  		smr = r32(s, 0x800 + 4 * i);
  		s2cr = r32(s, 0xC00 + 4 * i);
-@@ -3761,9 +3781,9 @@
+@@ -3762,9 +3782,9 @@
  
  /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
  

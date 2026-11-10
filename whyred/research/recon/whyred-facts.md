@@ -440,6 +440,11 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   (USFCFG=1: unmatched streams fault), ID0 0x48017a06, ID1 0x40008015: 6 SMRs, 21 CBs, 4 KB pages x32.
   Then the modem thread stalled inside the topaz identity-bank writes (iOS kept running). The SMMU
   is qcom,skip-init: next run lists SMR/S2CR read-only (writes only with wifi_smmu=1).
+- Read-only run (kernel 42898741854): all 6 SMRs invalid (0), every S2CR 0x000200ff (type 2 fault,
+  cb 63): nothing routes SID 0x1a00. Linux qcom,iommu-dma = "bypass" -> SMR + S2CR type 1 (bypass).
+- Crash reason now readable: "dog_hb.c:266:Task starvation: diag, ping: 4" at 13.7 s, after tftp
+  "image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig" and mcfg_sw "not found": the FAT index only went one
+  directory deep. Fixed: recursive (8 levels), 96-byte paths, 4096 entries.
 
 ## Not yet known
 

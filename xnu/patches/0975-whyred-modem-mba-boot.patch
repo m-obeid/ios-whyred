@@ -157,7 +157,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	{ "modem.b00", 0x1e1d000, 0x414, 0xaacde80c },
  	{ "modem.b01", 0x1e21000, 0x1f78, 0x80555ebe },
  	{ "modem.b02", 0x1e25000, 0x2930, 0x0858b3a0 },
-@@ -208,49 +214,225 @@
+@@ -208,49 +214,226 @@
  	{ "modem.mdt", 0x4a6d000, 0x238c, 0x8742d22b },
  };
  
@@ -167,9 +167,9 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 + * read cluster run by cluster run through sweet_emmc_read_part. 8.3 names, lower case (vfat
 + * shortname=lower, as Linux mounts it); long-name entries are skipped.
 + */
-+struct fat_file { char path[40]; uint32_t size, clus; };
++struct fat_file { char path[96]; uint32_t size, clus; };
 +static struct fat_file *fat_files;
-+static unsigned fat_count, fat_max = 1024;
++static unsigned fat_count, fat_max = 4096;
 +static uint16_t *fat_tab;                       /* FAT16 */
 +static uint32_t fat_entries, fat_spc, fat_clus_bytes;
 +static uint64_t fat_data_off, fat_root_off;
@@ -189,17 +189,17 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +}
 +
 +static void
-+fat_add_dir(const uint8_t *d, uint32_t bytes, const char *prefix, bool recurse);
++fat_add_dir(const uint8_t *d, uint32_t bytes, const char *prefix, unsigned depth);
 +
 +static void
-+fat_list_clusters(uint32_t clus, const char *prefix)
++fat_list_clusters(uint32_t clus, const char *prefix, unsigned depth)
 +{
 +	uint8_t *buf = (uint8_t *)IOMalloc(fat_clus_bytes);
 +	for (unsigned guard = 0; buf != NULL && clus >= 2 && clus < 0x0ffffff8 && guard < 4096; guard++) {
 +		if (!fat_part_read(fat_data_off + (uint64_t)(clus - 2) * fat_clus_bytes, buf, fat_clus_bytes)) {
 +			break;
 +		}
-+		fat_add_dir(buf, fat_clus_bytes, prefix, false);
++		fat_add_dir(buf, fat_clus_bytes, prefix, depth);
 +		clus = fat_next(clus);
 +	}
 +	if (buf != NULL) {
@@ -207,8 +207,9 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	}
 +}
 +
++/* depth: directories still to descend into (the modem asks for image/modem_pr/mcfg/configs/...) */
 +static void
-+fat_add_dir(const uint8_t *d, uint32_t bytes, const char *prefix, bool recurse)
++fat_add_dir(const uint8_t *d, uint32_t bytes, const char *prefix, unsigned depth)
 +{
 +	for (uint32_t o = 0; o + 32 <= bytes; o += 32) {
 +		const uint8_t *e = d + o;
@@ -231,13 +232,13 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +		}
 +		name[n] = 0;
 +		uint32_t clus = e[26] | e[27] << 8, size = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24;
-+		char path[40];
++		char path[96];
 +		snprintf(path, sizeof(path), "%s%s", prefix, name);
 +		if (e[11] & 0x10) {
-+			if (recurse) {
-+				char sub[40];
++			if (depth > 0) {
++				char sub[96];
 +				snprintf(sub, sizeof(sub), "%s/", path);
-+				fat_list_clusters(clus, sub);
++				fat_list_clusters(clus, sub, depth - 1);
 +			}
 +			continue;
 +		}
@@ -287,7 +288,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +		LOG("%s: cannot read the FAT", fw_part);
 +		return EIO;
 +	}
-+	fat_add_dir(root, fat_root_bytes, "", true);
++	fat_add_dir(root, fat_root_bytes, "", 8);
 +	IOFree(root, fat_root_bytes);
 +	LOG("%s: FAT16, %u clusters of %u bytes, %u files", fw_part, clusters, fat_clus_bytes, fat_count);
 +	return 0;
@@ -343,7 +344,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  {
 -	int i = fw_find(name);
 -	return i < 0 ? -1 : (int64_t)fw_files[i].size;
-+	char path[40];
++	char path[96];
 +	snprintf(path, sizeof(path), "image/%s", name);
 +	int i = fw_all_find(path);
 +	return i < 0 ? -1 : (int64_t)fat_files[i].size;
@@ -358,7 +359,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 -
 -	if (i < 0 || fw_files[i].size > max) {
 -		LOG("%s: not in the table or too big (%lld)", name, fw_size(name));
-+	char path[40];
++	char path[96];
 +	snprintf(path, sizeof(path), "image/%s", name);
 +	int i = fw_all_find(path);
 +	if (i < 0 || fat_files[i].size > max) {
@@ -402,7 +403,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  static struct smem_part_hdr *
  smem_partition(uint16_t a, uint16_t b)
  {
-@@ -292,6 +474,30 @@
+@@ -292,6 +475,30 @@
  		}
  		e += sizeof(*h) + h->pad_hdr + h->size;
  	}
@@ -433,7 +434,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	return NULL;
  }
  
-@@ -443,7 +649,7 @@
+@@ -443,7 +650,7 @@
  #define SMEM_GLINK_FIFO_TX  479
  #define SMEM_GLINK_FIFO_RX  480
  #define GLINK_TX_SIZE       0x4000u
@@ -442,7 +443,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define GLINK_FEATURES      1                   /* INTENT_REUSE */
  
  #define CMD_VERSION         0
-@@ -1000,6 +1206,17 @@
+@@ -1000,6 +1207,17 @@
  			q_announced = true;
  		}
  	}
@@ -460,7 +461,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	/* nobody opened IPCRTR after 2 s: open it from our side */
  	if (ms >= 2000 && !g_open_sent && g_rx != NULL) {
  		LOG("t=%u ms: modem did not open IPCRTR, opening it", ms);
-@@ -1038,7 +1255,7 @@
+@@ -1038,7 +1256,7 @@
  #define QMI_RESP            2
  
  /* generated by fwtable_all.py from NON-HLOS.bin (HyperOS 2.0.208 modem_a): 657 files, 657 extents */
@@ -469,7 +470,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	{ 0x25000, 0x4d4 },
  	{ 0x29000, 0x2098 },
  	{ 0x2d000, 0x14ef4 },
-@@ -1697,7 +1914,7 @@
+@@ -1697,7 +1915,7 @@
  	{ 0x7239000, 0x2ecfa },
  	{ 0x7269000, 0x3a39c0 },
  };
@@ -478,7 +479,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	{ "image/adsp.b00", 0x4d4, 0, 1 },
  	{ "image/adsp.b01", 0x2098, 1, 1 },
  	{ "image/adsp.b02", 0x14ef4, 2, 1 },
-@@ -2357,36 +2574,6 @@
+@@ -2357,36 +2575,6 @@
  	{ "image/wlanmdsp.mbn", 0x3a39c0, 656, 1 },
  };
  
@@ -515,7 +516,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  /* QMI */
  struct qmsg { uint8_t b[512]; uint32_t n; };
  
-@@ -2780,7 +2967,7 @@
+@@ -2780,7 +2968,7 @@
  			tftp_close(s);
  			return;
  		}
@@ -524,7 +525,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  		LOG("t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", g_ms, path, s->seek, s->rsize, s->blk, s->wsize, s->size);
  	}
  	if (!opts) {
-@@ -2884,7 +3071,7 @@
+@@ -2884,7 +3072,7 @@
  }
  
  /* rmtfs */
@@ -533,7 +534,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define VMID_HLOS           3
  #define VMID_MSS_MSA        15
  #define VMID_NAV            0x2B
-@@ -3005,12 +3192,20 @@
+@@ -3005,12 +3193,20 @@
  	}
  	case 4: {                                   /* ALLOC_BUFF */
  		if (rmtfs_pa == 0) {
@@ -558,7 +559,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  			}
  		}
  		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);
-@@ -3058,7 +3253,7 @@
+@@ -3058,7 +3254,7 @@
  #define WLFW_MSA_INFO       0x2D
  #define WLFW_MSA_READY      0x2E
  #define WLFW_HOST_CAP       0x34
@@ -567,7 +568,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define WLFW_MSA_SIZE       0x00100000u
  #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
  #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
-@@ -3207,7 +3402,7 @@
+@@ -3207,7 +3403,7 @@
  		LOG("wlfw: no board data file");
  		return;
  	}
@@ -576,7 +577,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	w_bdf_off = 0;
  	w_bdf_seg = 0;
  	LOG("t=%u ms: wlfw: board data %s, %u bytes", g_ms, name, w_bdf_len);
-@@ -6095,7 +6290,65 @@
+@@ -6095,7 +6291,65 @@
  	}
  }
  
@@ -643,7 +644,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  static bool
  loadable(const struct elf32_phdr *p)
-@@ -6106,11 +6359,11 @@
+@@ -6106,11 +6360,11 @@
  static bool
  modem_boot(void)
  {
@@ -660,7 +661,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  	struct smem_part_hdr *part = smem_partition(0, 1);
  	LOG("SMEM apps<->modem partition %p", part);
-@@ -6121,14 +6374,103 @@
+@@ -6121,14 +6375,103 @@
  		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
  		return false;
  	}
@@ -768,7 +769,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	}
  	mdt = (uint8_t *)IOMalloc(mdt_size);
  	if (mdt == NULL || fw_read("modem.mdt", mdt, mdt_size) != mdt_size) {
-@@ -6141,75 +6483,51 @@
+@@ -6141,75 +6484,51 @@
  			LOG("modem.mdt: bad ELF header");
  			goto out;
  		}
@@ -870,7 +871,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  			}
  			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
  			int64_t got = 0;
-@@ -6219,7 +6537,7 @@
+@@ -6219,7 +6538,7 @@
  				if (got != (int64_t)ph[i].p_filesz) {
  					LOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
  					m->release();
@@ -879,7 +880,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  				}
  			}
  			if (ph[i].p_memsz > got) {
-@@ -6227,24 +6545,29 @@
+@@ -6227,24 +6546,29 @@
  			}
  			mb();
  			m->release();
@@ -921,7 +922,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	return ok;
  }
  
-@@ -6274,10 +6597,9 @@
+@@ -6274,10 +6598,9 @@
  	state = -1;
  	soc_lock = IOLockAlloc();
  	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
@@ -933,7 +934,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  		if (err == EAGAIN) {
  			IOSleep(500);
  		}
-@@ -6344,14 +6666,14 @@
+@@ -6344,14 +6667,14 @@
  topaz_part_fw_size(const char *path)
  {
  	int i = fw_all_find(path);
