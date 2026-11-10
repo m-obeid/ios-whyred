@@ -360,6 +360,30 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Battery fix confirmed in the same boot (kernel run 42854797661): 91 % 4234 mV +114 mA charging=1.
 - Default image whyred/out/xnu-ios-fast6.img = kernel 42854797661 + sweetbattery=2 + topaz_inject.
 
+## Wi-Fi recon (2026-11-10)
+
+- Linux: wlan0 up (WCN3990 via icnss + the modem's WLAN PD). Modem: pil-q6v5-mss with
+  "No pas_id found" -> self-authenticating MBA boot (mba.mbn then modem.mdt/bNN into
+  0x8ac00000..0x92200000), NOT the TrustZone PAS path topaz uses. Linux sources:
+  drivers/soc/qcom/pil-msa.c, pil-q6v5.c, pil-q6v5-mss.c (lineage-21 tree).
+- DT: qcom,mss@4080000 (qdsp6v62-1-5; reg qdsp6_base 0x4080000, halt_q6 0x1f63000, halt_modem
+  0x1f65000, halt_nc 0x1f64000, rmb_base 0x4180000, restart_reg 0x179000, cxip_lm_vote_clear
+  0x1fe5048), mem-protect-id 0xf, modem_fw_region 0x8ac00000 (0x7e00000), pil_mba_region
+  0x94800000 (0x200000). icnss@18800000 (membase 0x18800000 size 0x800000, 12 IRQs 0x19d..0x1a9,
+  SMMU anoc2 0x16c0000 SIDs 0x1a00/0x1a01, wlan-msa 0x85700000 1 MB). SMEM 0x86000000 (2 MB, hwlock 3).
+  GLINK over SMEM to "mpss" (remote pid 1, IPCRTR channel, IRQ 0x1c4, APCS mailbox 0x17911000 bit 15).
+- Firmware: modem partition mmcblk0p56 (FAT, mounted /vendor/firmware_mnt): image/mba.mbn,
+  modem.mdt + b00..b28, wlanmdsp.mbn, bdwlan.bin / .1xx / .bxx. bt_firmware mmcblk0p38, persist p53.
+- topaz reference (subagent survey of patches 0113-0130, 0900): one file iokit/Kernel/arm/TopazModem.cpp,
+  polled thread. Generic and reusable: SMEM parser, SMP2P, GLINK, QRTR, QMI, pd-mapper/tftp/rmtfs,
+  WLFW, CE/HTC/WMI-TLV/HTT (already WCN3990 ath10k snoc tables), WPA2, all of 0900 (en0, Apple80211
+  ioctls). topaz README: joins WPA2, Safari works. SoC-specific: all addresses, PAS boot, SMMU SID,
+  SMP2P bits, hardcoded firmware offset tables (FAT16 modem_a), UFS-only partition reads.
+- Plan: (1) MBA modem boot, prototyped in the shim (fast local loop, screen output) until the
+  modem reports SMP2P ready; (2) port into TopazModem.cpp with whyred addresses and eMMC FAT reads;
+  (3) host services (rmtfs on modemst1/2/fsg, tftp, pd-mapper); (4) WLFW + CE with icnss addresses
+  and SMMU; (5) enable 0900 for en0 / Settings.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
