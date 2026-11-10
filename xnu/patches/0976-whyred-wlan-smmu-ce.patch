@@ -53,3 +53,53 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define SR_BASE_LO          0x00
  #define SR_BASE_HI          0x04
  #define SR_SIZE             0x08
+@@ -6683,6 +6703,41 @@
+ 	return smmu_identity(sid, mask, name);
+ }
+ 
++/*
++ * whyred: the WCN3990 supplies (icnss DT): vdd-cx-mx pm660_l5, vdd-1.8-xo pm660_l9 (pin ctrl),
++ * vdd-1.3-rfa pm660_l6 (pin ctrl), vdd-3.3-ch0 pm660_l19 (pin ctrl): RPM-SMD LDOs. Linux votes them
++ * on before the WLAN firmware starts; nothing does here. Read-only state of each (PM660 SID 1,
++ * LDOn at 0x4000 + (n - 1) * 0x100): STATUS1 0x08, VSET 0x40/41 (mV), MODE 0x45, EN_CTL 0x46,
++ * FOLLOW_HW_EN 0x47.
++ */
++extern "C" int whyred_spmi_init(void);
++extern "C" int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++static void
++wlan_rails_dump(const char *when)
++{
++	static const struct { const char *name; uint16_t base; } ldo[] = {
++		{ "l5 cx-mx", 0x4400 }, { "l6 1.3-rfa", 0x4500 }, { "l9 1.8-xo", 0x4800 }, { "l19 3.3-ch0", 0x5200 },
++	};
++	if (whyred_spmi_init() != 0) {
++		LOG("rails: no SPMI");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(ldo) / sizeof(ldo[0]); i++) {
++		uint8_t v[6] = {};
++		static const uint8_t off[6] = { 0x08, 0x40, 0x41, 0x45, 0x46, 0x47 };
++		bool ok = true;
++		for (unsigned k = 0; k < 6; k++) {
++			ok = ok && whyred_spmi_read(1, ldo[i].base + off[k], &v[k]) == 0;
++		}
++		LOG("rails %s: %s %04x: status %02x vset %u mV mode %02x en_ctl %02x hw_en %02x", when, ldo[i].name,
++		    ldo[i].base, v[0], v[1] | v[2] << 8, v[3], v[4], v[5]);
++		if (!ok) {
++			LOG("rails: read failed at %04x", ldo[i].base);
++		}
++	}
++}
++
+ static void
+ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -6697,6 +6752,7 @@
+ 		return;
+ 	}
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
++	wlan_rails_dump("before modem boot");
+ 	if (wifi_enabled() && !smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
