@@ -19,3 +19,4 @@ whyred/out/
 whyred/backup/
 whyred/ipsw/
 whyred/tools/osmdump/*.ko
+whyred/firmware/

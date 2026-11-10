@@ -543,6 +543,21 @@ void shim_main(uint64_t dtb)
 	con_newline();
 
 	uintptr_t ps, pe;
+#ifdef MSS_PROBE
+	if (ramdisk_find(dtb, &ps, &pe)) {
+		puts_("modem MBA boot probe (ramdisk = mba.mbn)");
+		con_newline();
+		con_newline();
+		mss_probe(ps, pe);
+		con_newline();
+		puts_("reset in ");
+		dec(REBOOT_AFTER_S);
+		puts_(" s");
+		con_newline();
+		delay_ms(REBOOT_AFTER_S * 1000);
+		reboot_to_fastboot();
+	}
+#endif
 	if (payload_find(dtb, &ps, &pe)) {
 		puts_("xnu payload found, handing off to Gold 0x100");
 		con_newline();

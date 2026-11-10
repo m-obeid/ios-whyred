@@ -7,6 +7,7 @@
 # OSM=1 ./build.sh           read-only Gold clock/voltage probe (OSM, CPRH, PLL)
 # OSM=1 OSM_TARGET=n          also bring up CPRH (open loop) + OSM and request table row n
 # CPRH_OL=1                   CPRH open loop (fused ceiling voltages) instead of the hardware closed loop
+# MSS=1 ./build.sh ../firmware/modem/mba.mbn   modem MBA boot probe (step 1a), ramdisk = mba.mbn
 # GOLD_ROW=n ./build.sh PAYLOAD   Gold OSM row before XNU (default 4 = 1804.8 MHz, 0 = leave at 600 MHz)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -24,17 +25,18 @@ mkdir -p out
 [ -f font.h ] || python3 gen_font.py "$FONT"
 
 $CC $CFLAGS -c start.S -o out/start.o
-$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} ${OSM:+-DOSM_PROBE} ${OSM_TARGET:+-DOSM_TARGET=$OSM_TARGET} ${GOLD_ROW:+-DGOLD_ROW=$GOLD_ROW} -c main.c -o out/main.o
+$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} ${OSM:+-DOSM_PROBE} ${MSS:+-DMSS_PROBE} ${OSM_TARGET:+-DOSM_TARGET=$OSM_TARGET} ${GOLD_ROW:+-DGOLD_ROW=$GOLD_ROW} -c main.c -o out/main.o
 $CC $CFLAGS ${CPRH_OL:+-DCPRH_OL} -c osm.c -o out/osm.o
 $CC $CFLAGS -c xnu.c -o out/xnu.o
 $CC $CFLAGS -c emmc.c -o out/emmc.o
+$CC $CFLAGS -c mss.c -o out/mss.o
 
 # The image runs wherever ABL loads it. Only the header's image_size may be absolute.
-abs=$($READELF -r out/main.o out/xnu.o out/emmc.o out/osm.o | grep -c ABS64 || true)
+abs=$($READELF -r out/main.o out/xnu.o out/emmc.o out/osm.o out/mss.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 
 $CC $CFLAGS -static -no-pie -T shim.ld -Wl,--build-id=none -Wl,-N -Wl,--no-warn-rwx-segments \
-	out/start.o out/main.o out/xnu.o out/emmc.o out/osm.o -o out/shim.elf
+	out/start.o out/main.o out/xnu.o out/emmc.o out/osm.o out/mss.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # Pad to image_size so .bss and the stacks are part of the loaded file.
 size=$((16#$($NM out/shim.elf | awk '$3=="_end"{print $1}')))

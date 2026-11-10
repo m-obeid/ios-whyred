@@ -154,6 +154,19 @@ int payload_find(uintptr_t dtb, uintptr_t *start, uintptr_t *end)
 	return 1;
 }
 
+/* The boot image ramdisk as ABL placed it, whatever it holds (MSS probe: mba.mbn). */
+int ramdisk_find(uintptr_t dtb, uintptr_t *start, uintptr_t *end)
+{
+	uint64_t lo, hi;
+	if (!fdt_chosen_num(dtb, "linux,initrd-start", &lo) || !fdt_chosen_num(dtb, "linux,initrd-end", &hi))
+		return 0;
+	if ((lo & 3) || hi <= lo)
+		return 0;
+	*start = lo;
+	*end = hi;
+	return 1;
+}
+
 static uintptr_t gicr_for(uint32_t aff)
 {
 	for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {

@@ -45,10 +45,14 @@ void osm_probe(void);
 void osm_probe2(void);
 int osm_bringup(unsigned target);
 
+/* mss.c */
+void mss_probe(uintptr_t mba, uintptr_t mba_end);
+
 /* emmc.c */
 void emmc_probe(void);
 
 /* xnu.c */
 int payload_find(uintptr_t dtb, uintptr_t *start, uintptr_t *end);
+int ramdisk_find(uintptr_t dtb, uintptr_t *start, uintptr_t *end);
 void gic_prepare(void);
 const char *xnu_boot(uintptr_t start, uintptr_t end);
