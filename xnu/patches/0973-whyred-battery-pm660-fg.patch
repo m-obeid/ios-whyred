@@ -109,7 +109,7 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
  		    percent, mv, external, charging);
  		fLastMode = mode;
  	}
-@@ -369,9 +380,84 @@
+@@ -369,9 +380,85 @@
  	return true;
  }
  
@@ -119,7 +119,8 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
 + * both match.
 + *   0x4009/0x400a  BATT_SOC_FG_MONOTONIC_SOC (+ CP): 0..255
 + *   0x41a0/0x41a6  BATT_INFO_VBATT (+ CP): 122.07 uV per bit
-+ *   0x41a2/0x41a8  BATT_INFO_IBATT (+ CP): signed, 488.28 uA per bit, positive = discharging
++ *   0x41a2/0x41a8  BATT_INFO_IBATT (+ CP): signed, 488.28 uA per bit, positive = charging
++ *                  (Linux bms current_now +381835 uA while charging, 2026-11-10)
 + *   0x4150         BATT_INFO_BATT_TEMP: 10 bits, quarter Kelvin
 + *   0x1006 [2:0]   BATTERY_CHARGER_STATUS_1: trickle, pre, fast, full-on, taper, terminate, ...
 + *   0x1310 bit 4   USBIN_PLUGIN_RT_STS
@@ -160,7 +161,7 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
 +	unsigned percent = soc == 255 ? 100 : soc == 0 ? 0 : (((unsigned)soc - 1) * 98u + 126u) / 253u + 1u;
 +	unsigned mv = (unsigned)(((uint64_t)rv * 122070u) / 1000000u);
 +	int ua = (int)(((int64_t)(int16_t)ri * 488281) / 1000);
-+	int ma = -ua / 1000;                    /* IOPMPowerSource: positive = charging */
++	int ma = ua / 1000;                     /* IOPMPowerSource: positive = charging, as the gauge */
 +	int kq = ((th & 7) << 8) | tl;          /* quarter Kelvin */
 +	int deci = ((kq + 2) / 4 - 273) * 10;
 +	if (mv < 2800 || mv > 4600 || deci < -400 || deci > 900) {
@@ -194,7 +195,7 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
  	if (fReal && pollTopaz()) {
  		return;
  	}
-@@ -438,10 +524,15 @@
+@@ -438,10 +525,15 @@
  	(void)sweet_cpufreq_max();
  	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
  	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
@@ -211,7 +212,7 @@ diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.c
  		fLoop = IOWorkLoop::workLoop();
  		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
  		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
-@@ -449,7 +540,7 @@
+@@ -449,7 +541,7 @@
  			fRunning = true;
  			fTimer->setTimeoutMS(10000);
  		} else {
