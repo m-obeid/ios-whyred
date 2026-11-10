@@ -242,7 +242,7 @@ int osm_bringup(unsigned target)
 	wr(0x148008, rd32(0x148008) | 1u);
 	gold_state("clk   ");
 
-	/* 4. CPRH, open loop: Linux's values with MARGIN_ADJ_CTL bit 4 (hardware closed loop) clear. */
+	/* 4. CPRH with Linux's values. Closed loop (0x7f8 bit 4) by default, CPRH_OL=1 for open loop. */
 	wr(CPRH + 0x00c, 0x17700);
 	wr(CPRH + 0x014, 0x38c);
 	wr(CPRH + 0x004, 0x1c1e);                       /* loop off while configuring */
@@ -252,7 +252,7 @@ int osm_bringup(unsigned target)
 	wr(CPRH + 0x700, 0x4);
 	wr(CPRH + 0x7a4, 0x21);
 	wr(CPRH + 0x7a8, 0x00844b00);                   /* settle count 33 */
-#ifdef CPRH_CL
+#ifndef CPRH_OL
 	wr(CPRH + 0x85c, 0x1de);                        /* thread 0 RO 7 target quotient (Linux dump) */
 	wr(CPRH + 0x7f8, 0x4090);                       /* PMIC step 4, hardware closed loop */
 #else
@@ -326,12 +326,10 @@ int osm_bringup(unsigned target)
 		dec(r);
 		gold_state(" ");
 	}
-#ifdef CPRH_CL
-	/* Closed loop: the voltage should settle from the open-loop ceiling toward Linux's ~788 mV. */
-	for (int i = 0; i < 5; i++) {
-		delay_ms(200);
-		gold_state("cl    ");
-	}
+#ifndef CPRH_OL
+	/* Closed loop settles from the open-loop ceiling to ~792 mV at row 4 (Linux: 788). */
+	delay_ms(100);
+	gold_state("cl    ");
 #endif
 	return 0;
 }

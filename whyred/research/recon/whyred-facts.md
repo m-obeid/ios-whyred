@@ -271,6 +271,14 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   (fork/exec or page faults are candidates).
 - Patch 0969: the 10 s log line adds the CPRH corner and mV (0x179c7aa4), and boot-args
   sweettherm_hot / sweettherm_cool (deci-C) for testing steps. CI 42789978412.
+- Kernel run 42789978412 (sha 02cc26a2...af92). Open loop, sweettherm_hot=650 cool=550, 4 busy loops:
+  65.0 C -> row 3 (828 mV), 65.7 C -> row 2 (756 mV), plateau 61.8 C at row 2, after the load
+  51.4 C -> row 3, 52.4 C -> row 4 (840 mV). Steps and recovery work.
+- CPRH closed loop (shim 0x85c = 0x1de, 0x7f8 = 0x4090): 792 mV idle, 796 mV under full load at row 4
+  (open loop 840, Linux 788). 140 s of 3 busy loops + repeated md5 of a 50 MB random file: 522 runs,
+  0 mismatches. Peak 70.5 C (open loop 71.2). Closed loop is now the shim default, CPRH_OL=1 for open.
+- Default image whyred/out/xnu-ios-fast3.img: kernel 42789978412, closed loop, row 4, sweettherm=1
+  default thresholds 90 / 75 C, otherwise the fast2 boot-args.
 
 ## Not yet known
 
