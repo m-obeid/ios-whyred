@@ -425,6 +425,18 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   missing), ALLOC -> FATAL 15 ms after (reads 1). topaz assigns rmtfs 3 MB to HLOS+MSS+NAV; whyred
   Linux (msm_sharedmem, no qcom,vm-nav-path, qcom,guard-memory): 2 MB to HLOS+MSS_MSA, 4 KB guards.
 
+- Fix 2 works (kernel run 42894230510, modem=1, no wifi=1): rmtfs buffer a0404000+200000 to HLOS+MSS_MSA
+  ret 0; ~42 QRTR services (nas, wds, uim, dms, ipa ...); pd-mapper tms/pdr_enabled, avs/audio,
+  kernel/elf_loader; tftp served image/wlanmdsp.mbn (3717208 B) from the FAT index; at 722 ms
+  *** WLFW service 0x45 up (node 0 port 0x53) ***: ind_register ok, host_cap rejected (err 1, not fatal),
+  msa_info ok (2 MSA regions), msa_ready ok, cap ok: chip_id 140 family 4002 (WCN3990), board_id ff,
+  fw 101c821a 2019-07-25, WLAN.HL.1.0.1.c2-00538-QCAHLSWMTPLZ-1.214870.1. Then "waiting MSA_READY ind",
+  FATAL at 13.6 s (crash reason item 421 empty).
+- Suspects for the 13.6 s FATAL: the host side of WLFW stops without wifi=1 (no BDF, wlan_cfg, mode);
+  WCN3990 rails (icnss vdd-cx-mx, vdd-1.8-xo, vdd-1.3-rfa, vdd-3.3-ch0: RPM-SMD LDOs) never voted on.
+- Next for wifi=1: SMMU anoc2 0x16c0000 SIDs 0x1a00/0x1a01 (topaz: apps SMMU 0x0C600000 SID 0x1A0),
+  CE base 0x18800000 + 0x240000, shadow 0x18800000 + 0x32000, board file bdwlan.bin (board_id ff).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
