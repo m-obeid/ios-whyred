@@ -252,7 +252,12 @@ int osm_bringup(unsigned target)
 	wr(CPRH + 0x700, 0x4);
 	wr(CPRH + 0x7a4, 0x21);
 	wr(CPRH + 0x7a8, 0x00844b00);                   /* settle count 33 */
+#ifdef CPRH_CL
+	wr(CPRH + 0x85c, 0x1de);                        /* thread 0 RO 7 target quotient (Linux dump) */
+	wr(CPRH + 0x7f8, 0x4090);                       /* PMIC step 4, hardware closed loop */
+#else
 	wr(CPRH + 0x7f8, 0x4080);                       /* PMIC step 4, open loop */
+#endif
 	for (int i = 0; i < 8; i++)
 		wr(CPRH + 0x3a00 + 4 * i, cprh_corner[i]);
 	wr(0x17812904, 0x01010031);                     /* SAW AVS ctl and limit, as spm_devices.c */
@@ -321,5 +326,12 @@ int osm_bringup(unsigned target)
 		dec(r);
 		gold_state(" ");
 	}
+#ifdef CPRH_CL
+	/* Closed loop: the voltage should settle from the open-loop ceiling toward Linux's ~788 mV. */
+	for (int i = 0; i < 5; i++) {
+		delay_ms(200);
+		gold_state("cl    ");
+	}
+#endif
 	return 0;
 }

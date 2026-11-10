@@ -1,0 +1,140 @@
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -7,7 +7,8 @@
+  * OSM performance request (DCVS_PERF_STATE_DESIRED, perf block 0x179c3f10) down when hot and back
+  * up when cool. Linux's own step trip for these zones is 105 C, critical 115/125 C.
+  *
+- * boot-args: sweettherm=0 off, 1 on (default), 2 also log the temperature every 10 s.
++ * boot-args: sweettherm=0 off, 1 on (default), 2 also log the temperature and LSE emulation
++ *            rates every 10 s.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -37,6 +38,13 @@
+ #define POLL_MS                 500
+ #define UP_HOLD_POLLS           4               /* at most one step up every 2 s */
+ 
++/* osfmk/arm64/sleh.c (patch 0968): LSE/LDAPR emulation statistics. */
++extern uint64_t sweet_lse_ops[11];
++struct sweet_lse_site {
++	uint64_t pc, n;
++};
++extern struct sweet_lse_site sweet_lse_sites[64];
++
+ static vm_offset_t tsens, osm;
+ static int therm_chan;
+ static int therm_mode;
+@@ -84,6 +92,44 @@
+ 	printf("WHYRED THERMAL: gold %d.%d C -> OSM row %u\n", temp / 10, temp % 10, row);
+ }
+ 
++/* Emulated LSE ops in the last interval, by op, and the four hottest PCs overall. */
++static void
++lse_report(unsigned secs)
++{
++	static uint64_t last[11];
++	static const char *const names[11] = {
++		"add", "clr", "eor", "set", "smax", "smin", "umax", "umin", "swp", "cas", "ldapr",
++	};
++	uint64_t total = 0;
++	char line[200];
++	int len = 0;
++	for (int i = 0; i < 11; i++) {
++		uint64_t n = sweet_lse_ops[i], d = n - last[i];
++		last[i] = n;
++		total += d;
++		if (d != 0 && len < (int)sizeof(line) - 24) {
++			len += snprintf(line + len, sizeof(line) - (size_t)len, " %s %llu", names[i], d / secs);
++		}
++	}
++	line[len] = 0;
++	printf("WHYRED LSE: %llu/s:%s\n", total / secs, line);
++	struct sweet_lse_site top[4] = {};
++	for (int i = 0; i < 64; i++) {
++		struct sweet_lse_site s = sweet_lse_sites[i];
++		for (int j = 0; j < 4; j++) {
++			if (s.n > top[j].n) {
++				for (int k = 3; k > j; k--) {
++					top[k] = top[k - 1];
++				}
++				top[j] = s;
++				break;
++			}
++		}
++	}
++	printf("WHYRED LSE top: %#llx %llu, %#llx %llu, %#llx %llu, %#llx %llu\n",
++	    top[0].pc, top[0].n, top[1].pc, top[1].n, top[2].pc, top[2].n, top[3].pc, top[3].n);
++}
++
+ static void
+ therm_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -124,6 +170,7 @@
+ 			}
+ 			if (therm_mode == 2 && (polls % (10000 / POLL_MS)) == 0) {
+ 				printf("WHYRED THERMAL: gold %d.%d C, OSM row %u\n", t / 10, t % 10, row);
++				lse_report(10);
+ 			}
+ 		}
+ 		polls++;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -888,6 +888,48 @@
+  * (machine_routines_asm.s); returns false for anything else (CASP stays
+  * EXC_BAD_INSTRUCTION).
+  */
++/*
++ * whyred: emulation statistics for bsd/dev/sweet_thermal.c (sweettherm=2 logs them every 10 s).
++ * Per-op counts and a 64-slot table of the hottest user PCs. Shared cache PCs are stored unslid,
++ * other PCs with bit 63 set. Updates are racy across CPUs; the numbers are approximate.
++ */
++#include <vm/vm_shared_region.h>
++struct sweet_lse_site {
++	uint64_t pc, n;
++};
++extern uint64_t sweet_lse_ops[11];
++extern struct sweet_lse_site sweet_lse_sites[64];
++uint64_t sweet_lse_ops[11];
++struct sweet_lse_site sweet_lse_sites[64];
++static uint64_t sweet_lse_slide, sweet_lse_sr_lo, sweet_lse_sr_hi;
++static bool sweet_lse_sr_known;
++
++static void
++sweet_lse_account(uint32_t op, uint64_t pc)
++{
++	sweet_lse_ops[op]++;
++	if (!sweet_lse_sr_known) {
++		vm_shared_region_t sr = vm_shared_region_get(current_task());
++		if (sr != NULL) {
++			sweet_lse_slide = sr->sr_slide;
++			sweet_lse_sr_lo = sr->sr_base_address;
++			sweet_lse_sr_hi = sr->sr_base_address + sr->sr_size;
++			sweet_lse_sr_known = true;
++			vm_shared_region_deallocate(sr);
++		}
++	}
++	uint64_t key = (pc >= sweet_lse_sr_lo && pc < sweet_lse_sr_hi) ? pc - sweet_lse_slide : pc | (1ULL << 63);
++	struct sweet_lse_site *s = &sweet_lse_sites[(key >> 2) & 63];
++	if (s->pc == key) {
++		s->n++;
++	} else if (s->n == 0) {
++		s->pc = key;
++		s->n = 1;
++	} else {
++		s->n--;                 /* a hotter PC wins the slot over time */
++	}
++}
++
+ static bool
+ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ {
+@@ -942,6 +984,7 @@
+ 	if (dst != 31) {
+ 		set_saved_state_reg(state, dst, (register_t)old);
+ 	}
++	sweet_lse_account(op, get_saved_state_pc(state));
+ 	add_saved_state_pc(state, 4);
+ 	return true;
+ }
