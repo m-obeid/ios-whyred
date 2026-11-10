@@ -446,6 +446,15 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   "image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig" and mcfg_sw "not found": the FAT index only went one
   directory deep. Fixed: recursive (8 levels), 96-byte paths, 4096 entries.
 
+## WCN3990 rails (2026-11-10)
+
+- Read-only dump (kernel 42904705967), PM660 SID 1 LDOs before the modem boots: l6 (vdd-1.3-rfa) 0x4500
+  status 94 vset 1304 mV en_ctl 80; l9 (vdd-1.8-xo) 0x4800 status 94 1800 mV en_ctl 80; l19 (vdd-3.3-ch0)
+  0x5200 status 94 3300 mV en_ctl 80; l5 (vdd-cx-mx) 0x4400 status 00 vset 848 mV en_ctl 00: OFF.
+  APIDs: 0x144 -> 98, 0x145 -> 118, 0x148 -> 132, 0x152 -> 155.
+- Patch 0977: whyred_spmi_write (only SID 1 0x4446, apps-owned channel) and, with wifi=1, l5 on before
+  the modem boots.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.

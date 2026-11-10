@@ -1,0 +1,143 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -1,7 +1,8 @@
+ /*
+  * whyred: read-only PMIC register access over the SPMI arbiter v3 (live DT qcom,spmi@800f000:
+  * core 0x800f000, obsrvr 0x9400000, cnfg 0x800a000, EE 0). One observer channel per APID at
+- * obsrvr + 0x8000 * apid; EXT_READL of one byte, as sweet_keys.c. No writes.
++ * obsrvr + 0x8000 * apid; EXT_READL of one byte, as sweet_keys.c. One write: whyred_spmi_write,
++ * through the APID's channel (chnls 0x8400000 + 0x8000 * apid), allowlisted registers only.
+  * Used by SweetBattery (sweetbattery=2) for the PM660 fuel gauge and charger status.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -13,9 +14,11 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int whyred_spmi_init(void);
+ int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++int whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ 
+ #define WS_CORE_PA      0x0800f000u
+ #define WS_OBS_PA       0x09400000u
++#define WS_CHNLS_PA     0x08400000u
+ #define WS_CNFG_PA      0x0800a000u
+ #define WS_APIDS        512u
+ #define WS_SLOTS        8u
+@@ -25,6 +28,8 @@
+ static struct {
+ 	uint16_t ppid;
+ 	vm_offset_t ch;         /* observer channel; 0 = no apps-owned APID */
++	uint16_t apid;
++	bool owned;             /* apps (EE 0) owns it: writes allowed */
+ } ws_slot[WS_SLOTS];
+ static unsigned ws_used;
+ 
+@@ -69,23 +74,28 @@
+ 	if (ws_used == WS_SLOTS) {
+ 		return 0;
+ 	}
+-	uint32_t found = WS_APIDS;
++	uint32_t found = WS_APIDS, owner = 7;
+ 	for (uint32_t a = 0; a < WS_APIDS; a++) {
+ 		uint32_t map = ws_rd(ws_core, 0x800u + 4u * a);
+ 		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+-		if ((ws_rd(ws_cnfg, 0x700u + 4u * a) & 7u) == 0) {
++		uint32_t own = ws_rd(ws_cnfg, 0x700u + 4u * a) & 7u;
++		if (own == 0) {
+ 			found = a;
++			owner = 0;
+ 			break;
+ 		}
+ 		if (found == WS_APIDS) {
+ 			found = a;
++			owner = own;
+ 		}
+ 	}
+ 	vm_offset_t ch = found == WS_APIDS ? 0 : ml_io_map(WS_OBS_PA + 0x8000u * found, 0x1000);
+ 	ws_slot[ws_used].ppid = ppid;
+ 	ws_slot[ws_used].ch = ch;
++	ws_slot[ws_used].apid = (uint16_t)found;
++	ws_slot[ws_used].owned = ch != 0 && owner == 0;
+ 	ws_used++;
+ 	printf("WHYRED SPMI: ppid %#x -> apid %u\n", ppid, found);
+ 	return ch;
+@@ -116,6 +126,46 @@
+ 		}
+ 		delay(1);
+ 	}
++	return -1;
++}
++/*
++ * The only registers this may write: PM660 (SID 1) LDO5 EN_CTL, the WCN3990 vdd-cx-mx supply
++ * (TopazModem.cpp, wifi=1). Linux turns it on through RPM-SMD; ABL leaves it off.
++ */
++int
++whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	if (!ws_ready || !(sid == 1 && addr == 0x4446)) {
++		printf("WHYRED SPMI: write %u:%#x refused\n", sid, addr);
++		return -1;
++	}
++	uint16_t ppid = (uint16_t)((sid & 0xfu) << 8 | ((addr >> 8) & 0xffu));
++	if (!ws_channel(ppid)) {
++		return -1;
++	}
++	unsigned i = 0;
++	while (i < ws_used && ws_slot[i].ppid != ppid) {
++		i++;
++	}
++	if (i == ws_used || !ws_slot[i].owned) {
++		printf("WHYRED SPMI: ppid %#x not apps-owned, write refused\n", ppid);
++		return -1;
++	}
++	vm_offset_t wr = ml_io_map(WS_CHNLS_PA + 0x8000u * ws_slot[i].apid, 0x1000);
++	if (!wr) {
++		return -1;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(wr + 0x10) = value;                         /* WDATA0 */
++	*(volatile uint32_t *)wr = (0u << 27) | ((addr & 0xffu) << 4);    /* EXT_WRITEL, 1 byte */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned k = 0; k < 1000; k++) {
++		uint32_t st = ws_rd(wr, 0x08);
++		if (st & 1u) {
++			return (st & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
+ 	return -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6712,6 +6712,7 @@
+  */
+ extern "C" int whyred_spmi_init(void);
+ extern "C" int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ 
+ static void
+ wlan_rails_dump(const char *when)
+@@ -6753,6 +6754,19 @@
+ 	}
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
+ 	wlan_rails_dump("before modem boot");
++	/*
++	 * Measured: l6, l9, l19 are on (ABL), l5 (vdd-cx-mx, VSET already 848 mV = Linux's
++	 * qcom,vdd-cx-mx-config) is off. Turn it on before the WLAN firmware starts.
++	 */
++	if (wifi_enabled()) {
++		uint8_t en = 0;
++		if (whyred_spmi_read(1, 0x4446, &en) == 0 && !(en & 0x80)) {
++			int r = whyred_spmi_write(1, 0x4446, (uint8_t)(en | 0x80));
++			IODelay(1000);
++			LOG("rails: pm660 l5 (vdd-cx-mx) on: %d", r);
++			wlan_rails_dump("after l5 on");
++		}
++	}
+ 	if (wifi_enabled() && !smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
