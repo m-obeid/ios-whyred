@@ -410,6 +410,15 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   running modem: SMEM 0x86000000, SMP2P, GLINK "mpss" IPCRTR, QRTR, then rmtfs/tftp/pd-mapper
   and WLFW.
 
+## Modem boots from the iOS kernel (patch 0975, 2026-11-10)
+
+- Kernel run 42888154568, boot-arg modem=1: "modem: FAT16, 12283 clusters of 16384 bytes, 309 files",
+  SMEM version 12, MBA runs (PBL 1, MBA 2), metadata status 3, region assign 0, 28 segments, status 4.
+  SMP2P item 435 up at 45 ms, slave-kernel 0x6 READY HANDOVER at 99 ms.
+- GLINK: descriptor 478 already made by the modem, our TX FIFO 479 (16 KB) allocated, VERSION sent
+  (APCS bit 15). The modem's FIFO 480 never appears in the apps-modem partition: rx 0, chan down.
+  The modem goes FATAL at 34.8 s (crash reason empty). Next: dump items 478-480 in both partitions.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
