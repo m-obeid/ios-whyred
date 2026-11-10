@@ -459,6 +459,20 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   needs an RPM-SMD request (glink-rpm over RPM message RAM, "ldoa" 5, swen/uv). Next build logs the
   exact arbiter status, and adds sysctl kern.whyred_backlight (WLED off/on for a dark test loop).
 
+## RPM-SMD client, WCN3990 power (2026-11-10/11)
+
+- Patch 0978: GLINK over RPM msg RAM 0x778000 (0x7000). TOC "grt0" at the end: {magic, count,
+  {id, offset, size}}; count 10, ap2r at 0x200 (0x6f8 bytes), r2ap at 0x900 (0x6f8). VERSION 1 ->
+  RPM sends VERSION + VERSION_ACK, opens two channels (rcid 2 and 3, 13- and 10-byte names); our
+  "rpm_requests" lcid 1 OPEN_ACK ok, remote rpm_requests rcid 3. Requests acknowledged with
+  "req" header + "msg#" (0x2367736d) answers. After "ldoa" 5 uv 848000 swen 1: pm660 l5 status 94,
+  en_ctl 80: on. Kernel run 42919412920.
+- Modem still FATAL at 13.7 s (diag starvation). Linux icnss (not ath10k) never waits for
+  MSA_READY_IND and sends no board data; after cap: icnss_hw_power_on (rails + clock
+  cxo_ref_clk_pin = RPM_SMD_RF_CLK1_PIN: "clka" id 4, key "pccb" 1), then waits FW_READY_IND.
+  topaz's w_start_bdf waited for MSA_READY_IND, so the host stalled after cap.
+- Next build: rf_clk1 pin-ctrl vote, after cap wait for FW_READY directly, no BDF.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.

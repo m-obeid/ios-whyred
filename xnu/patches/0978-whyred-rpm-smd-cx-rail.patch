@@ -1,7 +1,43 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -6739,6 +6739,235 @@
+@@ -3378,7 +3378,7 @@
+ }
+ 
+ /* bdwlan.bNN for board ids < 0x100, bdwlan.NNN otherwise, bdwlan.bin as fallback */
+-static void
++__attribute__((unused)) static void
+ w_start_bdf(void)
+ {
+ 	char name[40];
+@@ -3530,8 +3530,7 @@
+ 	if (d[0] == QMI_IND) {
+ 		if (msg == WLFW_MSA_READY_IND) {
+ 			LOG("t=%u ms: wlfw: MSA_READY indication", g_ms);
+-			w_msa_ind = true;
+-			w_start_bdf();
++			w_msa_ind = true;               /* whyred: icnss only counts it, no board data download */
+ 		} else if (msg == WLFW_FW_READY_IND) {
+ 			w_fw_ready = true;
+ 			LOG("t=%u ms: *** WLAN FIRMWARE READY ***", g_ms);
+@@ -3605,8 +3604,14 @@
+ 			}
+ 		}
+ 		w_cap_done = true;
+-		w_step = "waiting MSA_READY ind";
+-		w_start_bdf();
++		/*
++		 * whyred: Linux icnss (drivers/soc/qcom/icnss.c, server_arrive) sends no board data and
++		 * never waits for MSA_READY_IND (the firmware loads bdwlan itself): after cap it powers the
++		 * chip (rails + cxo_ref_clk_pin, done before the modem here) and waits for FW_READY_IND,
++		 * which then gets wlan_cfg and wlan_mode.
++		 */
++		w_step = "waiting FW_READY";
++		LOG("t=%u ms: wlfw: cap done, waiting for FW_READY (no BDF on SDM636 icnss)", g_ms);
+ 		break;
+ 	case WLFW_BDF_DOWNLOAD:
+ 		if (!ok) {
+@@ -6739,6 +6744,243 @@
  	}
  }
  
@@ -214,7 +250,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +		if (c - 1 == 9) {
 +			/* m[4..]: "req" header, then {msg_type "msg", len, msg_id, ["err", len, text]} */
 +			LOG("rpm: answer: svc %08x len %u type %08x len %u id %u %08x %08x", m[4], m[5], m[6], m[7], m[8], m[9], m[10]);
-+			return m[6] == 0x0067736d && m[8] == p[2] && m[9] != 0x00727265;   /* "msg", no "err" */
++			return m[6] == 0x2367736d && m[8] == p[2] && m[9] != 0x00727265;   /* "msg#", no "err" */
 +		}
 +		LOG("rpm: glink cmd %u while waiting", c - 1);
 +	}
@@ -232,12 +268,20 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	bool a = rpm_request(0, 0x616f646c, 5, kv, 2);       /* "ldoa" active set */
 +	bool b = rpm_request(1, 0x616f646c, 5, kv, 2);       /* sleep set */
 +	LOG("rpm: ldoa 5 on: active %s, sleep %s", a ? "ok" : "FAILED", b ? "ok" : "FAILED");
++	/*
++	 * icnss clocks = "cxo_ref_clk_pin": RPM_SMD_RF_CLK1_PIN, an XO buffer under pin control
++	 * ("clka" id 4, key "pccb" = 1; Linux clk-smd-rpm.c DEFINE_CLK_SMD_RPM_XO_BUFFER_PINCTRL).
++	 */
++	static const uint32_t ck[] = { 0x62636370, 1 };
++	a = rpm_request(0, 0x616b6c63, 4, ck, 1);
++	b = rpm_request(1, 0x616b6c63, 4, ck, 1);
++	LOG("rpm: clka 4 (rf_clk1 pin ctrl) on: active %s, sleep %s", a ? "ok" : "FAILED", b ? "ok" : "FAILED");
 +}
 +
  static void
  topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -6761,9 +6990,14 @@
+@@ -6761,9 +7003,14 @@
  	if (wifi_enabled()) {
  		uint8_t en = 0;
  		if (whyred_spmi_read(1, 0x4446, &en) == 0 && !(en & 0x80)) {
