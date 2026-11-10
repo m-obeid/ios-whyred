@@ -384,6 +384,22 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   (3) host services (rmtfs on modemst1/2/fsg, tftp, pd-mapper); (4) WLFW + CE with icnss addresses
   and SMMU; (5) enable 0900 for en0 / Settings.
 
+## Modem MBA boot, step 1a works (2026-11-10)
+
+- Shim MSS=1 (whyred/shim/mss.c), ramdisk = mba.mbn (0x3a2d0 bytes, ELF). Sequence: GCC clocks
+  (cfg_ahb 0x18a000, bimc_mss_q6 0x14401c, boot_rom vote 0x152004 bit 10, gpll0_out_msscc 0x15200c
+  bit 2, snoc 0x18a03c, mnoc 0x18a004: all on); MBA copied to 0x94800000; hyp_assign (SCM 0x42000c16)
+  1 MB HLOS -> VMID 15 returned 0; restart pulse 0x179000; RMB MBA_IMAGE = 0x94800000; q6v55
+  v62-1-5 power-up (XO CBCR 1, BHS status 1, 30 MEM_PWR banks, unclamp, reset release, CLK_ENA).
+  Result: RMB PBL status 1 (success), MBA status 2 (XPU unlocked, scribbled). No RPM rail votes needed.
+- Pitfalls: MSS registers (RMB 0x4180000) abort until gcc_mss_cfg_ahb runs (ESR 0x96000010).
+  Q6SS 0x4080000 reads abort once the core runs (FAR 0x4080014, ESR 0x96000210): poll RMB only.
+- Before power-up: Q6 RESET 7, PWR_CTL 0x00780000, MEM_PWR 0, GFMUX 0x100, BHS 0; RMB all 0.
+- Shim: exceptions now reboot after 60 s (lands in Linux, then tools/to-fastboot.sh); SCALE=3
+  makes the console readable through the webcam.
+- Next: 1b metadata auth (modem.mdt -> buffer after MBA, assign to VMID 15, RMB META_DATA +
+  CMD 1, wait status 3); 1c segments into 0x8ac00000 + verify_blob lengths, wait status 4.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.

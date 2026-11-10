@@ -240,7 +240,8 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 	dsb();
 	step('J');
 	con_newline();
-	q6_dump("q6 up");
+	/* No Q6SS reads from here on: once the core runs, apps reads of 0x4080000 abort (measured,
+	 * FAR 0x4080014, ESR 0x96000210). Linux only polls the RMB registers. */
 
 	/* 6. pil_msa_wait_for_mba_ready: PBL, then MBA. */
 	uint32_t st;
