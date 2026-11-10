@@ -328,6 +328,20 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   sha256 matches. Upload 50 MB random: 8.3 MB/s, sha256 matches. ~11 frames per TX batch under load.
 - Default image whyred/out/xnu-ios-fast5.img = fast4 + 0972.
 
+## Battery: PM660 fuel gauge (2026-11-10)
+
+- Linux reference (sysfs, charging): battery capacity 97, voltage_now 4161854, current_now -381835;
+  bms current_now +381835 (FG raw positive = charging), temp 340 (34.0 C), charge_full_design 4000000.
+  Linux picks profile ascent_3450mah (batt_id 60 kOhm) but "using OTP"; the pack is 4000 mAh.
+- Patch 0973: bsd/dev/whyred_spmi.c (read-only SPMI v3 observer reads, APID cache) and SweetBattery
+  sweetbattery=2: FG 0x4009/0x400a MSOC (Linux fg_get_msoc rounding), VBATT 0x41a0 (+CP 0x41a6)
+  x 122.07 uV, IBATT 0x41a2 (+CP 0x41a8) signed x 488.28 uA (positive = charging), BATT_TEMP 0x4150
+  (quarter K), SMB2 0x1006[2:0] charger state, 0x1310 bit 4 USB plugin. Design 4000 mAh. 10 s poll.
+- APIDs: ppid 0x40 -> 30, 0x41 -> 31, 0x10 -> 7, 0x13 -> 10.
+- First CI failed: missing kern/clock.h for delay(). Kernel run 42848264830 (sha 2d797f67...d5c7).
+  First read under iOS: 100% (raw 255) 4294 mV +42 mA 36.0 C, charger state 3 (full-on), USB 1.
+- Image whyred/out/xnu-ios-batt.img = fast5 + 0973 with sweetbattery=2.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
