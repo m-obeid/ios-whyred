@@ -1,0 +1,130 @@
+diff --git a/bsd/dev/sweet_wled.c b/bsd/dev/sweet_wled.c
+--- a/bsd/dev/sweet_wled.c
++++ b/bsd/dev/sweet_wled.c
+@@ -22,6 +22,7 @@
+ int sweet_wled_init(void);
+ int sweet_wled_enable(int on);
+ int sweet_wled_level(unsigned level);
++unsigned sweet_wled_boot_level(void);
+ 
+ #define W_CORE_PA       0x0800f000u
+ #define W_CHNLS_PA      0x08400000u
+@@ -45,6 +46,7 @@
+ static uint16_t w_apid[2] = { W_NO_APID, W_NO_APID };
+ static bool w_ready, w_tried;
+ static uint32_t w_errors;
++static unsigned w_boot_level = 2047;
+ 
+ static uint32_t
+ rd32(vm_offset_t b, uint32_t o)
+@@ -188,10 +190,18 @@
+ 	}
+ 	printf("WHYRED WLED: module %#x, sinks %#x, string 0 %u, string 1 %u\n", en, sinks,
+ 	    (unsigned)(m0 & 0xf) << 8 | l0, (unsigned)(m1 & 0xf) << 8 | l1);
++	w_boot_level = (unsigned)(m0 & 0xf) << 8 | l0;
+ 	w_ready = true;
+ 	return 0;
+ }
+ 
++/* String 0 brightness as ABL left it (0..4095). */
++unsigned
++sweet_wled_boot_level(void)
++{
++	return w_boot_level;
++}
++
+ int
+ sweet_wled_enable(int on)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,7 @@
+ extern "C" int sweet_wled_init(void);               /* bsd/dev/sweet_wled.c: whyred PM660L WLED backlight */
+ extern "C" int sweet_wled_enable(int on);
+ extern "C" int sweet_wled_level(unsigned level);
++extern "C" unsigned sweet_wled_boot_level(void);
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
+ 
+ /*
+@@ -238,6 +239,9 @@
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
+ 	bool          fWled;          /* whyred: backlight is PMIC WLED (no DSI commands) */
++	bool          fWledOff;       /* WLED module currently off */
++	thread_call_t fWledOffCall;   /* WLED off after the fade to black */
++	static void   wledOffWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+@@ -384,7 +388,13 @@
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	fWled = fDsi == NULL && sweet_wled_init() == 0;
+ 	if (fWled) {
+-		IOLog("SWEET FB: brightness and display power via PM660L WLED\n");
++		fWledOffCall = thread_call_allocate(&AppleCLCD::wledOffWork, this);
++		fBlLevel = sweet_wled_boot_level() / 2u;        /* keep ABL's brightness until iOS sets one */
++		if (fBlLevel < 1) {
++			fBlLevel = 1;
++		}
++		fBlSent = fBlLevel;
++		IOLog("SWEET FB: brightness and display power via PM660L WLED, level %#x\n", fBlLevel);
+ 	}
+ 	if (fDsi != NULL || fWled) {
+ 		if (fDsi != NULL) {
+@@ -1069,11 +1079,28 @@
+ AppleCLCD::setPanelOn(bool on)
+ {
+ 	if (fWled) {
+-		/* LCD: the backlight is the whole visible state. On: the caller sends the level next. */
++		/*
++		 * LCD: the backlight is the whole visible state. Off: the vsync timer first fades the
++		 * last frame to black (SWEET_FB_FADE_STEPS frames), then wledOffWork switches the WLED
++		 * off. On: the caller sends the level next.
++		 */
++		if (!on) {
++			if (fWledOffCall != NULL) {
++				uint64_t deadline;
++				/* fade length plus margin: 36 vsync periods, ~600 ms */
++				clock_interval_to_deadline((SWEET_FB_FADE_STEPS + 6) * SWEET_FB_VSYNC_US, kMicrosecondScale, &deadline);
++				thread_call_enter_delayed(fWledOffCall, deadline);
++			}
++			return;
++		}
++		if (fWledOffCall != NULL) {
++			thread_call_cancel(fWledOffCall);
++		}
+ 		IOLockLock(fBlLock);
+-		int r = sweet_wled_enable(on);
++		int r = fWledOff ? sweet_wled_enable(1) : 0;
++		fWledOff = false;
+ 		IOLockUnlock(fBlLock);
+-		IOLog("SWEET FB: WLED %s: %s\n", on ? "on" : "off", r == 0 ? "done" : "FAILED");
++		IOLog("SWEET FB: WLED on: %s\n", r == 0 ? "done" : "FAILED");
+ 		return;
+ 	}
+ 	uint8_t first[4] = { (uint8_t)(on ? 0x11 : 0x28), 0, 0x05, 0x80 };
+@@ -1149,6 +1176,23 @@
+ }
+ 
+ void
++AppleCLCD::wledOffWork(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	IOLockLock(fb->fLock);
++	bool off = fb->fPowerOff;
++	IOLockUnlock(fb->fLock);
++	if (!off) {
++		return;                 /* turned back on during the fade */
++	}
++	IOLockLock(fb->fBlLock);
++	int r = fb->fWledOff ? 0 : sweet_wled_enable(0);
++	fb->fWledOff = true;
++	IOLockUnlock(fb->fBlLock);
++	IOLog("SWEET FB: WLED off after fade: %s\n", r == 0 ? "done" : "FAILED");
++}
++
++void
+ AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)p0;
