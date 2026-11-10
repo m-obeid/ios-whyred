@@ -454,6 +454,10 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   APIDs: 0x144 -> 98, 0x145 -> 118, 0x148 -> 132, 0x152 -> 155.
 - Patch 0977: whyred_spmi_write (only SID 1 0x4446, apps-owned channel) and, with wifi=1, l5 on before
   the modem boots.
+- Result (kernel 42914059374): the l5 EN_CTL write returned -1, rails unchanged, modem FATAL at 13.6 s
+  (diag starvation) as before. The PMIC arbiter refuses direct writes to this LDO (RPM-owned): it
+  needs an RPM-SMD request (glink-rpm over RPM message RAM, "ldoa" 5, swen/uv). Next build logs the
+  exact arbiter status, and adds sysctl kern.whyred_backlight (WLED off/on for a dark test loop).
 
 ## Not yet known
 

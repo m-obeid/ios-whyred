@@ -63,10 +63,11 @@ diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
  	ws_used++;
  	printf("WHYRED SPMI: ppid %#x -> apid %u\n", ppid, found);
  	return ch;
-@@ -116,6 +126,46 @@
+@@ -115,6 +125,51 @@
+ 			return 0;
  		}
  		delay(1);
- 	}
++	}
 +	return -1;
 +}
 +/*
@@ -103,12 +104,54 @@ diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
 +	for (unsigned k = 0; k < 1000; k++) {
 +		uint32_t st = ws_rd(wr, 0x08);
 +		if (st & 1u) {
-+			return (st & 0x0eu) ? -1 : 0;
++			if (st & 0x0eu) {
++				printf("WHYRED SPMI: write %u:%#x apid %u status %#x (%s%s%s)\n", sid, addr, ws_slot[i].apid, st,
++				    (st & 2) ? "failure " : "", (st & 4) ? "denied " : "", (st & 8) ? "dropped" : "");
++				return -1;
++			}
++			return 0;
 +		}
 +		delay(1);
-+	}
+ 	}
  	return -1;
  }
+diff --git a/bsd/dev/sweet_wled.c b/bsd/dev/sweet_wled.c
+--- a/bsd/dev/sweet_wled.c
++++ b/bsd/dev/sweet_wled.c
+@@ -17,6 +17,7 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_wled_init(void);
+@@ -234,4 +235,26 @@
+ 	uint8_t clr = (uint8_t)(s & ~0x0fu), set = (uint8_t)(s | 0x0fu);
+ 	return w_write(W_SINK, 0x47, &clr, 1) && w_write(W_SINK, 0x47, &set, 1) ? 0 : -1;
+ }
++/*
++ * sysctl kern.whyred_backlight: 0 switches the WLED module off, 1 on, behind iOS's back (iOS still
++ * thinks the display is on). For the test loop: a dark room while nobody looks at the phone.
++ */
++static int whyred_backlight = 1;
++
++static int
++whyred_backlight_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = whyred_backlight, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	if (sweet_wled_enable(v != 0) != 0) {
++		return EIO;
++	}
++	whyred_backlight = v != 0;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_backlight, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    whyred_backlight_sysctl, "I", "whyred: WLED module on (1) or off (0)");
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
