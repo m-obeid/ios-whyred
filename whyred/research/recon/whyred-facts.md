@@ -476,6 +476,10 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   "waiting FW_READY" after cap; no FW_READY, modem FATAL at 13.6 s with diag starvation again (also
   without wifi=1 earlier): not WLAN-specific. Next: MSS proxy votes as pil_mss_make_proxy_votes
   ("rwcx" 0 / "rwmx" 0 vlvl 384, qdss "clk0" 1 STAT 1); boot-arg modem_proxy=0 skips them.
+- Kernel 42922409124: proxy votes cx/mx/qdss acked; FATAL moved from 13.6 s to 17.2 s, still diag
+  starvation. topaz's QRTR ignored NEW_LOOKUP (type 10) and data for unserved ports silently.
+  Next build answers lookups as net/qrtr/ns.c (matching NEW_SERVER + all-zero terminator) and logs
+  unknown control types and unclaimed data.
 
 ## Not yet known
 
