@@ -299,6 +299,23 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Default image whyred/out/xnu-ios-fast4.img: kernel run 42800881885 (sha 37938d05...3116),
   fast3 boot-args, shim closed loop row 4.
 
+## Status bar: why it is the pink "rdar" placeholder (2026-11-10, parked)
+
+- UIKit +[_UIStatusBarVisualProvider_Phone visualProviderSubclassForScreen:...] (0x189ab546c):
+  UIScreen._exclusionArea nil -> LegacyPhone (iPhone 8 bar); rect y > 0 -> DynamicSplit; else Split.
+  Split/DynamicSplit then pick a size class (Split1080, Split1125, ...); no match -> Fallback (pink).
+- _exclusionArea comes from SpringBoard: +[UISDisplayContext(SpringBoard) sb_embeddedDisplayDefaultContext]
+  -> +[UISDisplaySingleRectShape(SpringBoard) sb_thisDeviceDisplayShape] -> SBHScreenTypeForCurrentDevice
+  (SpringBoardHome) = _SBHScreenTypeLookup(reference bounds in points, scale, SBFEffectiveArtworkSubtype,
+  SBFEffectiveDeviceClass, SBFEffectiveHomeButtonType). Internal builds only: SBHomeScreenDefaults
+  overriddenScreenType (os_variant_has_internal_content).
+- Native canvas 1080x2160 @3 = 360x720 pt matches no iPhone, so the bar falls back. MG cache
+  ArtworkDeviceSubType 570 changed nothing (tested, reverted; original in whyred/backup/).
+- Options: (A) present 1080x2340 (iPhone 12 mini, 360x780 pt) and drop 180 rows when copying to the
+  panel; (B) internal override; (C) home-button screen type (may lose gestures).
+- MG key hash: base64(md5("MGCopyAnswer" + name)) without padding. Tools: ipsw 3.1.743 in the
+  scratchpad, cache copied from whyred/ipsw/ios16-root.img (loop mount, sudo).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
