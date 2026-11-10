@@ -1,0 +1,347 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_syna.c			standard
+ bsd/dev/sweet_thermal.c			standard
+ bsd/dev/sweet_wled.c			standard
++bsd/dev/whyred_spmi.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -20,6 +20,9 @@
+ extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
+ extern "C" int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ extern "C" int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++/* bsd/dev/whyred_spmi.c: read-only PMIC access on the whyred SPMI arbiter v3 */
++extern "C" int whyred_spmi_init(void);
++extern "C" int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -31,14 +34,19 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fWhyred;
+ 	int fLastMode;
++	unsigned fDesign;       /* design capacity, mAh */
++	int fTempCenti;         /* battery temperature, centi-degrees C */
++	bool fTempMeasured;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
+ 	bool pollTopaz(void);
++	bool pollWhyred(void);
++	static bool whyredPair(unsigned a, unsigned b, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -57,7 +65,10 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fWhyred = false;
++	fDesign = 5020;
++	fTempCenti = 2500;
++	fTempMeasured = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -107,11 +118,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (topaz DT nominal 5020, whyred 4000). powerd computes C*100/M. */
++	const unsigned capacity = (fDesign * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesign);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -125,15 +136,15 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesign);
++	putNumber("DesignCapacity", fDesign);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; fixed 25 C unless the gauge measured it. */
++	putNumber("Temperature", (UInt32)fTempCenti);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !fTempMeasured);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -143,7 +154,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesign, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -160,7 +171,7 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    !measured ? "static fallback" : fWhyred ? "PM660 fuel gauge" : "PM6150 / estimated SOC",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -369,9 +380,84 @@
+ 	return true;
+ }
+ 
++/*
++ * whyred: PM660 (SID 0) FG gen3 and SMB2 charger, read only, as Linux qpnp-fg-gen3 / fg-util.c
++ * and qpnp-smb2 read them. Each 2-byte value is read with its shadow copy and used only when
++ * both match.
++ *   0x4009/0x400a  BATT_SOC_FG_MONOTONIC_SOC (+ CP): 0..255
++ *   0x41a0/0x41a6  BATT_INFO_VBATT (+ CP): 122.07 uV per bit
++ *   0x41a2/0x41a8  BATT_INFO_IBATT (+ CP): signed, 488.28 uA per bit, positive = discharging
++ *   0x4150         BATT_INFO_BATT_TEMP: 10 bits, quarter Kelvin
++ *   0x1006 [2:0]   BATTERY_CHARGER_STATUS_1: trickle, pre, fast, full-on, taper, terminate, ...
++ *   0x1310 bit 4   USBIN_PLUGIN_RT_STS
++ */
++bool
++SweetBattery::whyredPair(unsigned a, unsigned b, uint16_t *value)
++{
++	for (unsigned tries = 0; tries < 5; tries++) {
++		uint8_t l0, h0, l1, h1;
++		if (whyred_spmi_read(0, a, &l0) || whyred_spmi_read(0, a + 1, &h0) ||
++		    whyred_spmi_read(0, b, &l1) || whyred_spmi_read(0, b + 1, &h1)) {
++			return false;
++		}
++		if (l0 == l1 && h0 == h1) {
++			*value = (uint16_t)(l0 | h0 << 8);
++			return true;
++		}
++	}
++	return false;
++}
++
++bool
++SweetBattery::pollWhyred(void)
++{
++	uint8_t soc = 0, soc_cp = 1, tl, th, chg, usb;
++	for (unsigned tries = 0; tries < 5 && soc != soc_cp; tries++) {
++		if (whyred_spmi_read(0, 0x4009, &soc) || whyred_spmi_read(0, 0x400a, &soc_cp)) {
++			return false;
++		}
++	}
++	uint16_t rv, ri;
++	if (soc != soc_cp || !whyredPair(0x41a0, 0x41a6, &rv) || !whyredPair(0x41a2, 0x41a8, &ri) ||
++	    whyred_spmi_read(0, 0x4150, &tl) || whyred_spmi_read(0, 0x4151, &th) ||
++	    whyred_spmi_read(0, 0x1006, &chg) || whyred_spmi_read(0, 0x1310, &usb)) {
++		return false;
++	}
++	/* fg_get_msoc: 0 and 255 exact, 1..254 scaled to 1..99 */
++	unsigned percent = soc == 255 ? 100 : soc == 0 ? 0 : (((unsigned)soc - 1) * 98u + 126u) / 253u + 1u;
++	unsigned mv = (unsigned)(((uint64_t)rv * 122070u) / 1000000u);
++	int ua = (int)(((int64_t)(int16_t)ri * 488281) / 1000);
++	int ma = -ua / 1000;                    /* IOPMPowerSource: positive = charging */
++	int kq = ((th & 7) << 8) | tl;          /* quarter Kelvin */
++	int deci = ((kq + 2) / 4 - 273) * 10;
++	if (mv < 2800 || mv > 4600 || deci < -400 || deci > 900) {
++		return false;
++	}
++	fTempCenti = deci * 10;
++	fTempMeasured = true;
++	unsigned state = chg & 7u;
++	bool external = (usb & 0x10u) != 0;
++	bool charging = external && state <= 4;
++	bool full = external && state == 5;
++	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, true);
++	static unsigned logs;
++	if (logs++ % 30 == 0) {
++		IOLog("SWEET BATTERY: whyred %u%% (raw %u) %umV %dmA %d.%dC charger state %u usb %d\n",
++		    percent, soc, mv, ma, deci / 10, (deci < 0 ? -deci : deci) % 10, state, external);
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fWhyred && pollWhyred()) {
++		return;
++	}
++	if (fWhyred) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
+ 	if (fReal && pollTopaz()) {
+ 		return;
+ 	}
+@@ -438,10 +524,15 @@
+ 	(void)sweet_cpufreq_max();
+ 	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	/* sweetbattery=2: whyred PM660 fuel gauge (4000 mAh pack) */
++	fWhyred = real == 2 && whyred_spmi_init() == 0;
++	if (fWhyred) {
++		fDesign = 4000;
++	}
+ 	fReal = real == 1 && sweet_i2c1_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+-	if (fReal) {
++	if (fReal || fWhyred) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+@@ -449,7 +540,7 @@
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(10000);
+ 		} else {
+-			fReal = false;
++			fReal = fWhyred = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/whyred_spmi.c
+@@ -0,0 +1,120 @@
++/*
++ * whyred: read-only PMIC register access over the SPMI arbiter v3 (live DT qcom,spmi@800f000:
++ * core 0x800f000, obsrvr 0x9400000, cnfg 0x800a000, EE 0). One observer channel per APID at
++ * obsrvr + 0x8000 * apid; EXT_READL of one byte, as sweet_keys.c. No writes.
++ * Used by SweetBattery (sweetbattery=2) for the PM660 fuel gauge and charger status.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int whyred_spmi_init(void);
++int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++#define WS_CORE_PA      0x0800f000u
++#define WS_OBS_PA       0x09400000u
++#define WS_CNFG_PA      0x0800a000u
++#define WS_APIDS        512u
++#define WS_SLOTS        8u
++
++static vm_offset_t ws_core, ws_cnfg;
++static bool ws_ready, ws_tried;
++static struct {
++	uint16_t ppid;
++	vm_offset_t ch;         /* observer channel; 0 = no apps-owned APID */
++} ws_slot[WS_SLOTS];
++static unsigned ws_used;
++
++static uint32_t
++ws_rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++int
++whyred_spmi_init(void)
++{
++	if (ws_tried) {
++		return ws_ready ? 0 : -1;
++	}
++	ws_tried = true;
++	ws_core = ml_io_map(WS_CORE_PA, 0x1000);
++	ws_cnfg = ml_io_map(WS_CNFG_PA, 0x1000);
++	if (!ws_core || !ws_cnfg) {
++		return -1;
++	}
++	uint32_t ver = ws_rd(ws_core, 0);
++	if (ver < 0x30000000u || ver >= 0x40000000u) {
++		printf("WHYRED SPMI: arbiter version %#x is not v3\n", ver);
++		return -1;
++	}
++	ws_ready = true;
++	return 0;
++}
++
++/* Observer channel of the apps-owned APID for a PPID, mapped once and cached. */
++static vm_offset_t
++ws_channel(uint16_t ppid)
++{
++	for (unsigned i = 0; i < ws_used; i++) {
++		if (ws_slot[i].ppid == ppid) {
++			return ws_slot[i].ch;
++		}
++	}
++	if (ws_used == WS_SLOTS) {
++		return 0;
++	}
++	uint32_t found = WS_APIDS;
++	for (uint32_t a = 0; a < WS_APIDS; a++) {
++		uint32_t map = ws_rd(ws_core, 0x800u + 4u * a);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		if ((ws_rd(ws_cnfg, 0x700u + 4u * a) & 7u) == 0) {
++			found = a;
++			break;
++		}
++		if (found == WS_APIDS) {
++			found = a;
++		}
++	}
++	vm_offset_t ch = found == WS_APIDS ? 0 : ml_io_map(WS_OBS_PA + 0x8000u * found, 0x1000);
++	ws_slot[ws_used].ppid = ppid;
++	ws_slot[ws_used].ch = ch;
++	ws_used++;
++	printf("WHYRED SPMI: ppid %#x -> apid %u\n", ppid, found);
++	return ch;
++}
++
++/* One byte at PMIC sid, 16-bit address addr. 0 on success. Callers are serialized (one work loop). */
++int
++whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	if (!ws_ready) {
++		return -1;
++	}
++	vm_offset_t ch = ws_channel((uint16_t)((sid & 0xfu) << 8 | ((addr >> 8) & 0xffu)));
++	if (!ch) {
++		return -1;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)ch = (1u << 27) | ((addr & 0xffu) << 4);     /* EXT_READL, 1 byte */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = ws_rd(ch, 0x08);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return -1;
++			}
++			*out = (uint8_t)ws_rd(ch, 0x18);
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
