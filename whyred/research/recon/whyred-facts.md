@@ -244,6 +244,21 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   No LMH/thermal limits firmware is started: nothing throttles on heat under XNU.
 - Remaining speed gap: ARMv8.1 LSE/LDAPR emulation (patch 0081), visible as sys time on atomics-heavy code.
 
+## Thermal governor, LSE stats, CPRH closed loop (2026-11-10, untested on the phone)
+
+- Patch 0967 bsd/dev/sweet_thermal.c, started from sweet_emmc_keys_thread after touch. Polls Gold TSENS
+  sensors 3-6 (tm 0x10ae000, status 0xa0 + 4n, valid bit 21, bits 11:0 signed deci-C) every 500 ms.
+  Steps OSM DESIRED (0x179c3f10) one row down at >= 90 C, to row 0 at >= 105 C (Linux step trip),
+  one row up per 2 s at <= 75 C, never above the shim's boot row. sweettherm=0 off, 1 on, 2 logs.
+- Patch 0968: sleh.c counts emulated LSE ops per type and the hottest user PCs (64-slot table, shared
+  cache PCs unslid, others with bit 63 set). sweettherm=2 prints `WHYRED LSE: N/s: ...` and
+  `WHYRED LSE top:` every 10 s. Goal: find which code traps most before choosing an optimization.
+- Shim CPRH_CL=1: 0x85c = 0x1de (RO 7 target quotient, Linux dump), 0x7f8 = 0x4090 (closed loop), then
+  five gold_state lines 200 ms apart. Test image whyred/out/osm-cl-probe.img (OSM=1 OSM_TARGET=4 CPRH_CL=1).
+  Expected: voltage drops from 840 mV toward Linux's ~788 mV at row 4. Corner words already carry
+  RO select 7 and per-corner quotient deltas.
+- CI: run 42785894823 (0967 only) cancelled, run 42786485693 builds 0967 + 0968.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
