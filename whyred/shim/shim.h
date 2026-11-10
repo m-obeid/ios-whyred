@@ -50,6 +50,14 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end);
 
 /* emmc.c */
 void emmc_probe(void);
+int emmc_init(void);
+int emmc_read(uint32_t lba, uint32_t count, uintptr_t dst);
+int emmc_part(const char *name, uint32_t *first, uint32_t *blocks);
+
+/* fat.c */
+int fat_mount(const char *part);
+int fat_lookup(const char *dir, const char *name, uint32_t *clus, uint32_t *size);
+int fat_read(uint32_t clus, uint32_t size, uintptr_t dst);
 
 /* xnu.c */
 int payload_find(uintptr_t dtb, uintptr_t *start, uintptr_t *end);

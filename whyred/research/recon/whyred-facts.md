@@ -397,8 +397,18 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Before power-up: Q6 RESET 7, PWR_CTL 0x00780000, MEM_PWR 0, GFMUX 0x100, BHS 0; RMB all 0.
 - Shim: exceptions now reboot after 60 s (lands in Linux, then tools/to-fastboot.sh); SCALE=3
   makes the console readable through the webcam.
-- Next: 1b metadata auth (modem.mdt -> buffer after MBA, assign to VMID 15, RMB META_DATA +
-  CMD 1, wait status 3); 1c segments into 0x8ac00000 + verify_blob lengths, wait status 4.
+- Steps 1b + 1c work (same evening): shim reads mba.mbn, modem.mdt, modem.bNN from the stock "modem"
+  partition (GPT name "modem", FAT16, image/, new whyred/shim/fat.c + emmc_read/emmc_part API) by
+  ADMA2 straight into place. modem.mdt (0x20dc = ELF headers 0x3f4 + hash 0x1ce8) copied to
+  0x94900000, hyp_assign to VMID 15 -> RMB META_DATA, CMD 1 -> status 3 (headers OK). Region
+  0x8ac00000 + 0x7600000 hyp_assign to {15, HLOS} -> 28 PT_LOAD segments (0x366c202 bytes) loaded
+  in order with verify_blob (CODE_START, CMD 2, CODE_LENGTH += memsz) -> status 4: AUTH COMPLETE.
+  The modem runs. Image whyred/out/mss-1c.img (SCALE=3 MSS=1 ./build.sh, no ramdisk needed).
+- A 57 MB ramdisk (tools/pack-modem.py) is accepted by fastboot but ABL never starts it and
+  fastboot then rejects commands until `fastboot reboot bootloader`. Keep boot images small.
+- Next (stage 2): move the MBA boot into the kernel (TopazModem.cpp structure) and talk to the
+  running modem: SMEM 0x86000000, SMP2P, GLINK "mpss" IPCRTR, QRTR, then rmtfs/tftp/pd-mapper
+  and WLFW.
 
 ## Not yet known
 

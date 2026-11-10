@@ -450,3 +450,91 @@ void emmc_probe(void)
 		con_newline();
 	}
 }
+
+/* ---- read API for the MSS probe (fat.c): quiet init, sector reads to any address, GPT lookup ---- */
+
+static int emmc_ready;
+
+int emmc_init(void)
+{
+	if (emmc_ready)
+		return 0;
+	if ((rd32(GCC_SDCC1_APPS_CBCR) & CBCR_CLK_OFF) || (rd32(GCC_SDCC1_AHB_CBCR) & CBCR_CLK_OFF) ||
+	    (rd32(CQ + 0x08) & 1) || !(hc_rd(CLKCTL) & (1U << 2))) {
+		puts_("!! emmc: clock off, CQE on or SD clock stopped");
+		con_newline();
+		return -1;
+	}
+	hc_wr(INTEN, hc_rd(INTEN) | 0xf3ff0023U);
+	uint32_t st, sts;
+	for (uint32_t r = 1; r <= 16; r++)
+		if (!cmd13_quiet(r, &st, &sts)) {
+			rca = r;
+			emmc_ready = 1;
+			return 0;
+		}
+	puts_("!! emmc: no card answers CMD13");
+	con_newline();
+	return -1;
+}
+
+/*
+ * count 512-byte blocks from lba to physical address dst (4-byte aligned), 64 blocks per
+ * command. ADMA2 writes memory directly; the shim runs with the MMU off, so no cache work.
+ */
+int emmc_read(uint32_t lba, uint32_t count, uintptr_t dst)
+{
+	uint32_t sts;
+	while (count) {
+		uint32_t n = count > 64 ? 64 : count;
+		if (idle_lines())
+			return fail("lines busy", hc_rd(PRESENT));
+		volatile struct adma_desc *d = desc;
+		d->attr = ADMA_VALID | ADMA_END | ADMA_TRAN;
+		d->len = (uint16_t)(n * 512);
+		d->addr_lo = (uint32_t)dst;
+		d->addr_hi = (uint32_t)((uint64_t)dst >> 32);
+		dsb();
+		hc_wr(INTSTS, 0xffffffff);
+		hc_wr(ADMA_ADDR_LO, (uint32_t)(uintptr_t)desc);
+		hc_wr(ADMA_ADDR_HI, (uint32_t)((uint64_t)(uintptr_t)desc >> 32));
+		hc_wr(BLKSZ_CNT, (n << 16) | 0x7000 | 512);
+		hc_wr(ARG, lba);
+		uint32_t mode = TM_DMA | TM_READ | TM_BLKCNT_EN | (n > 1 ? TM_MULTI | TM_AUTO_CMD12 : 0);
+		hc_wr(XFER_CMD, (CMD_R1_DATA(n > 1 ? 18 : 17) << 16) | mode);
+		if (wait_int(INT_CMD_DONE, 100, &sts))
+			return fail("read cmd", sts);
+		hc_wr(INTSTS, INT_CMD_DONE);
+		if (wait_int(INT_XFER_DONE, 1000, &sts))
+			return fail("read xfer", sts);
+		hc_wr(INTSTS, INT_XFER_DONE);
+		dsb();
+		lba += n;
+		count -= n;
+		dst += n * 512;
+	}
+	return 0;
+}
+
+/* First LBA and block count of the GPT partition called name. */
+int emmc_part(const char *name, uint32_t *first, uint32_t *blocks)
+{
+	if (read_dma(1, 1))
+		return -1;
+	if (dmabuf[0] != 'E' || dmabuf[1] != 'F' || dmabuf[2] != 'I')
+		return -1;
+	uint64_t entries = le64(dmabuf + 72);
+	uint32_t n = le32(dmabuf + 80), esize = le32(dmabuf + 84), per = esize ? 512 / esize : 0;
+	for (uint32_t i = 0; i < n && per; i++) {
+		if (i % per == 0 && read_dma((uint32_t)(entries + i / per), 1))
+			return -1;
+		const uint8_t *e = dmabuf + (i % per) * esize;
+		if (le64(e + 32) && name_is(e, name)) {
+			*first = (uint32_t)le64(e + 32);
+			*blocks = (uint32_t)(le64(e + 40) - le64(e + 32) + 1);
+			return 0;
+		}
+	}
+	return -1;
+}
+

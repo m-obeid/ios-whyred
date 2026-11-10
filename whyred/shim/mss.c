@@ -1,6 +1,7 @@
 /*
  * Modem (MSS, Hexagon Q6 v62-1-5) self-authenticating boot, step 1a: power the Q6 up and run
- * MBA from the ramdisk (MSS=1 ./build.sh ../firmware/modem/mba.mbn). Follows Linux
+ * MBA from the ramdisk (MSS=1 ./build.sh ../firmware/modem/mba.mbn), or with a firmware pack
+ * (tools/pack-modem.py) also steps 1b/1c: metadata and segments. Follows Linux
  * drivers/soc/qcom/pil-msa.c (pil_mss_reset_load_mba, pil_mss_reset) and pil-q6v5.c
  * (__pil_q6v55_reset, qdsp6v62_1_5) with whyred's DT (qcom,mss@4080000).
  * Success: RMB PBL status 1, then MBA status 1 or 2 (XPU unlocked).
@@ -49,8 +50,8 @@ static void smc8(uint64_t a[8])
 	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
 }
 
-/* hyp_assign_phys (SCM 0x0C/0x16), HLOS -> one VMID read-write; topaz TopazModem.cpp scm_assign. */
-static uint64_t scm_assign(uint64_t addr, uint64_t size, uint32_t vmid, uint64_t *res)
+/* hyp_assign_phys (SCM 0x0C/0x16), HLOS -> n VMIDs read-write; topaz TopazModem.cpp scm_assign. */
+static uint64_t scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmid, unsigned n, uint64_t *res)
 {
 	volatile uint64_t *p = (volatile uint64_t *)SCM_BUF;
 	for (int i = 0; i < 64; i++)
@@ -58,17 +59,19 @@ static uint64_t scm_assign(uint64_t addr, uint64_t size, uint32_t vmid, uint64_t
 	p[0] = addr;                                    /* 0x000: mem map {addr, size} */
 	p[1] = size;
 	*(volatile uint32_t *)(SCM_BUF + 0x40) = VMID_HLOS;     /* 0x040: source VMIDs */
-	*(volatile uint32_t *)(SCM_BUF + 0x80) = vmid;          /* 0x080: {vmid, perm, ctx(8), ctx_size, 0} */
-	*(volatile uint32_t *)(SCM_BUF + 0x84) = PERM_RW;
+	for (unsigned i = 0; i < n; i++) {             /* 0x080: {vmid, perm, ctx(8), ctx_size, 0} each */
+		*(volatile uint32_t *)(SCM_BUF + 0x80 + 24 * i) = vmid[i];
+		*(volatile uint32_t *)(SCM_BUF + 0x84 + 24 * i) = PERM_RW;
+	}
 	p[32] = 4;                                      /* 0x100: extended args: source list size */
 	p[33] = SCM_BUF + 0x80;                         /* dest list */
-	p[34] = 24;                                     /* dest list size */
+	p[34] = 24 * n;                                 /* dest list size */
 	p[35] = 0;
 	dsb();
 	uint64_t ai = 7 | (1 << 4) | (1 << 8) | (1 << 12);
 	uint64_t a[8] = { 0x42000c16, ai, SCM_BUF, 16, SCM_BUF + 0x40, SCM_BUF + 0x100, 0, 0 };
 	smc8(a);
-	for (unsigned n = 0; a[0] == 1 && n < 100000; n++) {    /* INTERRUPTED: resume with the session id */
+	for (unsigned k = 0; a[0] == 1 && k < 100000; k++) {    /* INTERRUPTED: resume with the session id */
 		uint64_t b[8] = { 1, ai, SCM_BUF, 16, SCM_BUF + 0x40, SCM_BUF + 0x100, a[6], 0 };
 		for (int i = 0; i < 8; i++)
 			a[i] = b[i];
@@ -76,6 +79,70 @@ static uint64_t scm_assign(uint64_t addr, uint64_t size, uint32_t vmid, uint64_t
 	}
 	*res = a[1];
 	return a[0];
+}
+
+/* Firmware pack (whyred/tools/pack-modem.py): "WMDM", count, {name[24], off, size}. */
+static uintptr_t pack_base;
+static int pack_find(const char *name, uintptr_t *data, uint32_t *size)
+{
+	if (!pack_base || rd32(pack_base) != 0x4d444d57)        /* "WMDM" */
+		return 0;
+	uint32_t count = rd32(pack_base + 4);
+	for (uint32_t i = 0; i < count; i++) {
+		uintptr_t e = pack_base + 8 + 32 * i;
+		int j = 0;
+		for (; name[j]; j++)
+			if (*(volatile uint8_t *)(e + j) != (uint8_t)name[j])
+				break;
+		if (name[j] == 0 && *(volatile uint8_t *)(e + j) == 0) {
+			*data = pack_base + rd32(e + 24);
+			*size = rd32(e + 28);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void copy_bytes(uintptr_t dst, uintptr_t src, uint32_t n)
+{
+	uint32_t i = 0;
+	for (; i + 4 <= n; i += 4)
+		wr32(dst + i, rd32(src + i));
+	for (; i < n; i++)
+		*(volatile uint8_t *)(dst + i) = *(volatile uint8_t *)(src + i);
+}
+
+static void zero_bytes(uintptr_t dst, uint32_t n)
+{
+	uint32_t i = 0;
+	for (; i < n && ((dst + i) & 3); i++)
+		*(volatile uint8_t *)(dst + i) = 0;
+	for (; i + 4 <= n; i += 4)
+		wr32(dst + i, 0);
+	for (; i < n; i++)
+		*(volatile uint8_t *)(dst + i) = 0;
+}
+
+/*
+ * A firmware file to dst: from the pack when the ramdisk is one (pack-modem.py), else from the
+ * stock "modem" partition (FAT, image/NAME) read by ADMA2 straight into dst. 0 on success.
+ */
+static int fat_ok;
+static int fw_get(const char *name, uintptr_t dst, uint32_t max, uint32_t *size)
+{
+	uintptr_t data;
+	uint32_t n, clus;
+	if (pack_base) {
+		if (!pack_find(name, &data, &n) || n > max)
+			return -1;
+		copy_bytes(dst, data, n);
+		*size = n;
+		return 0;
+	}
+	if (!fat_ok || fat_lookup("image", name, &clus, &n) || n > max)
+		return -1;
+	*size = n;
+	return fat_read(clus, n, dst);
 }
 
 static void rmb_dump(const char *label)
@@ -136,11 +203,39 @@ static int wait_nonzero(uintptr_t reg, unsigned ms, uint32_t *out)
 	return -1;
 }
 
-void mss_probe(uintptr_t mba, uintptr_t mba_end)
+static void modem_load(void);
+
+void mss_probe(uintptr_t rd, uintptr_t rd_end)
 {
-	uint64_t size = mba_end - mba;
+	kv("ramdisk ", rd, 8);
+	kv("end ", rd_end, 8);
+	con_newline();
+	pack_base = rd32(rd) == 0x4d444d57 ? rd : 0;
+	/* ABL chooses where the ramdisk lands: a pack must not overlap what this probe writes. */
+	static const uintptr_t busy[3][2] = {
+		{ 0x8ac00000, 0x92200000 }, { 0x94800000, 0x94a00000 }, { 0xa1000000, 0xa1400000 },
+	};
+	for (int i = 0; pack_base && i < 3; i++)
+		if (rd < busy[i][1] && rd_end > busy[i][0]) {
+			kv("!! ramdisk overlaps ", busy[i][0], 8);
+			con_newline();
+			return;
+		}
+	if (!pack_base) {
+		puts_("firmware from the modem partition: ");
+		fat_ok = fat_mount("modem") == 0;
+		if (!fat_ok)
+			return;
+	}
+	uint32_t size32;
+	if (fw_get("mba.mbn", MBA_PA, 0x100000, &size32)) {
+		puts_("!! mba.mbn not found");
+		con_newline();
+		return;
+	}
+	uint64_t size = size32;
 	kv("mba.mbn bytes ", size, 8);
-	kv("first word ", rd32(mba), 8);
+	kv("first word ", rd32(MBA_PA), 8);
 	con_newline();
 
 	/* 1. Clocks, DT order: iface, bus, mem, gpll0_mss, snoc_axi, mnoc_axi. MSS registers abort
@@ -156,18 +251,10 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 	q6_dump("before");
 	rmb_dump("before");
 
-	/* 2. MBA into its region (1 MB slot), then give that memory to the modem's VM. */
-	if (size > 0x100000) {
-		puts_("!! mba.mbn larger than 1 MB");
-		con_newline();
-		return;
-	}
-	for (uint64_t o = 0; o < size; o += 4)
-		wr32(MBA_PA + o, rd32(mba + o));
-	dsb();
-	kv("copied, check ", rd32(MBA_PA), 8);
+	/* 2. MBA is already in its region (1 MB slot): give that memory to the modem's VM. */
 	uint64_t res;
-	uint64_t r = scm_assign(MBA_PA, 0x100000, VMID_MSS_MSA, &res);
+	static const uint32_t msa[1] = { VMID_MSS_MSA };
+	uint64_t r = scm_assign(MBA_PA, 0x100000, msa, 1, &res);
 	kv("assign ret ", r, 8);
 	kv("res ", res, 8);
 	con_newline();
@@ -263,4 +350,123 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 	puts_(st == 1 || st == 2 ? "XPU UNLOCKED: MBA RUNS" : "(UNEXPECTED)");
 	con_newline();
 	rmb_dump("after");
+	if (st == 1 || st == 2)
+		modem_load();
+}
+
+/* Signed RMB status: negative values are MBA error codes. */
+static int wait_status(uint32_t want, unsigned ms, int32_t *got)
+{
+	for (unsigned i = 0; i <= ms; i++) {
+		int32_t v = (int32_t)rd32(RMB + RMB_MBA_STATUS);
+		if (v == (int32_t)want || v < 0) {
+			*got = v;
+			return v == (int32_t)want ? 0 : -1;
+		}
+		delay_ms(1);
+	}
+	*got = (int32_t)rd32(RMB + RMB_MBA_STATUS);
+	return -1;
+}
+
+#define MDATA_PA        (MBA_PA + 0x100000)     /* after MBA in pil_mba_region, as Linux allocates */
+#define MODEM_PA        0x8ac00000UL            /* modem_fw_region */
+#define MODEM_SIZE      0x7600000UL             /* lowest..highest loadable segment of modem.mdt */
+#define MDT_COPY        0xa1200000UL            /* free RAM below the XNU base */
+
+/*
+ * Step 1b: pil_msa_auth_modem_mdt. Step 1c: pil_boot's segment loop (sequential, "qcom,sequential-
+ * fw-load") with pil_msa_mba_verify_blob after each, then pil_msa_mba_auth.
+ */
+static void modem_load(void)
+{
+	/* Our own copy for the program headers: MDATA_PA belongs to the modem after the assign. */
+	uintptr_t mdt = MDT_COPY;
+	uint32_t mdt_size;
+	if (fw_get("modem.mdt", mdt, 0x100000, &mdt_size)) {
+		puts_("!! modem.mdt not found");
+		con_newline();
+		return;
+	}
+	copy_bytes(MDATA_PA, mdt, mdt_size);
+	dsb();
+	static const uint32_t msa[1] = { VMID_MSS_MSA };
+	uint64_t res, r = scm_assign(MDATA_PA, (mdt_size + 0xfff) & ~0xfffU, msa, 1, &res);
+	kv("mdt ", mdt_size, 4);
+	kv("assign ", r, 2);
+	wr32(RMB + RMB_PMI_CODE_LENGTH, 0);
+	wr32(RMB + RMB_PMI_META_DATA, MDATA_PA);
+	wr32(RMB + RMB_MBA_COMMAND, 1);                 /* CMD_META_DATA_READY */
+	dsb();
+	int32_t st;
+	int bad = wait_status(3, 10000, &st);
+	kv("meta status ", (uint32_t)st, 8);
+	puts_(bad ? "FAILED" : "HEADERS OK");
+	con_newline();
+	if (bad)
+		return;
+
+	/* pil_assign_mem_to_subsys_and_linux: the whole region to MSS_MSA and HLOS. */
+	static const uint32_t both[2] = { VMID_MSS_MSA, VMID_HLOS };
+	r = scm_assign(MODEM_PA, MODEM_SIZE, both, 2, &res);
+	kv("region assign ", r, 2);
+	con_newline();
+	if (r != 0)
+		return;
+
+	uint32_t phoff = rd32(mdt + 28), phnum = *(volatile uint16_t *)(mdt + 44);
+	uint32_t loaded = 0, bytes = 0;
+	for (uint32_t i = 0; i < phnum; i++) {
+		uintptr_t ph = mdt + phoff + 32 * i;
+		uint32_t type = rd32(ph), pa = rd32(ph + 12), filesz = rd32(ph + 16), memsz = rd32(ph + 20);
+		uint32_t flags = rd32(ph + 24);
+		if (type != 1 || ((flags >> 24) & 7) == 2 || memsz == 0)
+			continue;                       /* PT_LOAD and not the hash segment */
+		if (pa < MODEM_PA || pa + memsz > MODEM_PA + MODEM_SIZE) {
+			kv("!! segment outside region ", i, 2);
+			con_newline();
+			return;
+		}
+		if (filesz) {
+			char name[10] = "modem.b00";
+			name[7] = (char)('0' + i / 10);
+			name[8] = (char)('0' + i % 10);
+			uint32_t got;
+			if (fw_get(name, pa, filesz, &got) || got != filesz) {
+				puts_("!! missing, short or unreadable ");
+				puts_(name);
+				con_newline();
+				return;
+			}
+		}
+		zero_bytes(pa + filesz, memsz - filesz);
+		dsb();
+		/* pil_msa_mba_verify_blob */
+		uint32_t len = rd32(RMB + RMB_PMI_CODE_LENGTH);
+		if (len == 0) {
+			wr32(RMB + RMB_PMI_CODE_START, pa);
+			wr32(RMB + RMB_MBA_COMMAND, 2);         /* CMD_LOAD_READY */
+		}
+		wr32(RMB + RMB_PMI_CODE_LENGTH, len + memsz);
+		dsb();
+		st = (int32_t)rd32(RMB + RMB_MBA_STATUS);
+		if (st < 0) {
+			kv("!! MBA error at segment ", i, 2);
+			kv("status ", (uint32_t)st, 8);
+			con_newline();
+			return;
+		}
+		loaded++;
+		bytes += filesz;
+		con_putc('.');
+	}
+	con_newline();
+	kv("segments ", loaded, 2);
+	kv("bytes ", bytes, 8);
+	con_newline();
+	bad = wait_status(4, 10000, &st);               /* STATUS_AUTH_COMPLETE */
+	kv("auth status ", (uint32_t)st, 8);
+	puts_(bad ? "FAILED" : "MODEM AUTHENTICATED: RUNNING");
+	con_newline();
+	rmb_dump("final");
 }
