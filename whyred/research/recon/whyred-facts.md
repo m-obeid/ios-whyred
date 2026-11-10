@@ -244,7 +244,7 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   No LMH/thermal limits firmware is started: nothing throttles on heat under XNU.
 - Remaining speed gap: ARMv8.1 LSE/LDAPR emulation (patch 0081), visible as sys time on atomics-heavy code.
 
-## Thermal governor, LSE stats, CPRH closed loop (2026-11-10, untested on the phone)
+## Thermal governor, LSE stats, CPRH closed loop (2026-11-10)
 
 - Patch 0967 bsd/dev/sweet_thermal.c, started from sweet_emmc_keys_thread after touch. Polls Gold TSENS
   sensors 3-6 (tm 0x10ae000, status 0xa0 + 4n, valid bit 21, bits 11:0 signed deci-C) every 500 ms.
@@ -260,7 +260,17 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - CI: run 42785894823 (0967 only) cancelled, run 42786485693 builds 0967 + 0968.
 - Run 42786485693 passed, both patches applied. Kernel sha 9b2c2b17...d29e. Boot images (fast2 args +
   sweettherm=2): whyred/out/xnu-ios-therm.img (open loop) and xnu-ios-therm-cl.img (shim CPRH_CL=1).
-  Next: boot therm.img, watch `WHYRED THERMAL` / `WHYRED LSE` in udplog, load the CPU, then try therm-cl.img.
+- Boot of xnu-ios-therm.img (10:14 local): `tsens trdy 0x8, OSM enable 1, boot row 4`. Gold 42 C idle,
+  59 C peak during boot. 4 busy loops (cpus=4, all Gold) for 3 min: 48 -> 70 C in 20 s, plateau 71.2 C,
+  53 C 10 s after the load. Never reached 90 C, no steps taken.
+- LSE: 0 emulated ops per second for the whole boot, SpringBoard, SSH and the load test. iOS 16's
+  arm64 userland does not run LSE/LDAPR on this CPU (it checks the CPU capabilities). Test binary
+  (1M LDADD, scratch lse.S via tools/mkinit.py): counter shows exactly 1000000 at 0x100000418,
+  0.55 s (0.24 user + 0.30 sys), so ~0.55 us per emulated op. 1M LDAXR/STLXR loops: 0.01 s.
+  The earlier claim that dash-loop sys time is LSE emulation was wrong. Its cause is still unknown
+  (fork/exec or page faults are candidates).
+- Patch 0969: the 10 s log line adds the CPRH corner and mV (0x179c7aa4), and boot-args
+  sweettherm_hot / sweettherm_cool (deci-C) for testing steps. CI 42789978412.
 
 ## Not yet known
 
