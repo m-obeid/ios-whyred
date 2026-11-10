@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -8,7 +8,8 @@
+  * up when cool. Linux's own step trip for these zones is 105 C, critical 115/125 C.
+  *
+  * boot-args: sweettherm=0 off, 1 on (default), 2 also log the temperature and LSE emulation
+- *            rates every 10 s.
++ *            rates every 10 s. sweettherm_hot / sweettherm_cool: step thresholds in deci-C
++ *            (default 900 / 750, for testing the steps; the 105 C trip is fixed).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -30,10 +31,12 @@
+ #define OSM_PERF_DCVS_PA        0x179c3000u     /* page holding DESIRED at +0xf10, ENABLE at +0x004 */
+ #define OSM_ENABLE              0x004u
+ #define OSM_DESIRED             0xf10u
++#define CPRH_STATUS_PA          0x179c7000u     /* page holding CPRH status at +0xaa4 */
++#define CPRH_STATUS             0xaa4u          /* [17:6] last voltage in mV, [5:0] corner */
+ 
+-#define HOT_DC                  900             /* step down at 90.0 C */
++static int HOT_DC = 900;                        /* step down at 90.0 C */
++static int COOL_DC = 750;                       /* step up at 75.0 C */
+ #define CRIT_DC                 1050            /* row 0 at 105.0 C (Linux step trip) */
+-#define COOL_DC                 750             /* step up at 75.0 C */
+ #define NO_TEMP                 (-100000)       /* no valid sensor */
+ #define POLL_MS                 500
+ #define UP_HOLD_POLLS           4               /* at most one step up every 2 s */
+@@ -45,7 +48,7 @@
+ };
+ extern struct sweet_lse_site sweet_lse_sites[64];
+ 
+-static vm_offset_t tsens, osm;
++static vm_offset_t tsens, osm, cprh;
+ static int therm_chan;
+ static int therm_mode;
+ 
+@@ -169,7 +172,9 @@
+ 				cool = 0;
+ 			}
+ 			if (therm_mode == 2 && (polls % (10000 / POLL_MS)) == 0) {
+-				printf("WHYRED THERMAL: gold %d.%d C, OSM row %u\n", t / 10, t % 10, row);
++				uint32_t cs = rd(cprh, CPRH_STATUS);
++				printf("WHYRED THERMAL: gold %d.%d C, OSM row %u, CPRH corner %u %u mV\n", t / 10, t % 10,
++				    row, cs & 0x3fu, (cs >> 6) & 0xfffu);
+ 				lse_report(10);
+ 			}
+ 		}
+@@ -191,9 +196,16 @@
+ 		return;
+ 	}
+ 	therm_mode = mode;
++	(void)PE_parse_boot_argn("sweettherm_hot", &HOT_DC, sizeof(HOT_DC));
++	(void)PE_parse_boot_argn("sweettherm_cool", &COOL_DC, sizeof(COOL_DC));
++	if (HOT_DC > CRIT_DC || COOL_DC >= HOT_DC) {
++		HOT_DC = 900;
++		COOL_DC = 750;
++	}
+ 	tsens = ml_io_map(TSENS_TM_PA, 0x1000);
+ 	osm = ml_io_map(OSM_PERF_DCVS_PA, 0x1000);
+-	if (!tsens || !osm) {
++	cprh = ml_io_map(CPRH_STATUS_PA, 0x1000);
++	if (!tsens || !osm || !cprh) {
+ 		printf("WHYRED THERMAL: MMIO mapping failed\n");
+ 		return;
+ 	}
