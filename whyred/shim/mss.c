@@ -100,17 +100,26 @@ static void q6_dump(const char *label)
 	con_newline();
 }
 
-/* Branch clock on (enable bit), then wait for CBCR bit 31 (clock off) to clear. */
-static void clk_on(const char *name, uintptr_t en, uint32_t bit, uintptr_t cbcr)
+/* Branch clock on (enable bit), then wait for CBCR bit 31 (clock off) to clear. Prints only failures. */
+static int clk_on(const char *name, uintptr_t en, uint32_t bit, uintptr_t cbcr)
 {
 	wr32(en, rd32(en) | bit);
 	dsb();
-	int i;
-	for (i = 0; i < 1000 && (rd32(cbcr) & (1u << 31)); i++)
+	for (int i = 0; i < 1000; i++) {
+		if (!(rd32(cbcr) & (1u << 31)))
+			return 0;
 		delay_ms(1);
+	}
+	puts_("!! clock off: ");
 	puts_(name);
-	kv(" ", rd32(cbcr), 8);
-	puts_(i == 1000 ? "OFF " : "on ");
+	con_newline();
+	return 1;
+}
+
+/* One letter per step of the power-up, so the last letter on screen names a faulting access. */
+static void step(char c)
+{
+	con_putc(c);
 }
 
 static int wait_nonzero(uintptr_t reg, unsigned ms, uint32_t *out)
@@ -136,12 +145,13 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 
 	/* 1. Clocks, DT order: iface, bus, mem, gpll0_mss, snoc_axi, mnoc_axi. MSS registers abort
 	 *    (synchronous external abort) until cfg_ahb runs: dump only after this. */
-	clk_on("cfg_ahb", GCC + 0x8a000, 1, GCC + 0x8a000);
-	clk_on("bimc_q6", GCC + 0x4401c, 1, GCC + 0x4401c);
-	clk_on("rom", GCC + 0x52004, 1u << 10, GCC + 0x38004);
+	int bad = clk_on("cfg_ahb", GCC + 0x8a000, 1, GCC + 0x8a000);
+	bad += clk_on("bimc_q6", GCC + 0x4401c, 1, GCC + 0x4401c);
+	bad += clk_on("rom", GCC + 0x52004, 1u << 10, GCC + 0x38004);
 	wr32(GCC + 0x5200c, rd32(GCC + 0x5200c) | (1u << 2));  /* gpll0_out_msscc (halt check: delay) */
-	clk_on("snoc", GCC + 0x8a03c, 1, GCC + 0x8a03c);
-	clk_on("mnoc", GCC + 0x8a004, 1, GCC + 0x8a004);
+	bad += clk_on("snoc", GCC + 0x8a03c, 1, GCC + 0x8a03c);
+	bad += clk_on("mnoc", GCC + 0x8a004, 1, GCC + 0x8a004);
+	puts_(bad ? "clocks: SOME OFF" : "clocks: all on");
 	con_newline();
 	q6_dump("before");
 	rmb_dump("before");
@@ -167,6 +177,7 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 		return;
 	}
 
+	step('A');
 	/* 3. MSS restart pulse (pil_mss_assert_resets / deassert_resets). */
 	uint32_t dbg = rd32(Q6 + QDSP6SS_DBG_CFG);
 	wr32(MSS_RESTART, 1);
@@ -177,6 +188,7 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 	delay_ms(1);
 	wr32(Q6 + QDSP6SS_DBG_CFG, dbg);
 
+	step('B');
 	/* 4. RMB: MBA image address, no debug policy. */
 	wr32(RMB + RMB_MBA_IMAGE, MBA_PA);
 	wr32(RMB + RMB_PMI_CODE_START, 0);
@@ -184,12 +196,14 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 	dsb();
 
 	/* 5. __pil_q6v55_reset, qdsp6v62_1_5 path. */
+	step('C');
 	uint32_t v = rd32(Q6 + QDSP6SS_RESET);
 	wr32(Q6 + QDSP6SS_RESET, v | 0x7);              /* CORE_ARES | BUS_ARES_ENA | STOP_CORE */
 	wr32(Q6 + QDSP6SS_XO_CBCR, rd32(Q6 + QDSP6SS_XO_CBCR) | 1);
 	int i;
 	for (i = 0; i < 1000 && (rd32(Q6 + QDSP6SS_XO_CBCR) & (1u << 31)); i++)
 		delay_ms(1);
+	step('D');
 	kv("xo cbcr ", rd32(Q6 + QDSP6SS_XO_CBCR), 8);
 	v = rd32(Q6 + QDSP6SS_PWR_CTL) | (1u << 24);   /* BHS_ON */
 	wr32(Q6 + QDSP6SS_PWR_CTL, v);
@@ -198,12 +212,14 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 		delay_ms(1);
 	kv("bhs ", rd32(Q6 + QDSP6V62SS_BHS_STATUS), 8);
 	con_newline();
+	step('E');
 	v |= 1u << 25;                                  /* LDO_BYP */
 	wr32(Q6 + QDSP6SS_PWR_CTL, v);
 	v = rd32(Q6 + QDSP6SS_PWR_CTL) & ~(1u << 22);   /* CLAMP_QMC_MEM off */
 	wr32(Q6 + QDSP6SS_PWR_CTL, v);
 	v |= (1u << 18) | (1u << 19);                   /* L2DATA_STBY_N | SLP_RET_N */
 	wr32(Q6 + QDSP6SS_PWR_CTL, v);
+	step('F');
 	v = rd32(Q6 + QDSP6V6SS_MEM_PWR_CTL);
 	for (int b = 29; b >= 0; b--) {                 /* memory banks one at a time */
 		v |= 1u << b;
@@ -211,14 +227,19 @@ void mss_probe(uintptr_t mba, uintptr_t mba_end)
 		for (volatile int d = 0; d < 2000; d++)
 			;
 	}
+	step('G');
 	v = rd32(Q6 + QDSP6SS_PWR_CTL) & ~(1u << 21);   /* CLAMP_WL off */
 	wr32(Q6 + QDSP6SS_PWR_CTL, v);
 	v &= ~(1u << 20);                               /* CLAMP_IO off */
 	wr32(Q6 + QDSP6SS_PWR_CTL, v);
+	step('H');
 	v = rd32(Q6 + QDSP6SS_RESET) & ~0x3u;           /* CORE_ARES and STOP_CORE off: run */
 	wr32(Q6 + QDSP6SS_RESET, v);
+	step('I');
 	wr32(Q6 + QDSP6SS_GFMUX_CTL, rd32(Q6 + QDSP6SS_GFMUX_CTL) | (1u << 1));  /* CLK_ENA */
 	dsb();
+	step('J');
+	con_newline();
 	q6_dump("q6 up");
 
 	/* 6. pil_msa_wait_for_mba_ready: PBL, then MBA. */

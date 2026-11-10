@@ -25,7 +25,7 @@ mkdir -p out
 [ -f font.h ] || python3 gen_font.py "$FONT"
 
 $CC $CFLAGS -c start.S -o out/start.o
-$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} ${OSM:+-DOSM_PROBE} ${MSS:+-DMSS_PROBE} ${OSM_TARGET:+-DOSM_TARGET=$OSM_TARGET} ${GOLD_ROW:+-DGOLD_ROW=$GOLD_ROW} -c main.c -o out/main.o
+$CC $CFLAGS ${EMMC:+-DEMMC_PROBE} ${OSM:+-DOSM_PROBE} ${MSS:+-DMSS_PROBE} ${SCALE:+-DSCALE=$SCALE} ${OSM_TARGET:+-DOSM_TARGET=$OSM_TARGET} ${GOLD_ROW:+-DGOLD_ROW=$GOLD_ROW} -c main.c -o out/main.o
 $CC $CFLAGS ${CPRH_OL:+-DCPRH_OL} -c osm.c -o out/osm.o
 $CC $CFLAGS -c xnu.c -o out/xnu.o
 $CC $CFLAGS -c emmc.c -o out/emmc.o

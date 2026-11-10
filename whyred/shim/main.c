@@ -75,7 +75,9 @@ void delay_ms(uint64_t ms)
 uintptr_t fb_base = SPLASH_BASE;
 uint32_t fb_w = 1080, fb_h = 2160, fb_cpp = 3, fb_stride = 1080 * 3;
 
+#ifndef SCALE
 #define SCALE	2
+#endif
 #define CW	(8 * SCALE)
 #define CH	(16 * SCALE)
 #define MARGIN	12
@@ -525,9 +527,9 @@ void exc_handler(uint64_t slot)
 	con_newline();
 	kv("far ", far, 16);
 	con_newline();
-	puts_("halted. hold power + vol- for fastboot");
-	for (;;)
-		__asm__ volatile("wfe");
+	puts_("reboot to fastboot in 60 s");
+	delay_ms(60000);
+	reboot_to_fastboot();
 }
 
 /* ---- main ---- */
