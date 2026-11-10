@@ -178,6 +178,14 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   used by the iPhone X userland (patch 0081). Compare the same loop under Linux on whyred.
 - iOS has no scp/sftp-server: read files with `ssh ... cat`.
 
+## Hardware buttons (2026-11-10)
+
+- Kernel: CI run 42723857575 (patch 0964). SPMI arbiter VERSION 0x30000000 (v3). APIDs: PON (PPID 0x008) 4,
+  PM660L GPIO7 (PPID 0x2c6) 167. GPIO7 subtype 0x11, mode 0 (input), EN 0x80.
+- Idle: PON RT_STS 0x0810 = 0, GPIO7 RT_STS 0xc610 bit 0 = 1. Power = PON bit 0, volume down = PON bit 1,
+  volume up = GPIO7 bit 0 low. All three seen pressed and released (sweetkeys=2 log), events go to SweetHID.
+- Keep presses under ~4 s: PON S1+S2 timers reset the phone (power ~6.5 s, power + vol- ~5.5 s).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
