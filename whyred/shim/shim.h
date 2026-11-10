@@ -38,6 +38,11 @@ uint32_t be32(const volatile uint8_t *p);
 int streq(const volatile uint8_t *a, const char *b);
 const volatile uint8_t *align4(const volatile uint8_t *p);
 
+/* osm.c */
+uint64_t osm_speed_ticks(uint64_t n);
+void osm_print_speed(const char *who, uint64_t ticks, uint64_t n);
+void osm_probe(void);
+
 /* emmc.c */
 void emmc_probe(void);
 

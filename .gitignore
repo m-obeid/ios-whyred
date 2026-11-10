@@ -18,3 +18,4 @@ whyred/shim/out/
 whyred/out/
 whyred/backup/
 whyred/ipsw/
+whyred/tools/osmdump/*.ko

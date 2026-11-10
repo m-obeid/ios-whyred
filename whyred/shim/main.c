@@ -346,10 +346,25 @@ static void __attribute__((noreturn)) gold_boot(void)
 		__asm__ volatile("wfe");
 }
 
+#ifdef OSM_PROBE
+static volatile uint64_t osm_go, osm_done;
+#endif
+
 void secondary_main(uint64_t slot)
 {
 	if (slot == 4 && handoff_start)
 		gold_boot();
+#ifdef OSM_PROBE
+	if (slot == 4 && osm_go) {
+		osm_print_speed("gold  ", osm_speed_ticks(20000000), 20000000);
+		osm_probe();
+		dsb();
+		osm_done = 1;
+		dsb();
+		for (;;)
+			__asm__ volatile("wfe");
+	}
+#endif
 	struct cpu_report *r = &rep[slot & 7];
 	r->t = now();
 	r->midr = rsr("midr_el1");
@@ -530,6 +545,31 @@ void shim_main(uint64_t dtb)
 		dec(r);
 		con_newline();
 	} else {
+#ifdef OSM_PROBE
+		puts_("gold clock probe (read-only)");
+		con_newline();
+		osm_print_speed("silver", osm_speed_ticks(20000000), 20000000);
+		osm_go = 1;
+		dsb();
+		int64_t r = (int64_t)smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+		if (r != 0) {
+			puts_("!! CPU_ON 0x100 failed: ");
+			dec(r);
+			con_newline();
+		}
+		uint64_t until = now() + rsr("cntfrq_el0") * 20;
+		while (r == 0 && !osm_done && now() < until)
+			;
+		con_newline();
+		puts_(osm_done ? "probe done" : "!! gold probe did not finish (bus stall?)");
+		con_newline();
+		puts_("reset in ");
+		dec(REBOOT_AFTER_S);
+		puts_(" s");
+		con_newline();
+		delay_ms(REBOOT_AFTER_S * 1000);
+		reboot_to_fastboot();
+#endif
 #ifdef EMMC_PROBE
 		puts_("emmc probe (read-only)");
 		con_newline();

@@ -211,6 +211,23 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   apply). The extra sys time on the dash loop is the ARMv8.1 LSE/LDAPR emulation (patch 0081).
 - USB unplug/replug: patch 0966 (CI run 42729844526) ends active transfers and re-arms ep0 SETUP.
 
+## Gold CPU clock: bootloader state vs Linux (2026-11-10)
+
+- Shim OSM probe (whyred/shim OSM=1, read-only): after ABL the Gold mux (0x17811054) is 0x401 = GPLL0
+  (600 MHz), Gold PLL L 0x20 (614 MHz, unused), CPRH ctl/status 0, OSM disabled, OSM table empty.
+  Speed bin fuse 3. => XNU runs Gold at 600 MHz (matches the 2.8x slowdown).
+- Linux reference (whyred/tools/osmdump, a read-only kernel module built against the phone's exact
+  kernel in the whyred-kernel-build Docker image; dump in recon/osmdump-linux.txt):
+  Gold PLL L 0x5e (1804.8 MHz), mux cfg 0x500 (PLL early), OSM enable 1, desired index 4, cycle ctl 0x113,
+  CPRH ctl (0x179c7aa0) 0x080a00c9 (bit 0 OSM interface), status 0xcc504, SAW 0x40314.
+  Gold LUT rows (freq_data / volt): 0 0x0004000f/0x2bc (288 MHz, 700 mV), 1 0x0404003a/0x102bc (1113.6, 700),
+  2 0x04040049/0x202f4 (1401.6, 756), 3 0x0404005b/0x3033c (1747.2, 828), 4..39 0x0404005e/0x40348 (1804.8, 840).
+  CPRH_REG_CORNER(0..7): 0e00414b 0e00414b 0e1d4f59 0e3e616b 0e44616e 0e697282 0e837d87 20007676.
+- Normal-world reads that abort (synchronous external abort): OSM cluster block +0x000..0xfff (TZ sequencer)
+  and unimplemented gaps, and CPRH +0x3000. Read only offsets the Linux drivers define.
+- Next: port the Linux init (cpr3-regulator.c/cprh-kbss-regulator.c, clk-cpu-osm-660.c, both in
+  ~/Project/whyred-linux/src/kernel-lineage-21) into the shim, staged, checking against this dump.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
