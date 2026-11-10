@@ -1,0 +1,193 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_syna.c			standard
++bsd/dev/sweet_thermal.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -48,6 +48,7 @@
+ extern void sweet_usb_probe(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_syna_init(void);
++extern void sweet_thermal_init(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -767,6 +768,7 @@
+ {
+ 	sweet_keys_init();
+ 	sweet_syna_init();      /* touch: starts its own thread, 20 s later */
++	sweet_thermal_init();   /* Gold cluster thermal steps on the OSM table */
+ }
+ 
+ /* Root device for rd=emmcroot0 (IOFindBSDRoot). */
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.c
+@@ -0,0 +1,158 @@
++/*
++ * whyred thermal governor for the Gold cluster.
++ *
++ * The shim (whyred/shim/osm.c) brings the Gold cluster up to OSM table row 4 (1804.8 MHz) with
++ * CPRH open-loop voltages, but nothing like Linux's LMH limits firmware runs under XNU. This thread
++ * reads the Gold TSENS sensors (cpu-1-0..1-3 = sensors 3..6, live DT tsens@10ad000) and steps the
++ * OSM performance request (DCVS_PERF_STATE_DESIRED, perf block 0x179c3f10) down when hot and back
++ * up when cool. Linux's own step trip for these zones is 105 C, critical 115/125 C.
++ *
++ * boot-args: sweettherm=0 off, 1 on (default), 2 also log the temperature every 10 s.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_thermal_init(void);
++
++#define TSENS_TM_PA             0x010ae000u
++#define TSENS_SN_STATUS(n)      (0xa0u + 4u * (n))
++#define TSENS_VALID             (1u << 21)
++#define TSENS_TRDY              0xe4u
++#define TSENS_TRDY_FIRST_ROUND  (1u << 3)
++#define OSM_PERF_DCVS_PA        0x179c3000u     /* page holding DESIRED at +0xf10, ENABLE at +0x004 */
++#define OSM_ENABLE              0x004u
++#define OSM_DESIRED             0xf10u
++
++#define HOT_DC                  900             /* step down at 90.0 C */
++#define CRIT_DC                 1050            /* row 0 at 105.0 C (Linux step trip) */
++#define COOL_DC                 750             /* step up at 75.0 C */
++#define NO_TEMP                 (-100000)       /* no valid sensor */
++#define POLL_MS                 500
++#define UP_HOLD_POLLS           4               /* at most one step up every 2 s */
++
++static vm_offset_t tsens, osm;
++static int therm_chan;
++static int therm_mode;
++
++static uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* Hottest valid Gold sensor in deci-degrees C, or NO_TEMP if none is valid. */
++static int
++gold_temp_dc(void)
++{
++	int hot = NO_TEMP;
++	for (uint32_t s = 3; s <= 6; s++) {
++		uint32_t code = 0;
++		for (int tries = 0; tries < 3; tries++) {
++			code = rd(tsens, TSENS_SN_STATUS(s));
++			if (code & TSENS_VALID) {
++				break;
++			}
++		}
++		if (!(code & TSENS_VALID)) {
++			continue;
++		}
++		int t = (int)(code & 0xfffu);
++		if (t & 0x800) {
++			t -= 0x1000;            /* 12-bit two's complement */
++		}
++		if (t > hot) {
++			hot = t;
++		}
++	}
++	return hot;
++}
++
++static void
++set_row(uint32_t row, int temp)
++{
++	*(volatile uint32_t *)(osm + OSM_DESIRED) = row;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("WHYRED THERMAL: gold %d.%d C -> OSM row %u\n", temp / 10, temp % 10, row);
++}
++
++static void
++therm_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t max_row = rd(osm, OSM_DESIRED), row = max_row;
++	unsigned cool = 0, polls = 0, invalid = 0;
++
++	printf("WHYRED THERMAL: tsens trdy %#x, OSM enable %u, boot row %u, step down %d.%d C, up %d.%d C\n",
++	    rd(tsens, TSENS_TRDY), rd(osm, OSM_ENABLE), max_row, HOT_DC / 10, HOT_DC % 10,
++	    COOL_DC / 10, COOL_DC % 10);
++	if (!(rd(osm, OSM_ENABLE) & 1u) || max_row == 0) {
++		printf("WHYRED THERMAL: OSM not enabled by the shim, nothing to govern\n");
++		return;
++	}
++	for (;;) {
++		int t = gold_temp_dc();
++		if (t == NO_TEMP) {
++			if ((invalid++ % 20u) == 0) {
++				printf("WHYRED THERMAL: no valid Gold sensor reading (trdy %#x)\n", rd(tsens, TSENS_TRDY));
++			}
++		} else {
++			invalid = 0;
++			if (t >= CRIT_DC && row != 0) {
++				row = 0;
++				set_row(row, t);
++				cool = 0;
++			} else if (t >= HOT_DC && row > 1) {
++				row--;
++				set_row(row, t);
++				cool = 0;
++			} else if (t <= COOL_DC && row < max_row) {
++				if (++cool >= UP_HOLD_POLLS) {
++					row++;
++					set_row(row, t);
++					cool = 0;
++				}
++			} else {
++				cool = 0;
++			}
++			if (therm_mode == 2 && (polls % (10000 / POLL_MS)) == 0) {
++				printf("WHYRED THERMAL: gold %d.%d C, OSM row %u\n", t / 10, t % 10, row);
++			}
++		}
++		polls++;
++		uint64_t deadline;
++		clock_interval_to_deadline(POLL_MS, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&therm_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++void
++sweet_thermal_init(void)
++{
++	int mode = 1;
++	(void)PE_parse_boot_argn("sweettherm", &mode, sizeof(mode));
++	if (mode == 0) {
++		printf("WHYRED THERMAL: disabled (sweettherm=0)\n");
++		return;
++	}
++	therm_mode = mode;
++	tsens = ml_io_map(TSENS_TM_PA, 0x1000);
++	osm = ml_io_map(OSM_PERF_DCVS_PA, 0x1000);
++	if (!tsens || !osm) {
++		printf("WHYRED THERMAL: MMIO mapping failed\n");
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(therm_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
