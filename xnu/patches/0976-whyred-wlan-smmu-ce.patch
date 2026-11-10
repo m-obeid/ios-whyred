@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3666,9 +3666,10 @@
+  *  - WMI (TLV): SERVICE_READY -> INIT -> READY, then a passive scan (nothing is transmitted);
+  *    each BSS seen is logged once, its BSSID masked.
+  */
+-#define SMMU_PA             0x0C600000ull
+-#define SMMU_SIZE           0x00080000u
+-#define WLAN_SID            0x1A0
++/* whyred: icnss iommus <&anoc2_smmu 0x1a00>, <0x1a01> (qcom,smmu-v2 at 0x16c0000, skip-init) */
++#define SMMU_PA             0x016C0000ull       /* topaz apps SMMU 0x0C600000 */
++#define SMMU_SIZE           0x00040000u
++#define WLAN_SID            0x1A00              /* topaz 0x1A0 */
+ #define WLAN_SID_MASK       0x1
+ #define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
+ #define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
+@@ -3761,9 +3762,9 @@
+ 
+ /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
+ 
+-#define CE_PA               (0x0C800000ull + 0x240000)
++#define CE_PA               (0x18800000ull + 0x240000)   /* whyred icnss membase 0x18800000 (topaz 0x0C800000) */
+ #define CE_COUNT            12
+-#define SHADOW_PA           (0x0C800000ull + 0x32000)
++#define SHADOW_PA           (0x18800000ull + 0x32000)
+ #define SR_BASE_LO          0x00
+ #define SR_BASE_HI          0x04
+ #define SR_SIZE             0x08
