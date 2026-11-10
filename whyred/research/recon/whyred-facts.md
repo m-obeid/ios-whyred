@@ -258,6 +258,9 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   Expected: voltage drops from 840 mV toward Linux's ~788 mV at row 4. Corner words already carry
   RO select 7 and per-corner quotient deltas.
 - CI: run 42785894823 (0967 only) cancelled, run 42786485693 builds 0967 + 0968.
+- Run 42786485693 passed, both patches applied. Kernel sha 9b2c2b17...d29e. Boot images (fast2 args +
+  sweettherm=2): whyred/out/xnu-ios-therm.img (open loop) and xnu-ios-therm-cl.img (shim CPRH_CL=1).
+  Next: boot therm.img, watch `WHYRED THERMAL` / `WHYRED LSE` in udplog, load the CPU, then try therm-cl.img.
 
 ## Not yet known
 
