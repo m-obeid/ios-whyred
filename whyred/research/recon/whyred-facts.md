@@ -316,6 +316,18 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - MG key hash: base64(md5("MGCopyAnswer" + name)) without padding. Tools: ipsw 3.1.743 in the
   scratchpad, cache copied from whyred/ipsw/ios16-root.img (loop mount, sudo).
 
+## USB Ethernet speed (2026-11-10)
+
+- Before: one TRB per direction, a StartTransfer per frame, events polled every 1 ms:
+  ~1 frame/ms. 115 MB download over SSH took 118 s (0.9 MB/s).
+- Patch 0972 (bsd/dev/sweet_usb.c): RX = 16 TRBs x 2 KiB in one transfer (CSP + ISP_IMI + IOC per
+  TRB, XferInProgress enabled on ep 0x01, re-armed after XferComplete); TX = up to 16 queued frames
+  per transfer, IOC + LST on the last; TX queue 64; poll 250 us while busy, 1 ms idle. CPU never
+  writes TRBs the controller owns (non-coherent DMA, shared cache lines).
+- Kernel run 42832495994 (sha 63f14b72...e115). Same 115 MB file: 9.6 s = 11.5 MB/s (12.8x),
+  sha256 matches. Upload 50 MB random: 8.3 MB/s, sha256 matches. ~11 frames per TX batch under load.
+- Default image whyred/out/xnu-ios-fast5.img = fast4 + 0972.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
