@@ -472,6 +472,10 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   cxo_ref_clk_pin = RPM_SMD_RF_CLK1_PIN: "clka" id 4, key "pccb" 1), then waits FW_READY_IND.
   topaz's w_start_bdf waited for MSA_READY_IND, so the host stalled after cap.
 - Next build: rf_clk1 pin-ctrl vote, after cap wait for FW_READY directly, no BDF.
+- Kernel 42921074876: rpm ldoa 5 and clka 4 both acked (active + sleep), WLFW goes straight to
+  "waiting FW_READY" after cap; no FW_READY, modem FATAL at 13.6 s with diag starvation again (also
+  without wifi=1 earlier): not WLAN-specific. Next: MSS proxy votes as pil_mss_make_proxy_votes
+  ("rwcx" 0 / "rwmx" 0 vlvl 384, qdss "clk0" 1 STAT 1); boot-arg modem_proxy=0 skips them.
 
 ## Not yet known
 

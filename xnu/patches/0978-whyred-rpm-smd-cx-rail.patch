@@ -37,7 +37,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  		break;
  	case WLFW_BDF_DOWNLOAD:
  		if (!ok) {
-@@ -6739,6 +6744,243 @@
+@@ -6739,6 +6744,264 @@
  	}
  }
  
@@ -257,10 +257,31 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	return false;
 +}
 +
++/*
++ * MSS proxy votes (Linux pil-q6v5-mss / pil_mss_make_proxy_votes): vdd_cx (pm660l_s3_level, "rwcx"
++ * 0) and vdd_mx (pm660l_s5_level, "rwmx" 0) at level 384 (DT vdd_cx-voltage / vdd_mx-uV 0x180,
++ * TURBO), proxy clocks xo and qdss ("clk0" 1, key "STAT" = 1). Linux drops them once the modem
++ * says it holds its own; here they stay for the session. Suspected: modem diag starves on an
++ * unclocked QDSS.
++ */
++static void
++mss_proxy_votes(void)
++{
++	if (!rpm_up && !rpm_open()) {
++		return;
++	}
++	static const uint32_t lvl[] = { 0x6c766c76, 384 };                  /* "vlvl" */
++	static const uint32_t qdss[] = { 0x54415453, 1 };                   /* "STAT" */
++	bool cx = rpm_request(0, 0x78637772, 0, lvl, 1);                    /* "rwcx" */
++	bool mx = rpm_request(0, 0x786d7772, 0, lvl, 1);                    /* "rwmx" */
++	bool qd = rpm_request(0, 0x306b6c63, 1, qdss, 1);                   /* "clk0" 1 = qdss */
++	LOG("rpm: MSS proxy votes: cx %s, mx %s, qdss %s", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED", qd ? "ok" : "FAILED");
++}
++
 +static void
 +wlan_cx_rail_on(void)
 +{
-+	if (!rpm_open()) {
++	if (!rpm_up && !rpm_open()) {
 +		return;
 +	}
 +	/* pm660_l5: qcom,resource-name "ldoa", qcom,resource-id 5; icnss qcom,vdd-cx-mx-config 848000 */
@@ -281,7 +302,19 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  static void
  topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -6761,9 +7003,14 @@
+@@ -6754,6 +7017,11 @@
+ 	}
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
+ 	wlan_rails_dump("before modem boot");
++	uint32_t proxy = 1;
++	(void)PE_parse_boot_argn("modem_proxy", &proxy, sizeof(proxy));
++	if (proxy) {
++		mss_proxy_votes();
++	}
+ 	/*
+ 	 * Measured: l6, l9, l19 are on (ABL), l5 (vdd-cx-mx, VSET already 848 mV = Linux's
+ 	 * qcom,vdd-cx-mx-config) is off. Turn it on before the WLAN firmware starts.
+@@ -6761,9 +7029,14 @@
  	if (wifi_enabled()) {
  		uint8_t en = 0;
  		if (whyred_spmi_read(1, 0x4446, &en) == 0 && !(en & 0x80)) {
