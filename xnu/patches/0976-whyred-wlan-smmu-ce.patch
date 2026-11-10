@@ -15,7 +15,33 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #define WLAN_SID_MASK       0x1
  #define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
  #define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
-@@ -3761,9 +3762,9 @@
+@@ -3711,6 +3712,25 @@
+ 	uint64_t used = 0;
+ 
+ 	LOG("smmu: sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs, page %x x%u", cr0, id0, id1, nsmr, ncb, psize, npage);
++	/*
++	 * whyred: the anoc2 SMMU is qcom,skip-init (programmed by the hypervisor) and the first run
++	 * of the topaz writes below stalled the thread. Read-only unless wifi_smmu=1: list the
++	 * stream matches, and if one already covers the WLAN SID, use it as it is.
++	 */
++	uint32_t smmu_write = 0;
++	(void)PE_parse_boot_argn("wifi_smmu", &smmu_write, sizeof(smmu_write));
++	bool covered = false;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t r = r32(s, 0x800 + 4 * i), c = r32(s, 0xC00 + 4 * i);
++		bool match = (r >> 31) != 0 && smmu_sid_match(r, sid, mask);
++		LOG("smmu: SMR%u %08x S2CR %08x (type %u cb %u)%s", i, r, c, (c >> 16) & 3, c & 0x3f, match ? " <- WLAN" : "");
++		covered = covered || match;
++	}
++	if (!smmu_write) {
++		LOG("smmu: %s: no writes (wifi_smmu=1 to program an identity bank)", covered ? "WLAN SID already matched" :
++		    "WLAN SID NOT matched");
++		return true;
++	}
+ 	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
+ 		smr = r32(s, 0x800 + 4 * i);
+ 		s2cr = r32(s, 0xC00 + 4 * i);
+@@ -3761,9 +3781,9 @@
  
  /* ---------------- copy engines (ath10k ce.c, WCN3990: 64-bit descriptors, shadow regs, RRI in DDR) */
  

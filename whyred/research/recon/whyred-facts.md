@@ -436,6 +436,10 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   WCN3990 rails (icnss vdd-cx-mx, vdd-1.8-xo, vdd-1.3-rfa, vdd-3.3-ch0: RPM-SMD LDOs) never voted on.
 - Next for wifi=1: SMMU anoc2 0x16c0000 SIDs 0x1a00/0x1a01 (topaz: apps SMMU 0x0C600000 SID 0x1A0),
   CE base 0x18800000 + 0x240000, shadow 0x18800000 + 0x32000, board file bdwlan.bin (board_id ff).
+- Patch 0976 first run (kernel 42896938632, modem=1 wifi=1): anoc2 SMMU reads work: sCR0 0x00200626
+  (USFCFG=1: unmatched streams fault), ID0 0x48017a06, ID1 0x40008015: 6 SMRs, 21 CBs, 4 KB pages x32.
+  Then the modem thread stalled inside the topaz identity-bank writes (iOS kept running). The SMMU
+  is qcom,skip-init: next run lists SMR/S2CR read-only (writes only with wifi_smmu=1).
 
 ## Not yet known
 
