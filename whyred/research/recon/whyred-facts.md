@@ -280,6 +280,25 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Default image whyred/out/xnu-ios-fast3.img: kernel 42789978412, closed loop, row 4, sweettherm=1
   default thresholds 90 / 75 C, otherwise the fast2 boot-args.
 
+## Backlight: PM660L WLED (2026-11-10)
+
+- Live DT qcom,leds@d800 (pm660l-spmi-wled): USID 3, ctrl 0xd800, sink 0xd900, string-cfg 0x3.
+  Linux qcom-spmi-wled.c WLED4: ctrl 0x46 bit 7 module enable; sink 0x57/0x58 + 0x10n brightness
+  LSB / MSB[3:0]; sink 0x47 [3:0] sync clear then set.
+- SPMI v3 writes: chnls 0x08400000 + 0x8000 * apid, CMD +0 = (0 << 27) | (addr << 4) | (n - 1),
+  WDATA0 +0x10, STATUS +0x08 (bit 0 done, 3:1 errors). Reads via observer 0x09400000 (as keys).
+  WLED ctrl PPID 0x3d8 = APID 52, sink 0x3d9 = APID 6, both owner 0 (apps).
+- ABL state: module 0x80 (on), sinks 0x30 (strings 0+1), brightness 2047 / 4095.
+- Patch 0970 bsd/dev/sweet_wled.c (allowlisted writes, sweetwled=0 off) + SweetFramebuffer hooks:
+  display off/on switch the WLED module, IOMFBBrightnessLevel maps DBV 1..0x7ff to 3..4095.
+  Patch 0971: WLED off ~600 ms after the off request so the fade to black shows first; start level
+  = ABL level / 2 (0x3ff -> 2047). Verified: lock fades then goes fully dark, unlock restores 2047.
+- Brightness slider: dead. sweetbl=1 (AppleARMBacklight published, backboardd matches it) made the
+  UI much slower and the slider still sat at 50 %; CoreBrightness never called setProperties on
+  either service. Needs CoreBrightness RE. Default stays sweetbl=0.
+- Default image whyred/out/xnu-ios-fast4.img: kernel run 42800881885 (sha 37938d05...3116),
+  fast3 boot-args, shim closed loop row 4.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
