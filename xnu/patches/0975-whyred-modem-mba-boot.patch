@@ -1,0 +1,849 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -771,6 +771,108 @@
+ 	sweet_thermal_init();   /* Gold cluster thermal steps on the OSM table */
+ }
+ 
++/*
++ * whyred: read-only access to any GPT partition by name, for the modem firmware ("modem", FAT)
++ * and its EFS partitions (modemst1/2, fsg, fsc): iokit/Kernel/arm/TopazModem.cpp. Same shape as
++ * sweet_ufs_read_part on topaz. EAGAIN until the driver is up.
++ */
++int sweet_emmc_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++static struct {
++	char name[24];
++	uint64_t first, sectors;
++} part_cache[8];
++static unsigned part_cached;
++
++static int
++part_lookup(const char *want, uint64_t *first, uint64_t *sectors)
++{
++	for (unsigned i = 0; i < part_cached; i++) {
++		if (strcmp(part_cache[i].name, want) == 0) {
++			*first = part_cache[i].first;
++			*sectors = part_cache[i].sectors;
++			return 0;
++		}
++	}
++	const uint8_t *b = (const uint8_t *)(se.dma + DMA_BOUNCE);
++	int error = emmc_read(1, 1);
++	if (error) {
++		return error;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (memcmp(b, "EFI PART", 8) != 0 || esz != 128 || nent == 0 || nent > 256) {
++		return ENXIO;
++	}
++	error = emmc_read(entry_lba, (nent * esz + SECTOR - 1) / SECTOR);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t f, l;
++		memcpy(&f, e + 32, 8);
++		memcpy(&l, e + 40, 8);
++		if (l < f || l + 1 > se.card_sectors) {
++			return ENXIO;
++		}
++		*first = f;
++		*sectors = l - f + 1;
++		if (part_cached < sizeof(part_cache) / sizeof(part_cache[0])) {
++			strlcpy(part_cache[part_cached].name, want, sizeof(part_cache[0].name));
++			part_cache[part_cached].first = f;
++			part_cache[part_cached].sectors = *sectors;
++			part_cached++;
++		}
++		return 0;
++	}
++	return ENOENT;
++}
++
++int
++sweet_emmc_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
++{
++	uint64_t first = 0, sectors = 0;
++	int error;
++
++	if (!se.ready) {
++		return EAGAIN;
++	}
++	lck_mtx_lock(&sweet_emmc_lock);
++	error = part_lookup(want, &first, &sectors);
++	if (!error && (off > sectors * SECTOR || len > sectors * SECTOR - off)) {
++		error = EINVAL;
++	}
++	for (uint64_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % SECTOR);
++		uint32_t take = (uint32_t)MIN(len - done, (uint64_t)(BOUNCE_SIZE - skip));
++		error = emmc_read(first + pos / SECTOR, (skip + take + SECTOR - 1) / SECTOR);
++		if (!error) {
++			memcpy((uint8_t *)dst + done, (const uint8_t *)(se.dma + DMA_BOUNCE) + skip, take);
++			done += take;
++		}
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	return error;
++}
++
+ /* Root device for rd=emmcroot0 (IOFindBSDRoot). */
+ int sweet_emmc_rootdev(dev_t *dev);
+ 
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -43,17 +43,20 @@
+ #define MDT_TYPE_HASH       (2u << 24)
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+-/* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+-#define MODEM_POOL_BASE     0xE0000000ull
++/*
++ * whyred: RAM the kernel does not manage, between the fixed carve-outs (end 0xa0400000) and the
++ * XNU base 0xa2000000 (whyred/tools/mkadt_whyred.py). topaz: 0xE0000000. Below 0xF0000000 for TZ.
++ */
++#define MODEM_POOL_BASE     0xA0400000ull
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+-#define SMEM_PA             0x46000000ull
++#define SMEM_PA             0x86000000ull       /* whyred smem-mem@86000000 (topaz 0x46000000) */
+ #define SMEM_SIZE           0x00200000u
+ #define SMEM_GLOBAL_HOST    0xFFFE
+-#define TCSR_MUTEX_PA       0x00340000ull       /* qcom,tcsr-mutex, stride 0x1000 */
++#define TCSR_MUTEX_PA       0x01F40000ull       /* whyred syscon@1f40000 (qcom,tcsr-mutex), stride 0x1000 */
+ #define SMEM_HWLOCK         3
+ #define HWLOCK_APPS_ID      1
+-#define APCS_PA             0x0F111000ull
++#define APCS_PA             0x17911000ull       /* whyred qcom,sdm660-apcs-hmss-global (topaz 0x0F111000) */
+ #define APCS_IPC            8                   /* apcs_glb mailbox */
+ #define MPSS_SMP2P_BIT      14
+ 
+@@ -174,10 +177,13 @@
+  * same NON-HLOS.bin (HyperOS 2.0.208; every file is one contiguous run); the CRC32 tells
+  * whether the phone's partition is that image.
+  */
+-extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
+-
+-static char fw_part[32] = "modem_a";
+-static const struct { const char *name; uint32_t off, size, crc; } fw_files[] = {
++/* whyred: eMMC (bsd/dev/sweet_emmc.c), the same interface as topaz's UFS reader. */
++extern "C" int sweet_emmc_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++#define sweet_ufs_read_part sweet_emmc_read_part
++
++static char fw_part[32] = "modem";            /* whyred GPT name (topaz modem_a) */
++/* topaz only: whyred reads the files through FAT (fat_* below) */
++__attribute__((unused)) static const struct { const char *name; uint32_t off, size, crc; } fw_files[] = {
+ 	{ "modem.b00", 0x1e1d000, 0x414, 0xaacde80c },
+ 	{ "modem.b01", 0x1e21000, 0x1f78, 0x80555ebe },
+ 	{ "modem.b02", 0x1e25000, 0x2930, 0x0858b3a0 },
+@@ -208,45 +214,205 @@
+ 	{ "modem.mdt", 0x4a6d000, 0x238c, 0x8742d22b },
+ };
+ 
++/*
++ * whyred: the stock "modem" partition is FAT16 (NON-HLOS). At mount the FAT is read whole and the
++ * root plus each top-level directory are listed into fat_files ("image/modem.b00"). Files are
++ * read cluster run by cluster run through sweet_emmc_read_part. 8.3 names, lower case (vfat
++ * shortname=lower, as Linux mounts it); long-name entries are skipped.
++ */
++struct fat_file { char path[40]; uint32_t size, clus; };
++static struct fat_file *fat_files;
++static unsigned fat_count, fat_max = 1024;
++static uint16_t *fat_tab;                       /* FAT16 */
++static uint32_t fat_entries, fat_spc, fat_clus_bytes;
++static uint64_t fat_data_off, fat_root_off;
++static uint32_t fat_root_bytes;
++
++static bool
++fat_part_read(uint64_t off, void *dst, uint64_t n)
++{
++	return sweet_ufs_read_part(fw_part, off, dst, n) == 0;
++}
++
++static uint32_t
++fat_next(uint32_t c)
++{
++	uint32_t v = c < fat_entries ? fat_tab[c] : 0xffff;
++	return v >= 0xfff8 ? 0x0fffffff : v;
++}
++
++static void
++fat_add_dir(const uint8_t *d, uint32_t bytes, const char *prefix, bool recurse);
++
++static void
++fat_list_clusters(uint32_t clus, const char *prefix)
++{
++	uint8_t *buf = (uint8_t *)IOMalloc(fat_clus_bytes);
++	for (unsigned guard = 0; buf != NULL && clus >= 2 && clus < 0x0ffffff8 && guard < 4096; guard++) {
++		if (!fat_part_read(fat_data_off + (uint64_t)(clus - 2) * fat_clus_bytes, buf, fat_clus_bytes)) {
++			break;
++		}
++		fat_add_dir(buf, fat_clus_bytes, prefix, false);
++		clus = fat_next(clus);
++	}
++	if (buf != NULL) {
++		IOFree(buf, fat_clus_bytes);
++	}
++}
++
++static void
++fat_add_dir(const uint8_t *d, uint32_t bytes, const char *prefix, bool recurse)
++{
++	for (uint32_t o = 0; o + 32 <= bytes; o += 32) {
++		const uint8_t *e = d + o;
++		if (e[0] == 0) {
++			return;
++		}
++		if (e[0] == 0xe5 || e[0] == '.' || e[11] == 0x0f || (e[11] & 0x08)) {
++			continue;
++		}
++		char name[13];
++		unsigned n = 0;
++		for (unsigned i = 0; i < 8 && e[i] != ' '; i++) {
++			name[n++] = (char)(e[i] >= 'A' && e[i] <= 'Z' ? e[i] + 32 : e[i]);
++		}
++		if (e[8] != ' ') {
++			name[n++] = '.';
++			for (unsigned i = 8; i < 11 && e[i] != ' '; i++) {
++				name[n++] = (char)(e[i] >= 'A' && e[i] <= 'Z' ? e[i] + 32 : e[i]);
++			}
++		}
++		name[n] = 0;
++		uint32_t clus = e[26] | e[27] << 8, size = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24;
++		char path[40];
++		snprintf(path, sizeof(path), "%s%s", prefix, name);
++		if (e[11] & 0x10) {
++			if (recurse) {
++				char sub[40];
++				snprintf(sub, sizeof(sub), "%s/", path);
++				fat_list_clusters(clus, sub);
++			}
++			continue;
++		}
++		if (fat_count < fat_max) {
++			strlcpy(fat_files[fat_count].path, path, sizeof(fat_files[0].path));
++			fat_files[fat_count].size = size;
++			fat_files[fat_count].clus = clus;
++			fat_count++;
++		}
++	}
++}
++
++/* Boot sector, the whole FAT, the root and one level of directories. EAGAIN while eMMC is not up. */
++static int
++fat_mount(void)
++{
++	uint8_t b[512];
++	int err = sweet_ufs_read_part(fw_part, 0, b, sizeof(b));
++	if (err != 0) {
++		return err;
++	}
++	uint32_t bps = b[11] | b[12] << 8, reserved = b[14] | b[15] << 8, nfats = b[16];
++	uint32_t root_ents = b[17] | b[18] << 8, fatsz = b[22] | b[23] << 8;
++	uint32_t tot = (b[19] | b[20] << 8) ? (uint32_t)(b[19] | b[20] << 8) : (uint32_t)(b[32] | b[33] << 8 | b[34] << 16 | b[35] << 24);
++	fat_spc = b[13];
++	if (bps != 512 || b[510] != 0x55 || b[511] != 0xaa || fatsz == 0 || fat_spc == 0) {
++		LOG("%s: not a FAT12/16 volume (bps %u, fatsz %u)", fw_part, bps, fatsz);
++		return EINVAL;
++	}
++	uint64_t fat_off = (uint64_t)reserved * 512;
++	fat_root_off = fat_off + (uint64_t)nfats * fatsz * 512;
++	fat_root_bytes = root_ents * 32;
++	fat_data_off = fat_root_off + ((fat_root_bytes + 511) & ~511u);
++	fat_clus_bytes = fat_spc * 512;
++	uint32_t clusters = (uint32_t)((tot * 512ull - fat_data_off) / fat_clus_bytes);
++	if (clusters < 4085 || clusters >= 65525) {
++		LOG("%s: %u clusters: only FAT16 is supported", fw_part, clusters);
++		return EINVAL;
++	}
++	fat_entries = fatsz * 256;
++	fat_tab = (uint16_t *)IOMalloc(fatsz * 512);
++	fat_files = (struct fat_file *)IOMalloc(fat_max * sizeof(struct fat_file));
++	uint8_t *root = (uint8_t *)IOMalloc(fat_root_bytes);
++	if (fat_tab == NULL || fat_files == NULL || root == NULL ||
++	    !fat_part_read(fat_off, fat_tab, fatsz * 512) || !fat_part_read(fat_root_off, root, fat_root_bytes)) {
++		LOG("%s: cannot read the FAT", fw_part);
++		return EIO;
++	}
++	fat_add_dir(root, fat_root_bytes, "", true);
++	IOFree(root, fat_root_bytes);
++	LOG("%s: FAT16, %u clusters of %u bytes, %u files", fw_part, clusters, fat_clus_bytes, fat_count);
++	return 0;
++}
++
+ static int
+-fw_find(const char *name)
++fw_all_find(const char *path)
+ {
+-	for (unsigned i = 0; i < sizeof(fw_files) / sizeof(fw_files[0]); i++) {
+-		if (strcmp(fw_files[i].name, name) == 0) {
++	for (unsigned i = 0; i < fat_count; i++) {
++		if (strcmp(fat_files[i].path, path) == 0) {
+ 			return (int)i;
+ 		}
+ 	}
+ 	return -1;
+ }
+ 
++/* n bytes at off of file i, following its cluster chain and reading contiguous runs at once */
++static bool
++fw_all_read(int i, uint64_t off, void *dst, uint64_t n)
++{
++	if (i < 0 || (unsigned)i >= fat_count || off + n > fat_files[i].size) {
++		return false;
++	}
++	uint32_t c = fat_files[i].clus;
++	for (uint64_t skip = off / fat_clus_bytes; skip > 0; skip--) {
++		c = fat_next(c);
++	}
++	uint64_t in = off % fat_clus_bytes, done = 0;
++	while (done < n) {
++		if (c < 2 || c >= 0x0ffffff8) {
++			return false;
++		}
++		uint32_t run = 1, last = c;
++		while ((uint64_t)run * fat_clus_bytes - in < n - done && fat_next(last) == last + 1 && run < 256) {
++			last++;
++			run++;
++		}
++		uint64_t take = MIN((uint64_t)run * fat_clus_bytes - in, n - done);
++		if (!fat_part_read(fat_data_off + (uint64_t)(c - 2) * fat_clus_bytes + in, (uint8_t *)dst + done, take)) {
++			return false;
++		}
++		done += take;
++		in = 0;
++		c = fat_next(last);
++	}
++	return true;
++}
++
+ static int64_t
+ fw_size(const char *name)
+ {
+-	int i = fw_find(name);
+-	return i < 0 ? -1 : (int64_t)fw_files[i].size;
++	char path[40];
++	snprintf(path, sizeof(path), "image/%s", name);
++	int i = fw_all_find(path);
++	return i < 0 ? -1 : (int64_t)fat_files[i].size;
+ }
+ 
+-/* Read the whole file name into dst (max bytes at most). Returns bytes read or -1. */
++/* Read the whole file image/name into dst (max bytes at most). Returns bytes read or -1. */
+ static int64_t
+ fw_read(const char *name, void *dst, uint64_t max)
+ {
+-	int i = fw_find(name), err;
+-
+-	if (i < 0 || fw_files[i].size > max) {
+-		LOG("%s: not in the table or too big (%lld)", name, fw_size(name));
++	char path[40];
++	snprintf(path, sizeof(path), "image/%s", name);
++	int i = fw_all_find(path);
++	if (i < 0 || fat_files[i].size > max) {
++		LOG("%s: not in %s or too big (%lld)", path, fw_part, fw_size(name));
+ 		return -1;
+ 	}
+-	err = sweet_ufs_read_part(fw_part, fw_files[i].off, dst, fw_files[i].size);
+-	if (err != 0) {
+-		LOG("%s: read from %s failed: %d", name, fw_part, err);
++	if (!fw_all_read(i, 0, dst, fat_files[i].size)) {
++		LOG("%s: read from %s failed", path, fw_part);
+ 		return -1;
+ 	}
+-	uint32_t crc = crc32(0, dst, fw_files[i].size);
+-	if (crc != fw_files[i].crc) {
+-		/* TrustZone checks the signature anyway: say so and go on */
+-		LOG("%s: crc32 %08x, expected %08x: %s is not the image this was made for", name, crc, fw_files[i].crc, fw_part);
+-	}
+-	return fw_files[i].size;
++	return fat_files[i].size;
+ }
+ 
+ /* ---------------------------------------------------------------- SMEM */
+@@ -443,7 +609,7 @@
+ #define SMEM_GLINK_FIFO_TX  479
+ #define SMEM_GLINK_FIFO_RX  480
+ #define GLINK_TX_SIZE       0x4000u
+-#define GLINK_IRQ_BIT       12
++#define GLINK_IRQ_BIT       15                  /* whyred: glink mpss mboxes <apcs 15> (topaz 12) */
+ #define GLINK_FEATURES      1                   /* INTENT_REUSE */
+ 
+ #define CMD_VERSION         0
+@@ -1038,7 +1204,7 @@
+ #define QMI_RESP            2
+ 
+ /* generated by fwtable_all.py from NON-HLOS.bin (HyperOS 2.0.208 modem_a): 657 files, 657 extents */
+-static const struct { uint32_t off, len; } fw_ext[] = {
++__attribute__((unused)) static const struct { uint32_t off, len; } fw_ext[] = {
+ 	{ 0x25000, 0x4d4 },
+ 	{ 0x29000, 0x2098 },
+ 	{ 0x2d000, 0x14ef4 },
+@@ -1697,7 +1863,7 @@
+ 	{ 0x7239000, 0x2ecfa },
+ 	{ 0x7269000, 0x3a39c0 },
+ };
+-static const struct { const char *path; uint32_t size; uint16_t ext, next; } fw_all[] = {
++__attribute__((unused)) static const struct { const char *path; uint32_t size; uint16_t ext, next; } fw_all[] = {
+ 	{ "image/adsp.b00", 0x4d4, 0, 1 },
+ 	{ "image/adsp.b01", 0x2098, 1, 1 },
+ 	{ "image/adsp.b02", 0x14ef4, 2, 1 },
+@@ -2357,36 +2523,6 @@
+ 	{ "image/wlanmdsp.mbn", 0x3a39c0, 656, 1 },
+ };
+ 
+-static int
+-fw_all_find(const char *path)
+-{
+-	for (unsigned i = 0; i < sizeof(fw_all) / sizeof(fw_all[0]); i++) {
+-		if (strcmp(fw_all[i].path, path) == 0) {
+-			return (int)i;
+-		}
+-	}
+-	return -1;
+-}
+-
+-/* read n bytes at off of file i from modem_a (extent by extent) */
+-static bool
+-fw_all_read(int i, uint64_t off, void *dst, uint64_t n)
+-{
+-	uint64_t base = 0, done = 0;
+-	for (unsigned k = 0; k < fw_all[i].next && done < n; k++) {
+-		uint32_t eo = fw_ext[fw_all[i].ext + k].off, el = fw_ext[fw_all[i].ext + k].len;
+-		if (off + done < base + el) {
+-			uint64_t in = off + done - base, take = MIN((uint64_t)el - in, n - done);
+-			if (sweet_ufs_read_part(fw_part, eo + in, (uint8_t *)dst + done, take) != 0) {
+-				return false;
+-			}
+-			done += take;
+-		}
+-		base += el;
+-	}
+-	return done == n;
+-}
+-
+ /* QMI */
+ struct qmsg { uint8_t b[512]; uint32_t n; };
+ 
+@@ -2780,7 +2916,7 @@
+ 			tftp_close(s);
+ 			return;
+ 		}
+-		s->size = fw_all[s->fi].size;
++		s->size = fat_files[s->fi].size;
+ 		LOG("t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", g_ms, path, s->seek, s->rsize, s->blk, s->wsize, s->size);
+ 	}
+ 	if (!opts) {
+@@ -3058,7 +3194,7 @@
+ #define WLFW_MSA_INFO       0x2D
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+-#define WLFW_MSA_BASE       0x51900000u         /* DTB wlan_msa_region, inside "PIL Reserved" */
++#define WLFW_MSA_BASE       0x85700000u         /* whyred wlan_msa_mem@85700000 (topaz 0x51900000) */
+ #define WLFW_MSA_SIZE       0x00100000u
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+ #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+@@ -3207,7 +3343,7 @@
+ 		LOG("wlfw: no board data file");
+ 		return;
+ 	}
+-	w_bdf_len = fw_all[w_bdf_fi].size;
++	w_bdf_len = fat_files[w_bdf_fi].size;
+ 	w_bdf_off = 0;
+ 	w_bdf_seg = 0;
+ 	LOG("t=%u ms: wlfw: board data %s, %u bytes", g_ms, name, w_bdf_len);
+@@ -6095,7 +6231,65 @@
+ 	}
+ }
+ 
+-/* ---------------------------------------------------------------- PAS boot */
++/* ---------------------------------------------------------------- MBA boot (whyred) */
++
++/*
++ * whyred: self-authenticating modem boot (Linux pil-msa.c / pil-q6v5.c, qcom,pil-q6v55-mss with
++ * qcom,pil-self-auth and qdsp6v62-1-5; no PAS id on SDM636). Proven step by step in the shim
++ * (whyred/shim/mss.c): clocks, MBA into pil_mba_region and hyp_assign to MSS_MSA, restart pulse,
++ * Q6 power-up, RMB PBL/MBA status; modem.mdt to MBA (status 3); region to {MSS_MSA, HLOS},
++ * segments with verify_blob; status 4 = authenticated and running.
++ */
++#define GCC_PA              0x00100000ull
++#define GCC_MSS_RESTART     0x79000             /* 0x179000, DT restart_reg */
++#define Q6_PA               0x04080000ull       /* qdsp6_base */
++#define RMB_PA              0x04180000ull       /* rmb_base */
++#define MBA_PA              0x94800000ull       /* pil_mba_region, 2 MB: MBA (1 MB slot), metadata */
++#define MODEM_REGION        0x8AC00000ull       /* modem_fw_region */
++#define MODEM_REGION_SIZE   0x07E00000ull
++
++#define RMB_MBA_IMAGE       0x00
++#define RMB_PBL_STATUS      0x04
++#define RMB_MBA_COMMAND     0x08
++#define RMB_MBA_STATUS      0x0c
++#define RMB_PMI_META_DATA   0x10
++#define RMB_PMI_CODE_START  0x14
++#define RMB_PMI_CODE_LENGTH 0x18
++
++static volatile uint8_t *mss_gcc, *mss_q6, *mss_rmb;
++
++static inline uint32_t r32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; mb(); }
++
++static bool
++mss_clk_on(const char *name, uint32_t en, uint32_t bit, uint32_t cbcr)
++{
++	w32(mss_gcc, en, r32(mss_gcc, en) | bit);
++	for (int i = 0; i < 1000; i++) {
++		if (!(r32(mss_gcc, cbcr) & (1u << 31))) {
++			return true;
++		}
++		IODelay(10);
++	}
++	LOG("MSS clock %s stays off (cbcr %08x)", name, r32(mss_gcc, cbcr));
++	return false;
++}
++
++/* Signed RMB status: negative values are MBA error codes. */
++static bool
++rmb_wait(uint32_t reg, int32_t want, unsigned ms, int32_t *got)
++{
++	for (unsigned i = 0; i <= ms; i++) {
++		int32_t v = (int32_t)r32(mss_rmb, reg);
++		if (want == 0 ? v != 0 : (v == want || v < 0)) {
++			*got = v;
++			return want == 0 || v == want;
++		}
++		IODelay(1000);
++	}
++	*got = (int32_t)r32(mss_rmb, reg);
++	return false;
++}
+ 
+ static bool
+ loadable(const struct elf32_phdr *p)
+@@ -6106,11 +6300,11 @@
+ static bool
+ modem_boot(void)
+ {
+-	uint8_t *mdt = NULL, *meta;
+-	int64_t mdt_size;
+-	uint64_t meta_pa = 0, res = 0, st;
+-	uint32_t min_a = ~0u, max_a = 0, hash = ~0u;
+-	bool relocate = false, ok = false;
++	uint8_t *mdt = NULL;
++	int64_t mdt_size = 0;
++	int32_t st;
++	bool ok = false;
++	IOMemoryMap *mba_map = NULL;
+ 
+ 	struct smem_part_hdr *part = smem_partition(0, 1);
+ 	LOG("SMEM apps<->modem partition %p", part);
+@@ -6121,14 +6315,103 @@
+ 		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
+ 		return false;
+ 	}
+-	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, PAS_ID_MODEM, 0, 0, &res);
+-	LOG("PAS id %u supported: ret=%llx res=%llx", PAS_ID_MODEM, st, res);
+-	/* informational only: on topaz TZ answers res=0 here, init_image decides */
++	mss_gcc = (volatile uint8_t *)ml_io_map(GCC_PA, 0xa0000);
++	mss_q6 = (volatile uint8_t *)ml_io_map(Q6_PA, 0x1000);
++	mss_rmb = (volatile uint8_t *)ml_io_map(RMB_PA, 0x1000);
++	mba_map = map_phys(MBA_PA, 0x200000, true);
++	if (mss_gcc == NULL || mss_q6 == NULL || mss_rmb == NULL || mba_map == NULL) {
++		LOG("MSS mappings failed");
++		return false;
++	}
++	uint8_t *mba = (uint8_t *)mba_map->getVirtualAddress();
++
++	/* 1. Clocks, DT order: iface, bus, mem, gpll0_mss, snoc_axi, mnoc_axi. MSS registers abort
++	 *    until gcc_mss_cfg_ahb runs. */
++	bool clk = mss_clk_on("cfg_ahb", 0x8a000, 1, 0x8a000) & mss_clk_on("bimc_q6", 0x4401c, 1, 0x4401c) &
++	    mss_clk_on("boot_rom", 0x52004, 1u << 10, 0x38004);
++	w32(mss_gcc, 0x5200c, r32(mss_gcc, 0x5200c) | (1u << 2));      /* gpll0_out_msscc */
++	clk = clk & mss_clk_on("snoc", 0x8a03c, 1, 0x8a03c) & mss_clk_on("mnoc", 0x8a004, 1, 0x8a004);
++	if (!clk) {
++		goto out;
++	}
++
++	/* 2. MBA (1 MB slot) and the modem's VM owns it */
++	{
++		int64_t n = fw_read("mba.mbn", mba, 0x100000);
++		if (n <= 0) {
++			goto out;
++		}
++		mb();
++		static const uint32_t msa[1] = { VMID_MSS_MSA };
++		uint64_t r = scm_assign(MBA_PA, 0x100000, msa, 1);
++		LOG("mba.mbn %lld bytes, assigned: %llx", n, r);
++		if (r != 0) {
++			goto out;
++		}
++	}
++
++	/* 3. restart pulse, keeping QDSP6SS_DBG_CFG */
++	{
++		uint32_t dbg = r32(mss_q6, 0x018);
++		w32(mss_gcc, GCC_MSS_RESTART, 1);
++		IODelay(200);
++		w32(mss_gcc, GCC_MSS_RESTART, 0);
++		IODelay(200);
++		w32(mss_q6, 0x018, dbg);
++	}
+ 
++	/* 4. RMB: MBA image, no debug policy */
++	w32(mss_rmb, RMB_MBA_IMAGE, (uint32_t)MBA_PA);
++	w32(mss_rmb, RMB_PMI_CODE_START, 0);
++	w32(mss_rmb, RMB_PMI_CODE_LENGTH, 0);
++
++	/* 5. __pil_q6v55_reset, qdsp6v62_1_5 */
++	{
++		uint32_t v;
++		w32(mss_q6, 0x014, r32(mss_q6, 0x014) | 0x7);           /* CORE_ARES | BUS_ARES_ENA | STOP_CORE */
++		w32(mss_q6, 0x038, r32(mss_q6, 0x038) | 1);             /* XO_CBCR */
++		for (int i = 0; i < 1000 && (r32(mss_q6, 0x038) & (1u << 31)); i++) {
++			IODelay(1);
++		}
++		v = r32(mss_q6, 0x030) | (1u << 24);                    /* BHS_ON */
++		w32(mss_q6, 0x030, v);
++		IODelay(1);
++		for (int i = 0; i < 1000 && !(r32(mss_q6, 0x0c4) & 1); i++) {
++			IODelay(1);
++		}
++		w32(mss_q6, 0x030, v | (1u << 25));                     /* LDO_BYP */
++		v = r32(mss_q6, 0x030) & ~(1u << 22);                   /* CLAMP_QMC_MEM off */
++		w32(mss_q6, 0x030, v);
++		v |= (1u << 18) | (1u << 19);                           /* L2DATA_STBY_N | SLP_RET_N */
++		w32(mss_q6, 0x030, v);
++		v = r32(mss_q6, 0x034);
++		for (int b = 29; b >= 0; b--) {                         /* memory banks one at a time */
++			v |= 1u << b;
++			w32(mss_q6, 0x034, v);
++			IODelay(1);
++		}
++		v = r32(mss_q6, 0x030) & ~(1u << 21);                   /* CLAMP_WL off */
++		w32(mss_q6, 0x030, v);
++		w32(mss_q6, 0x030, v & ~(1u << 20));                    /* CLAMP_IO off */
++		w32(mss_q6, 0x014, r32(mss_q6, 0x014) & ~0x3u);         /* run */
++		w32(mss_q6, 0x020, r32(mss_q6, 0x020) | (1u << 1));     /* GFMUX CLK_ENA */
++		/* no Q6SS access from here on: it aborts once the core runs */
++	}
++	if (!rmb_wait(RMB_PBL_STATUS, 0, 1000, &st) || st != 1) {
++		LOG("PBL status %d", st);
++		goto out;
++	}
++	if (!rmb_wait(RMB_MBA_STATUS, 0, 1000, &st) || (st != 1 && st != 2)) {
++		LOG("MBA status %d", st);
++		goto out;
++	}
++	LOG("MBA runs (PBL 1, MBA %d)", st);
++
++	/* 6. metadata (ELF headers + hash segment = modem.mdt), right after MBA */
+ 	mdt_size = fw_size("modem.mdt");
+ 	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
+ 		LOG("modem.mdt: size %lld", mdt_size);
+-		return false;
++		goto out;
+ 	}
+ 	mdt = (uint8_t *)IOMalloc(mdt_size);
+ 	if (mdt == NULL || fw_read("modem.mdt", mdt, mdt_size) != mdt_size) {
+@@ -6141,75 +6424,51 @@
+ 			LOG("modem.mdt: bad ELF header");
+ 			goto out;
+ 		}
+-		struct elf32_phdr *ph = (struct elf32_phdr *)(mdt + eh->e_phoff);
+-		for (uint32_t i = 0; i < eh->e_phnum; i++) {
+-			if ((ph[i].p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
+-				hash = i;
+-			}
+-			if (!loadable(&ph[i])) {
+-				continue;
+-			}
+-			if (ph[i].p_flags & MDT_RELOCATABLE) {
+-				relocate = true;
+-			}
+-			min_a = MIN(min_a, ph[i].p_paddr);
+-			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
+-		}
+-		LOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
+-		if (hash == ~0u || min_a < 0x4AB00000u || max_a > 0x4AB00000u + 0x6900000u) {
+-			LOG("unexpected layout (carveout is 0x4ab00000+0x6900000)");
++		memcpy(mba + 0x100000, mdt, mdt_size);
++		mb();
++		static const uint32_t msa[1] = { VMID_MSS_MSA };
++		uint64_t r = scm_assign(MBA_PA + 0x100000, ((uint64_t)mdt_size + 0xfff) & ~0xfffull, msa, 1);
++		w32(mss_rmb, RMB_PMI_CODE_LENGTH, 0);
++		w32(mss_rmb, RMB_PMI_META_DATA, (uint32_t)(MBA_PA + 0x100000));
++		w32(mss_rmb, RMB_MBA_COMMAND, 1);                       /* CMD_META_DATA_READY */
++		bool hdr_ok = rmb_wait(RMB_MBA_STATUS, 3, 10000, &st);
++		LOG("metadata %lld bytes (assign %llx): status %d%s", mdt_size, r, st, hdr_ok ? " headers OK" : "");
++		if (!hdr_ok) {
+ 			goto out;
+ 		}
+ 
+-		/* metadata = ELF header + phdrs + hash segment, contiguous, below 0xF0000000 */
+-		uint64_t hdr = eh->e_phoff + eh->e_phnum * sizeof(struct elf32_phdr);
+-		uint64_t meta_size = hdr + ph[hash].p_filesz;
+-		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
+-		if (meta == NULL) {
+-			LOG("metadata: pool allocation of %llu bytes failed", meta_size);
+-			goto out;
+-		}
+-		memcpy(meta, mdt, hdr);
+-		if (ph[hash].p_offset + ph[hash].p_filesz <= (uint64_t)mdt_size) {
+-			memcpy(meta + hdr, mdt + ph[hash].p_offset, ph[hash].p_filesz);
+-		} else {
+-			/* split firmware: the hash segment is its own .bNN file (qcom_mdt_read_metadata) */
+-			char hname[16];
+-			snprintf(hname, sizeof(hname), "modem.b%02u", hash);
+-			int64_t got = fw_read(hname, meta + hdr, ph[hash].p_filesz);
+-			LOG("hash from %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
+-			if (got != (int64_t)ph[hash].p_filesz) {
+-				goto out;
++		struct elf32_phdr *ph = (struct elf32_phdr *)(mdt + eh->e_phoff);
++		uint32_t min_a = ~0u, max_a = 0;
++		for (uint32_t i = 0; i < eh->e_phnum; i++) {
++			if (loadable(&ph[i])) {
++				min_a = MIN(min_a, ph[i].p_paddr);
++				max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
+ 			}
+ 		}
+-		mb();
+-
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), PAS_ID_MODEM, meta_pa, 0, &res);
+-		LOG("init_image: ret=%llx res=%llx resumes=%u (meta %llu bytes @%llx)", st, res, scm_resumes, meta_size, meta_pa);
+-		if (st != 0 || res != 0) {
++		if (min_a < MODEM_REGION || max_a > MODEM_REGION + MODEM_REGION_SIZE) {
++			LOG("segments %08x..%08x outside modem_fw_region", min_a, max_a);
+ 			goto out;
+ 		}
+-		if (relocate) {
+-			st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, PAS_ID_MODEM, min_a,
+-			    ((uint64_t)(max_a - min_a) + 0xfff) & ~0xfffull, &res);
+-			LOG("mem_setup: ret=%llx res=%llx", st, res);
+-			if (st != 0 || res != 0) {
+-				goto shutdown;
+-			}
++		static const uint32_t both[2] = { VMID_MSS_MSA, VMID_HLOS };
++		r = scm_assign(min_a, ((uint64_t)(max_a - min_a) + 0xfff) & ~0xfffull, both, 2);
++		LOG("region %08x..%08x to MSS_MSA + HLOS: %llx", min_a, max_a, r);
++		if (r != 0) {
++			goto out;
+ 		}
+ 
++		/* 7. segments in order, each reported to MBA (pil_msa_mba_verify_blob) */
++		uint32_t loaded = 0;
+ 		for (uint32_t i = 0; i < eh->e_phnum; i++) {
+ 			char name[16];
+ 			if (!loadable(&ph[i])) {
+ 				continue;
+ 			}
+-			/* map only while copying: TZ locks the carveout at auth_and_reset */
+ 			uint64_t pa = ph[i].p_paddr & ~0x3fffull, off = ph[i].p_paddr - pa;
+ 			uint64_t len = (off + ph[i].p_memsz + 0x3fff) & ~0x3fffull;
+ 			IOMemoryMap *m = map_phys(pa, len, true);
+ 			if (m == NULL) {
+ 				LOG("segment %u: cannot map %08x+%x", i, ph[i].p_paddr, ph[i].p_memsz);
+-				goto shutdown;
++				goto out;
+ 			}
+ 			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
+ 			int64_t got = 0;
+@@ -6219,7 +6478,7 @@
+ 				if (got != (int64_t)ph[i].p_filesz) {
+ 					LOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
+ 					m->release();
+-					goto shutdown;
++					goto out;
+ 				}
+ 			}
+ 			if (ph[i].p_memsz > got) {
+@@ -6227,24 +6486,29 @@
+ 			}
+ 			mb();
+ 			m->release();
++			uint32_t clen = r32(mss_rmb, RMB_PMI_CODE_LENGTH);
++			if (clen == 0) {
++				w32(mss_rmb, RMB_PMI_CODE_START, ph[i].p_paddr);
++				w32(mss_rmb, RMB_MBA_COMMAND, 2);               /* CMD_LOAD_READY */
++			}
++			w32(mss_rmb, RMB_PMI_CODE_LENGTH, clen + ph[i].p_memsz);
++			st = (int32_t)r32(mss_rmb, RMB_MBA_STATUS);
++			if (st < 0) {
++				LOG("MBA error %d after segment %u", st, i);
++				goto out;
++			}
++			loaded++;
+ 		}
+-		LOG("segments loaded");
+-
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, PAS_ID_MODEM, 0, 0, &res);
+-		LOG("auth_and_reset: ret=%llx res=%llx resumes=%u", st, res, scm_resumes);
+-		if (st != 0 || res != 0) {
+-			goto shutdown;
+-		}
+-		ok = true;
+-		goto out;
++		ok = rmb_wait(RMB_MBA_STATUS, 4, 10000, &st);           /* STATUS_AUTH_COMPLETE */
++		LOG("%u segments loaded, MBA status %d: %s", loaded, st, ok ? "modem authenticated, running" : "FAILED");
+ 	}
+-shutdown:
+-	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, PAS_ID_MODEM, 0, 0, &res);
+-	LOG("shutdown after failure: ret=%llx res=%llx", st, res);
+ out:
+ 	if (mdt != NULL) {
+ 		IOFree(mdt, mdt_size);
+ 	}
++	if (mba_map != NULL) {
++		mba_map->release();
++	}
+ 	return ok;
+ }
+ 
+@@ -6274,10 +6538,9 @@
+ 	state = -1;
+ 	soc_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
+-	uint8_t probe[16];
+ 	int err = EAGAIN;
+ 	for (int i = 0; i < 120 && err == EAGAIN; i++) {
+-		err = sweet_ufs_read_part(fw_part, fw_files[0].off, probe, sizeof(probe));
++		err = fat_mount();                  /* whyred: EAGAIN until sweet_emmc is up */
+ 		if (err == EAGAIN) {
+ 			IOSleep(500);
+ 		}
+@@ -6344,14 +6607,14 @@
+ topaz_part_fw_size(const char *path)
+ {
+ 	int i = fw_all_find(path);
+-	return i < 0 ? -1 : (int64_t)fw_all[i].size;
++	return i < 0 ? -1 : (int64_t)fat_files[i].size;
+ }
+ 
+ extern "C" bool
+ topaz_part_fw_read(const char *path, uint64_t off, void *dst, uint64_t n)
+ {
+ 	int i = fw_all_find(path);
+-	return i >= 0 && off + n <= fw_all[i].size && fw_all_read(i, off, dst, n);
++	return i >= 0 && off + n <= fat_files[i].size && fw_all_read(i, off, dst, n);
+ }
+ 
+ extern "C" bool
