@@ -504,6 +504,24 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   firmware rejects rejuvenate_enable (0x19) with err 1. Still no indication of any kind and no
   tftp request for bdwlan: the WLAN PD stalls before it talks to the chip.
 
+- memshare (QMI 0x34 v1 inst 1, Linux msm_memshare): the modem asks client 1 for 15 MB right
+  after boot; served from 0x96000000 (free RAM below the splash, outside XNU), assigned to MSS_MSA.
+- Linux apps-side QRTR services (qrtr-lookup on node 1): tftp 0x1000 (versions 1..12), rmtfs 14,
+  servreg-loc 64, memshare 52, IPA ctl 49, diag 0x1001 for MODEM/LPASS/WCNSS/SENSORS/CDSP/WDSP,
+  plus userspace 53/16, 55/1, 271, 280, 770, 1053. WCNSS diag (128+) is never used by the modem.
+- Linux bt_power (bt_wcn3990) votes l9 1.8 V, l6 1.304 V, l19 3.312 V, BOB pin1 (pcv1 3.6 V,
+  bobm 2) before the modem boots; icnss uses the l6/l9/l19 *_pin_ctrl regulators ("pcen" 2).
+  With both, PMIC hw_en reads 0x22 on l6/l9/l19.
+- FW_READY cause (Linux logcat): the userspace cnss-daemon is a second WLFW client. After cap it
+  sends BDF downloads (regdb.bin missing, bdwlan.bin from firmware_mnt/image) and cal_report.
+  The firmware answers the last BDF segment with err 1 on Linux too. Kernel 42947778970 does
+  bdwlan.bin (4 segments, last err 1) + cal_report: PIN_CONNECT_RESULT ind (0x2c), FW_READY at
+  2.4 s, wlan_cfg ok, wlan_mode mission ok, WMI SERVICE_READY, scan sees real APs (ch 6 -67 dBm,
+  ch 40 -83 dBm). en0 attaches, wifid queries Apple80211 (patch 0900); no scan request seen yet.
+- Wi-Fi test image: whyred/out/xnu-ios-wifi-cal.img (boot-args + modem=1 wifi=1 wifi_smmu=2).
+- WLED: one boot had the init read fail (status 0x9), which disables backlight control for the
+  boot (kern.whyred_backlight EIO). Needs a retry.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
