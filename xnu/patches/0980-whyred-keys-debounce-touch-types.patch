@@ -58,10 +58,75 @@ index 80d1e97..6d34080 100644
  				    k, state[k], pon, gpio);
  				sweet_hid_key(k, state[k]);
 diff --git a/bsd/dev/sweet_syna.c b/bsd/dev/sweet_syna.c
-index 99eaf58..4f06c85 100644
+index 99eaf58..57c69b5 100644
 --- a/bsd/dev/sweet_syna.c
 +++ b/bsd/dev/sweet_syna.c
-@@ -450,7 +450,19 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -20,6 +20,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+@@ -406,6 +407,44 @@ report(uint32_t mask, const int *x, const int *y)
+ 	active = mask;
+ }
+ 
++/*
++ * whyred: synthetic touches for unattended tests (unlock after boot, taps), from the touch
++ * thread through report(): sysctl kern.whyred_touch = x1 | y1 << 12 | x2 << 24 | y2 << 36 |
++ * ms << 48 (pixels, 0..4095; a tap is x2 = x1, y2 = y1, short ms). One finger, id 0.
++ */
++static volatile uint64_t inj_req;
++
++static void
++inject_run(uint64_t r)
++{
++	int x1 = (int)(r & 0xfff), y1 = (int)((r >> 12) & 0xfff), x2 = (int)((r >> 24) & 0xfff);
++	int y2 = (int)((r >> 36) & 0xfff), ms = (int)((r >> 48) & 0xffff);
++	int steps = ms / 16 > 1 ? ms / 16 : 1;
++	int x[SYNA_MAX_OBJ] = {0}, y[SYNA_MAX_OBJ] = {0};
++	printf("WHYRED TOUCH: injected %d,%d -> %d,%d in %d ms\n", x1, y1, x2, y2, ms);
++	for (int i = 0; i <= steps; i++) {
++		x[0] = x1 + (x2 - x1) * i / steps;
++		y[0] = y1 + (y2 - y1) * i / steps;
++		report(1, x, y);
++		sleep_ms(16);
++	}
++	report(0, x, y);
++}
++
++static int
++whyred_touch_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t v = 0;
++	int error = sysctl_handle_quad(oidp, &v, 0, req);
++	if (error == 0 && req->newptr != USER_ADDR_NULL) {
++		inj_req = v;
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_touch, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    whyred_touch_sysctl, "Q", "inject a one-finger touch: x1 | y1<<12 | x2<<24 | y2<<36 | ms<<48");
++
+ static void
+ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+@@ -441,6 +480,11 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+ 			sleep_ms(50);
+ 			continue;
+ 		}
++		if (inj_req != 0) {
++			uint64_t r = inj_req;
++			inj_req = 0;
++			inject_run(r);
++		}
+ 		if (memcmp(d, prev, nobj * 8) != 0) {
+ 			uint32_t mask = 0;
+ 			int x[SYNA_MAX_OBJ], y[SYNA_MAX_OBJ];
+@@ -450,7 +494,19 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
  				if (syna_mode == 1 && o[0] != 0) {
  					printf("WHYRED TOUCH: obj %u type %u x %d y %d z %u\n", i, o[0], rx, ry, o[5]);
  				}
@@ -82,7 +147,7 @@ index 99eaf58..4f06c85 100644
  					continue;
  				}
  				if (flip & 4u) {
-@@ -463,6 +475,13 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -463,6 +519,13 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
  				mask |= 1u << i;
  			}
  			if (syna_mode == 2) {
