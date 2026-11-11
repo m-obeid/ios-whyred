@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index c0ed52a..cbb27d2 100644
+index c0ed52a..90d3b38 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -989,14 +989,46 @@ qrtr_rx(const uint8_t *p, uint32_t len)
@@ -234,7 +234,66 @@ index c0ed52a..cbb27d2 100644
  	LOG("smmu: %s identity (sid %x mask %x) CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", name, sid, mask, cb,
  	    slot, smr, s2cr, r32(cbp, 0x0), ok ? "OK" : "NOT as written");
  	return ok;
-@@ -6180,6 +6274,117 @@ svc_announce(void)
+@@ -5583,7 +5677,7 @@ w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t
+ 	}
+ 	w_hmac_sha1(s_ptk, 16, e + 14, 4 + body, NULL, 0, NULL, 0, mic);
+ 	memcpy(k + 77, mic, 16);
+-	(void)w_tx_ether(e, 14 + 4 + body, true);
++	(void)w_tx_ether(e, 14 + 4 + body, !s_ptk_set);    /* whyred: rekeys go out encrypted */
+ }
+ 
+ static bool
+@@ -5605,7 +5699,8 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+ {
+ 	uint8_t frame[512];
+ 	const uint8_t *src = e + 6;
+-	if (s_state != S_4WAY || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) || memcmp(src, s_bssid, 6) != 0) {
++	if ((s_state != S_4WAY && s_state != S_UP) || elen < 14 + 4 + 95 || elen - 14 > sizeof(frame) ||
++	    memcmp(src, s_bssid, 6) != 0) {
+ 		return;
+ 	}
+ 	size_t len = elen - 14;
+@@ -5623,6 +5718,39 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+ 		return;
+ 	}
+ 	bool pairwise = info & 0x0008, ack = info & 0x0080, has_mic = info & 0x0100, install = info & 0x0040;
++	/*
++	 * whyred: group key handshake (the AP rotates the GTK every few minutes; unanswered, it ends the
++	 * link with reason 16 "group key handshake timeout"). Message 1/2: MIC, encrypted key data with
++	 * the GTK KDE. Answer with message 2/2 (secure | MIC), install the new group key.
++	 */
++	if (!pairwise && ack && has_mic && s_ptk_set) {
++		if (replay <= s_replay || !w_eapol_mic_ok(frame, len)) {
++			LOG("t=%u ms: wpa: group key message dropped (replay or MIC)", g_ms);
++			return;
++		}
++		s_replay = replay;
++		uint8_t plain[256], gtk[32], gtk_len = 0, gtk_idx = 1;
++		if ((info & 0x1000) && dlen >= 24 && dlen <= sizeof(plain) + 8 && aes_unwrap(s_ptk + 16, k + 95, dlen, plain)) {
++			for (uint32_t o = 0; o + 2 <= (uint32_t)dlen - 8 && o + 2 + plain[o + 1] <= (uint32_t)dlen - 8; o += 2 + plain[o + 1]) {
++				if (plain[o] == 0xDD && plain[o + 1] >= 6 && plain[o + 2] == 0x00 && plain[o + 3] == 0x0F &&
++				    plain[o + 4] == 0xAC && plain[o + 5] == 0x01) {
++					gtk_idx = plain[o + 6] & 3;
++					gtk_len = (uint8_t)MIN((uint32_t)plain[o + 1] - 6, 32u);
++					memcpy(gtk, plain + o + 8, gtk_len);
++				}
++			}
++		}
++		w_eapol_send(0x0302, NULL, NULL, 0);    /* key descriptor v2 | MIC | secure */
++		if (gtk_len != 0) {
++			w_install_key(true, gtk_idx, s_group_cipher == 2 ? WMI_CIPHER_TKIP : WMI_CIPHER_CCMP, gtk, gtk_len);
++		}
++		bzero(gtk, sizeof(gtk));
++		LOG("t=%u ms: wpa: group key renewed (idx %u, %s)", g_ms, gtk_idx, gtk_len ? "installed" : "NO key data");
++		return;
++	}
++	if (s_state != S_4WAY) {
++		return;                                 /* a pairwise rekey after the join: not handled */
++	}
+ 	if (pairwise && ack && !has_mic) {
+ 		/* message 1: ANonce -> PTK, answer with message 2 */
+ 		if (++s_msg1s > 3) {
+@@ -6180,6 +6308,117 @@ svc_announce(void)
  		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
  	}
  	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
@@ -352,7 +411,7 @@ index c0ed52a..cbb27d2 100644
  }
  
  static bool
-@@ -6195,6 +6400,19 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6195,6 +6434,19 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		wlfw_rx(data, len);
  		return true;
  	}
@@ -372,7 +431,7 @@ index c0ed52a..cbb27d2 100644
  	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
  		return tftp_session(dst_port, data, len);
  	}
-@@ -6212,6 +6430,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6212,6 +6464,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		rmtfs_rx(src_node, src_port, txn, msg, data, len);
  		return true;
  	}
@@ -383,7 +442,7 @@ index c0ed52a..cbb27d2 100644
  	return false;
  }
  
-@@ -6219,6 +6441,11 @@ static void
+@@ -6219,6 +6475,11 @@ static void
  svc_summary(void)
  {
  	LOG("WLFW: %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
@@ -395,7 +454,7 @@ index c0ed52a..cbb27d2 100644
  	LOG("services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) errors %u",
  	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
  }
-@@ -6232,8 +6459,8 @@ static void
+@@ -6232,8 +6493,8 @@ static void
  modem_watch(struct smem_part_hdr *part, unsigned seconds)
  {
  	struct smp2p_hdr *in = NULL, *out = smp2p_create_out(part);
@@ -406,7 +465,7 @@ index c0ed52a..cbb27d2 100644
  	bool ready = false;
  
  	if (out == NULL) {
-@@ -6272,6 +6499,18 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+@@ -6272,6 +6533,18 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
  		if (in != NULL && ipa_in == NULL) {
  			ipa_in = smp2p_find(in, "ipa");
  		}
@@ -425,7 +484,7 @@ index c0ed52a..cbb27d2 100644
  		if (sk != NULL && *sk != sk_last) {
  			sk_last = *sk;
  			LOG("t=%u ms: slave-kernel %08x%s%s%s", ms, sk_last, (sk_last & 1) ? " FATAL" : "",
-@@ -6739,6 +6978,332 @@ wlan_rails_dump(const char *when)
+@@ -6739,6 +7012,332 @@ wlan_rails_dump(const char *when)
  	}
  }
  
@@ -758,7 +817,7 @@ index c0ed52a..cbb27d2 100644
  static void
  topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -6754,16 +7319,33 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -6754,16 +7353,33 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
  	wlan_rails_dump("before modem boot");
