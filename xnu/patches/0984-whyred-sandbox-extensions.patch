@@ -1,0 +1,66 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 49ead96..a88126c 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -36,6 +36,7 @@
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
+ #include <sys/sysctl.h>
++#include <libkern/OSAtomic.h>
+ 
+ /*
+  * AMFI's sysctl node, which the AMFI kext makes on a device: libamfi's
+@@ -310,6 +311,43 @@ sweet_sandbox_container_path(__unused user_addr_t arg)
+ 	return ENOENT;
+ }
+ 
++/*
++ * Sandbox extensions. Nothing is sandboxed here, so an extension grants nothing, but its issuers
++ * give up without one: tccd answered every Photos request with "Failed to issue Sandbox
++ * Extension for kTCCServicePhotos", assetsd threw "assetsd requires TCCPhotosService access" and
++ * no photo library was made (2026-11-11). Arguments as libsystem_sandbox builds them:
++ * issue (op 5): { class, type, path, flags, char *token (2048 bytes), pid, ... } (8-byte fields);
++ * consume (op 6): { const char *token, size_t length, int64_t *handle }.
++ */
++#define SWEET_EXTENSION_TOKEN "0000000000000000000000000000000000000000;00;00000000;00000000;00000000;0000000000000001;whyred"
++static int64_t sweet_extension_handles;
++
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	uint64_t args[7];
++	int error = copyin(arg, args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	if (args[4] == 0) {
++		return EINVAL;
++	}
++	return copyout(SWEET_EXTENSION_TOKEN, (user_addr_t)args[4], sizeof(SWEET_EXTENSION_TOKEN));
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	uint64_t args[3];
++	int error = copyin(arg, args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	int64_t handle = OSIncrementAtomic64(&sweet_extension_handles) + 1;
++	return args[2] == 0 ? 0 : copyout(&handle, (user_addr_t)args[2], sizeof(handle));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -323,7 +361,9 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	case 4:         /* container path (audit token / pid) */
+ 		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
