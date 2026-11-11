@@ -558,6 +558,34 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
     swipe 540,2158 -> 540,700 / 250 ms, dark again. Settings dock icon 945,2040, Wi-Fi row 400,960,
     first known network row 300,787 (after the list loads, ~2 scans).
 
+## App crashes and hangs (2026-11-11)
+
+Crash logs: /var/mobile/Library/Logs/CrashReporter (bug_type 309 crash, 509 hang/watchdog
+stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`). Daemon stacks:
+`/usr/sbin/spindump PID 3 -file /tmp/x.txt -onlyTarget` (slide = spindump libdispatch base -
+0x18db34000).
+
+- Photos black screen: main thread in +[PLImageFormat _syncFormats] -> MCCopyCheckpointValue ->
+  checkpointd, which waits forever on com.apple.fairplayd.versioned. fairplayd.H2 exits at once
+  (needs FairPlayIOKit, not in our kernel), launchd respawned it 1636 times, the queued message
+  is never read. Same for sharingd: its main() waits on bluetoothd (also respawn-looping, no BT),
+  so Safari's Share button hung in -[SFShareSheetSlotManager ensureConnectionEstablished].
+  Fix (on the phone, persistent): `launchctl bootout` + `launchctl disable` of
+  user/501/com.apple.fairplayd.H2 and user/501/com.apple.bluetoothd (these LaunchDaemons sit in
+  the user/foreground domain). Clients now fail fast; sharingd reaches its run loop.
+- Settings > Safari crashed: SafariCore asks sandbox_container_path_for_pid (Sandbox op 4);
+  patch 0936 returned 0 without writing a path when CFFIXED_USER_HOME is absent (Preferences has
+  only HOME), so NSString got stack garbage -> nil -> fileURLWithPath: threw. 0982 returns ENOENT
+  (also on the early exits), as for an unsandboxed process.
+- Safari long press on an image: QR detector -> +[CIContext contextWithOptions:] -> GL ES context
+  -> NULL function. whyred_ui forces kCIContextUseSoftwareRenderer in -[CIContext initWithOptions:].
+- whyred_ui now loads everywhere: `kern.exec_inject="/usr/lib/whyred_ui.dylib *app"` (0947: every
+  program with ".app/" in its path; boot-arg topaz_inject=/usr/lib/whyred_ui.dylib,*app). Spotlight
+  is its own process (/Applications/Spotlight.app), which is why 123 failed there.
+- AegirPoster (Astronomy wallpaper) crash-loops in NUNIAegirRenderer (Metal): no GPU. Unrelated.
+- Wi-Fi icon: SBWiFiManager (bars from wifid SCALED_RSSI, dBm from RSSI.RSSI_CTL_AGR) reports
+  bars 3, rssi -66, associated, primary interface (whyred_ui probe in SpringBoard, 2026-11-11).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
