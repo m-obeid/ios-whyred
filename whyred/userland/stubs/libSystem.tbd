@@ -4,5 +4,5 @@ targets:         [ arm64-ios ]
 install-name:    '/usr/lib/libSystem.B.dylib'
 exports:
   - targets:     [ arm64-ios ]
-    symbols:     [ _getprogname, _open, _write, _close ]
+    symbols:     [ _getprogname, _open, _write, _close, _dladdr, _free ]
 ...
