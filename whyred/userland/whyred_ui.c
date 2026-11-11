@@ -326,35 +326,24 @@ kb_hooks(void)
 }
 
 /*
- * Core Image: there is no GPU, so CIContext falls back to an OpenGL ES context and calls a NULL
- * GL function (Safari crashed on a long press on an image: the QR code detector makes a context).
- * Every context asks for the software renderer instead.
+ * Core Image: there is no GPU. With no Metal device CIContext takes an OpenGL ES context and calls
+ * a NULL GL function (Safari crashed on a long press on an image: the QR code detector makes a
+ * context). The "software_renderer" option does not help on iOS (it only lowers the priority).
+ * Answer nil, as CIContext itself does when neither Metal nor GL is usable.
  */
 static id (*orig_ci_init)(id, SEL, id);
 static int ci_logs;
 
 static id
-msg1(id obj, const char *sel, id arg)
-{
-	return ((id (*)(id, SEL, id))objc_msgSend)(obj, sel_registerName(sel), arg);
-}
-
-static id
 ci_init(id self, SEL cmd, id options)
 {
-	id opts = msg1((id)objc_getClass("NSMutableDictionary"), "dictionaryWithDictionary:", options);
-	id key = ((id (*)(id, SEL, const char *))objc_msgSend)((id)objc_getClass("NSString"),
-	    sel_registerName("stringWithUTF8String:"), "kCIContextUseSoftwareRenderer");
-	id yes = ((id (*)(id, SEL, _Bool))objc_msgSend)((id)objc_getClass("NSNumber"),
-	    sel_registerName("numberWithBool:"), 1);
-	if (opts != NULL && key != NULL && yes != NULL) {
-		((void (*)(id, SEL, id, id))objc_msgSend)(opts, sel_registerName("setObject:forKey:"), yes, key);
-		options = opts;
-	}
+	(void)cmd;
+	(void)options;
 	if (ci_logs++ < 2) {
-		say("CIContext -> software renderer", "");
+		say("CIContext -> nil (no GPU)", "");
 	}
-	return orig_ci_init(self, cmd, options);
+	((void (*)(id, SEL))objc_msgSend)(self, sel_registerName("release"));
+	return NULL;
 }
 
 static void
