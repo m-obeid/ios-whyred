@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 80d1e97..6d34080 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -114,13 +114,32 @@ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0, ticks = 0;
++	int cand[3] = {0, 0, 0};
++	unsigned same[3] = {0, 0, 0};
++	unsigned errors = 0, ticks = 0, bogus = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		/*
++		 * whyred: with the modem up, some reads complete without an error bit but carry garbage
++		 * (GPIO7 RT_STS 0x10 / 0x88 / 0xfc, PON 0x75): ghost volume presses. GPIO RT_STS only
++		 * has bit 0; PON RT_STS bits 0-5. Drop such reads.
++		 */
++		unsigned bogus_before = bogus;
++		if (gok && (gpio & 0xfeu) != 0) {
++			gok = false;
++			bogus++;
++		}
++		if (pok && (pon & 0xc0u) != 0) {
++			pok = false;
++			bogus++;
++		}
++		if (bogus != bogus_before && (bogus & (bogus - 1)) == 0) {
++			printf("WHYRED KEYS: %u implausible reads dropped (last pon %#x gpio %#x)\n", bogus, pon, gpio);
++		}
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -135,8 +154,18 @@ keys_thread(void *arg, wait_result_t result)
+ 			    pon, gpio, pok, gok, keys_last_status);
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+-				state[k] = now[k];
++			if (!(k == 1 ? gok : pok)) {
++				continue;
++			}
++			/* debounce: a change counts after 3 equal samples in a row (60 ms) */
++			if (now[k] != cand[k]) {
++				cand[k] = now[k];
++				same[k] = 1;
++			} else if (same[k] < 3) {
++				same[k]++;
++			}
++			if (same[k] >= 3 && cand[k] != state[k]) {
++				state[k] = cand[k];
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio7:c610=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+diff --git a/bsd/dev/sweet_syna.c b/bsd/dev/sweet_syna.c
+index 99eaf58..4f06c85 100644
+--- a/bsd/dev/sweet_syna.c
++++ b/bsd/dev/sweet_syna.c
+@@ -450,7 +450,19 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+ 				if (syna_mode == 1 && o[0] != 0) {
+ 					printf("WHYRED TOUCH: obj %u type %u x %d y %d z %u\n", i, o[0], rx, ry, o[5]);
+ 				}
+-				if (o[0] != 1 && o[0] != 2 && o[0] != 6) {
++				/*
++				 * whyred: F12 object types 1 finger, 2 stylus, 3 palm, 4 unclassified, 5 hover,
++				 * 6 glove, 7 narrow, 8 hand edge. Touches at the screen edge (the keyboard's 123
++				 * key) came out dead: report everything but palm and hover, log each new type.
++				 */
++				if (o[0] != 0) {
++					static uint32_t seen_types;
++					if (o[0] < 32 && !(seen_types & (1u << o[0]))) {
++						seen_types |= 1u << o[0];
++						printf("WHYRED TOUCH: first object of type %u at x %d y %d\n", o[0], rx, ry);
++					}
++				}
++				if (o[0] == 0 || o[0] == 3 || o[0] == 5) {
+ 					continue;
+ 				}
+ 				if (flip & 4u) {
+@@ -463,6 +475,13 @@ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+ 				mask |= 1u << i;
+ 			}
+ 			if (syna_mode == 2) {
++				static uint32_t last_mask;
++				static unsigned downs;
++				if (mask != 0 && last_mask == 0 && downs++ < 300) {
++					unsigned f = (unsigned)__builtin_ctz(mask);
++					printf("WHYRED TOUCH: down %u at %d,%d\n", downs, x[f], y[f]);
++				}
++				last_mask = mask;
+ 				report(mask, x, y);
+ 			}
+ 			memcpy(prev, d, nobj * 8);
