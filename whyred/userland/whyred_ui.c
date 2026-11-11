@@ -325,6 +325,99 @@ kb_hooks(void)
 	kb_size_hooks();
 }
 
+/*
+ * Core Image: there is no GPU, so CIContext falls back to an OpenGL ES context and calls a NULL
+ * GL function (Safari crashed on a long press on an image: the QR code detector makes a context).
+ * Every context asks for the software renderer instead.
+ */
+static id (*orig_ci_init)(id, SEL, id);
+static int ci_logs;
+
+static id
+msg1(id obj, const char *sel, id arg)
+{
+	return ((id (*)(id, SEL, id))objc_msgSend)(obj, sel_registerName(sel), arg);
+}
+
+static id
+ci_init(id self, SEL cmd, id options)
+{
+	id opts = msg1((id)objc_getClass("NSMutableDictionary"), "dictionaryWithDictionary:", options);
+	id key = ((id (*)(id, SEL, const char *))objc_msgSend)((id)objc_getClass("NSString"),
+	    sel_registerName("stringWithUTF8String:"), "kCIContextUseSoftwareRenderer");
+	id yes = ((id (*)(id, SEL, _Bool))objc_msgSend)((id)objc_getClass("NSNumber"),
+	    sel_registerName("numberWithBool:"), 1);
+	if (opts != NULL && key != NULL && yes != NULL) {
+		((void (*)(id, SEL, id, id))objc_msgSend)(opts, sel_registerName("setObject:forKey:"), yes, key);
+		options = opts;
+	}
+	if (ci_logs++ < 2) {
+		say("CIContext -> software renderer", "");
+	}
+	return orig_ci_init(self, cmd, options);
+}
+
+static void
+ci_hooks(void)
+{
+	Class c = objc_getClass("CIContext");
+	if (c == NULL) {
+		return;
+	}
+	/* class_copyMethodList: no +initialize from inside the constructor (see kbs_add) */
+	SEL sel = sel_registerName("initWithOptions:");
+	unsigned int count = 0;
+	Method *list = class_copyMethodList(c, &count), m = NULL;
+	for (unsigned int i = 0; list != NULL && i < count; i++) {
+		if (method_getName(list[i]) == sel) {
+			m = list[i];
+		}
+	}
+	free(list);
+	if (m != NULL && same_text(method_getTypeEncoding(m), "@24@0:8@16")) {
+		orig_ci_init = (id (*)(id, SEL, id))method_getImplementation(m);
+		method_setImplementation(m, (IMP)ci_init);
+		say("CIContext initWithOptions: hooked", "");
+	} else {
+		say("CIContext initWithOptions: not hooked, type ", m ? method_getTypeEncoding(m) : "missing");
+	}
+}
+
+/*
+ * Wi-Fi bars probe (SpringBoard only): the status bar icon stays grey while Settings shows bars.
+ * SBWiFiManager takes the bars from wifid's SCALED_RSSI and the dBm from RSSI; log both for a while.
+ */
+extern int pthread_create(void *thread, const void *attr, void *(*start)(void *), void *arg);
+extern unsigned int sleep(unsigned int seconds);
+
+static void *
+wifi_probe(void *unused)
+{
+	(void)unused;
+	sleep(20);
+	for (int i = 0; i < 30; i++) {
+		id mgr = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("SBWiFiManager"), sel_registerName("sharedInstance"));
+		if (mgr != NULL) {
+			char a[24], b[24], c[24], line[100];
+			int bars = ((int (*)(id, SEL))objc_msgSend)(mgr, sel_registerName("signalStrengthBars"));
+			int rssi = ((int (*)(id, SEL))objc_msgSend)(mgr, sel_registerName("signalStrengthRSSI"));
+			_Bool assoc = ((_Bool (*)(id, SEL))objc_msgSend)(mgr, sel_registerName("isAssociated"));
+			_Bool primary = ((_Bool (*)(id, SEL))objc_msgSend)(mgr, sel_registerName("isPrimaryInterface"));
+			const char *parts[] = { "bars ", num(a, bars), " rssi ", num(b, rssi), " associated+2*primary ", num(c, assoc + 2 * primary) };
+			size_t o = 0;
+			for (unsigned k = 0; k < 6; k++) {
+				for (size_t n = 0; parts[k][n] && o < sizeof(line) - 1; n++) {
+					line[o++] = parts[k][n];
+				}
+			}
+			line[o] = 0;
+			say("wifi ", line);
+		}
+		sleep(10);
+	}
+	return NULL;
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
@@ -357,4 +450,9 @@ whyred_ui_init(void)
 		say("hooked ", hook_names[i]);
 	}
 	kb_hooks();
+	ci_hooks();
+	if (same_text(getprogname(), "SpringBoard")) {
+		long t;
+		pthread_create(&t, NULL, wifi_probe, NULL);
+	}
 }
