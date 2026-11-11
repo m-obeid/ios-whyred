@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index c0ed52a..4fe6c9d 100644
+index c0ed52a..a08b321 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -989,14 +989,44 @@ qrtr_rx(const uint8_t *p, uint32_t len)
@@ -90,7 +90,7 @@ index c0ed52a..4fe6c9d 100644
  		wm_u8(&m, 0x13, 1);                     /* msa_ready_enable */
 +		wm_u8(&m, 0x14, 1);                     /* pin_connect_result_enable (icnss_qmi.c) */
  		wm_u32(&m, 0x15, WLFW_CLIENT_ID);       /* client_id */
-+		wm_u8(&m, 0x19, 1);                     /* rejuvenate_enable (icnss quirk default) */
++		/* rejuvenate_enable 0x19 (icnss quirk default): this firmware answers err 1 (malformed) */
  		wm_send(&m);
  		w_step = "ind_register sent";
  	}
