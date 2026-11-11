@@ -578,7 +578,19 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   only HOME), so NSString got stack garbage -> nil -> fileURLWithPath: threw. 0982 returns ENOENT
   (also on the early exits), as for an unsandboxed process.
 - Safari long press on an image: QR detector -> +[CIContext contextWithOptions:] -> GL ES context
-  -> NULL function. whyred_ui forces kCIContextUseSoftwareRenderer in -[CIContext initWithOptions:].
+  -> NULL function. The "software_renderer" option is ignored on iOS (only sets priority_request_low).
+  whyred_ui makes -[CIContext initWithOptions:] answer nil, as CI does when no renderer works
+  (verified: long press works, 2026-11-11).
+- Wi-Fi join failed after a reboot: no auth reply on either band (fixed MAC 02:54:4F:50:41:5A, the AP
+  still held the old association). 0978 now sends a deauth (reason 3) before the peer and auth, and
+  retries auth 8 times. Verified: auth reply at +36 ms, joined.
+- Battery 12% is real (3613 mV; on the laptop port the phone still loses ~340 mA). The 100% flashes
+  came from SweetBattery's fallback on a failed SPMI read; 0983 keeps the last reading.
+- Photos still crashes: no Photos.sqlite. At boot assetsd threw "assetsd requires TCCPhotosService
+  access" (-[PLPrivacy photosAccessAllowedWithScope:] returns q, nonzero = throw). After a kickstart
+  it stays up but creates no library; Photos asserts numberOfSections == 1. assetsd logs only to
+  os_log (no `log` tool; applog's OS_ACTIVITY_DT_MODE showed nothing; launchd ignores edited plists).
+  Next: parse /var/db/diagnostics on the laptop.
 - whyred_ui now loads everywhere: `kern.exec_inject="/usr/lib/whyred_ui.dylib *app"` (0947: every
   program with ".app/" in its path; boot-arg topaz_inject=/usr/lib/whyred_ui.dylib,*app). Spotlight
   is its own process (/Applications/Spotlight.app), which is why 123 failed there.
