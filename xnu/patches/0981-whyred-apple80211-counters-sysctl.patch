@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
-index e2674ee..c6c750c 100644
+index e2674ee..2e52132 100644
 --- a/bsd/dev/redwood_apple80211.c
 +++ b/bsd/dev/redwood_apple80211.c
 @@ -41,6 +41,10 @@
@@ -44,7 +44,19 @@ index e2674ee..c6c750c 100644
  
  static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
  
-@@ -431,6 +457,8 @@ get(struct apple80211req *request)
+@@ -364,6 +390,11 @@ get(struct apple80211req *request)
+ 		kfree_data(answer, sizeof(*answer));
+ 		return error;
+ 	}
++	case 29: {                              /* whyred: why the link went (wifid asks after each loss) */
++		struct { uint32_t version, reason; uint8_t ea[6]; } d = { 1, 1, { 0 } };
++		request->req_val = 1;
++		return give(request, &d, sizeof(d));
++	}
+ 	case 21:                                /* how the last join went (0: not over yet) */
+ 		lck_mtx_lock(&apple80211_lock);
+ 		request->req_val = (int32_t)join_result;
+@@ -431,6 +462,8 @@ get(struct apple80211req *request)
  			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
  
  		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
@@ -53,7 +65,7 @@ index e2674ee..c6c750c 100644
  		break;
  	}
  	case 103:                               /* all of it, as a scan's result */
-@@ -633,6 +661,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+@@ -633,6 +666,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
  		result_next = 0;
  		lck_mtx_unlock(&apple80211_lock);
  		post(EVENT_SCAN_DONE, NULL, 0);
@@ -61,7 +73,7 @@ index e2674ee..c6c750c 100644
  		break;
  	case REDWOOD_STA_JOIN_DONE:
  		lck_mtx_lock(&apple80211_lock);
-@@ -653,6 +682,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+@@ -653,6 +687,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
  		post(EVENT_SSID_CHANGED, NULL, 0);
  		post(EVENT_BSSID_CHANGED, NULL, 0);
  		post(EVENT_LINK_CHANGED, &link, sizeof(link));
@@ -69,7 +81,7 @@ index e2674ee..c6c750c 100644
  		break;
  	}
  	}
-@@ -694,12 +724,7 @@ note(const struct apple80211req *request, bool is_set, int error)
+@@ -694,12 +729,7 @@ note(const struct apple80211req *request, bool is_set, int error)
  void
  redwood_apple80211_summary(void)
  {
@@ -83,7 +95,7 @@ index e2674ee..c6c750c 100644
  	for (unsigned i = 0; i < kind_count; i++) {
  		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
  		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
-@@ -737,3 +762,17 @@ redwood_apple80211_ioctl(u_long command, void *data)
+@@ -737,3 +767,17 @@ redwood_apple80211_ioctl(u_long command, void *data)
  	}
  	return error;
  }
