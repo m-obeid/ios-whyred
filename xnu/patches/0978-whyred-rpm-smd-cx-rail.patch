@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index c0ed52a..ae75536 100644
+index c0ed52a..8e850b8 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -989,14 +989,46 @@ qrtr_rx(const uint8_t *p, uint32_t len)
@@ -335,7 +335,28 @@ index c0ed52a..ae75536 100644
  static volatile int s_result;                   /* of the last join: 0 joined, else an errno (EAUTH: passphrase) */
  static volatile bool s_join_asked, s_leave_asked;
  static volatile uint32_t s_join_done;           /* bumped when a join ends either way */
-@@ -5583,7 +5716,7 @@ w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t
+@@ -5484,6 +5617,20 @@ w_send_auth(void)
+ 	return w_mgmt_tx(f, sizeof(f));
+ }
+ 
++/*
++ * Deauthentication, reason 3 (leaving): our MAC is fixed, and after a reboot without one the AP can
++ * still hold us as associated and ignore new auth requests (seen 2026-11-11: no auth reply on
++ * either band). Sent before the first auth of each join and again halfway through the retries.
++ */
++static bool
++w_send_deauth(void)
++{
++	uint8_t f[26], *b = w_mgmt_hdr(f, FC_DEAUTH);
++	b[0] = 3;
++	b[1] = 0;
++	return w_mgmt_tx(f, sizeof(f));
++}
++
+ static void
+ w_build_assoc_req(void)
+ {
+@@ -5583,7 +5730,7 @@ w_eapol_send(uint16_t info, const uint8_t *nonce, const uint8_t *data, uint16_t
  	}
  	w_hmac_sha1(s_ptk, 16, e + 14, 4 + body, NULL, 0, NULL, 0, mic);
  	memcpy(k + 77, mic, 16);
@@ -344,7 +365,7 @@ index c0ed52a..ae75536 100644
  }
  
  static bool
-@@ -5605,7 +5738,8 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+@@ -5605,7 +5752,8 @@ w_eapol_rx(const uint8_t *e, size_t elen)
  {
  	uint8_t frame[512];
  	const uint8_t *src = e + 6;
@@ -354,7 +375,7 @@ index c0ed52a..ae75536 100644
  		return;
  	}
  	size_t len = elen - 14;
-@@ -5623,6 +5757,39 @@ w_eapol_rx(const uint8_t *e, size_t elen)
+@@ -5623,6 +5771,39 @@ w_eapol_rx(const uint8_t *e, size_t elen)
  		return;
  	}
  	bool pairwise = info & 0x0008, ack = info & 0x0080, has_mic = info & 0x0100, install = info & 0x0040;
@@ -394,7 +415,32 @@ index c0ed52a..ae75536 100644
  	if (pairwise && ack && !has_mic) {
  		/* message 1: ANonce -> PTK, answer with message 2 */
  		if (++s_msg1s > 3) {
-@@ -6129,6 +6296,36 @@ static void
+@@ -5871,6 +6052,7 @@ w_join_poll(void)
+ 			}
+ 			s_state = S_AUTH;
+ 			s_tries = 1;
++			w_send_deauth();            /* before the peer exists: the firmware may drop a peer it sees deauthed */
+ 			w_peer(CMD_PEER_CREATE, TAG_PEER_CREATE, true);
+ 			w_send_auth();
+ 			s_deadline = g_ms + 400;
+@@ -5878,11 +6060,15 @@ w_join_poll(void)
+ 			w_join_end(ETIMEDOUT);
+ 		}
+ 	} else if ((s_state == S_AUTH || s_state == S_ASSOC) && g_ms > s_deadline) {
+-		if (s_tries >= 4) {
++		if (s_tries >= 8) {
+ 			w_join_end(ETIMEDOUT);
+ 		} else {
+ 			s_tries++;
+ 			if (s_state == S_AUTH) {
++				if (s_tries == 5) {
++					LOG("t=%u ms: join: no auth reply yet, deauth again", g_ms);
++					w_send_deauth();
++				}
+ 				w_send_auth();
+ 			} else {
+ 				w_mgmt_tx(s_assoc_req, s_assoc_req_len);
+@@ -6129,6 +6315,36 @@ static void
  radio_poll(unsigned ms)
  {
  	(void)ms;
@@ -431,7 +477,7 @@ index c0ed52a..ae75536 100644
  	if (w_cap_retry_ms != 0 && g_ms >= w_cap_retry_ms) {
  		w_cap_retry_ms = 0;
  		w_simple(WLFW_CAP, "cap sent again");
-@@ -6148,7 +6345,7 @@ radio_poll(unsigned ms)
+@@ -6148,7 +6364,7 @@ radio_poll(unsigned ms)
  			topaz_wlan_ready_hook();
  		}
  	}
@@ -440,7 +486,7 @@ index c0ed52a..ae75536 100644
  		w_join_poll();
  		w_tx_pump();
  	}
-@@ -6180,6 +6377,117 @@ svc_announce(void)
+@@ -6180,6 +6396,117 @@ svc_announce(void)
  		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
  	}
  	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
@@ -558,7 +604,7 @@ index c0ed52a..ae75536 100644
  }
  
  static bool
-@@ -6195,6 +6503,19 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6195,6 +6522,19 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		wlfw_rx(data, len);
  		return true;
  	}
@@ -578,7 +624,7 @@ index c0ed52a..ae75536 100644
  	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
  		return tftp_session(dst_port, data, len);
  	}
-@@ -6212,13 +6533,50 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6212,13 +6552,50 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		rmtfs_rx(src_node, src_port, txn, msg, data, len);
  		return true;
  	}
@@ -629,7 +675,7 @@ index c0ed52a..ae75536 100644
  	LOG("services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) errors %u",
  	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
  }
-@@ -6232,8 +6590,8 @@ static void
+@@ -6232,8 +6609,8 @@ static void
  modem_watch(struct smem_part_hdr *part, unsigned seconds)
  {
  	struct smp2p_hdr *in = NULL, *out = smp2p_create_out(part);
@@ -640,7 +686,7 @@ index c0ed52a..ae75536 100644
  	bool ready = false;
  
  	if (out == NULL) {
-@@ -6272,6 +6630,18 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+@@ -6272,6 +6649,18 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
  		if (in != NULL && ipa_in == NULL) {
  			ipa_in = smp2p_find(in, "ipa");
  		}
@@ -659,7 +705,7 @@ index c0ed52a..ae75536 100644
  		if (sk != NULL && *sk != sk_last) {
  			sk_last = *sk;
  			LOG("t=%u ms: slave-kernel %08x%s%s%s", ms, sk_last, (sk_last & 1) ? " FATAL" : "",
-@@ -6739,6 +7109,332 @@ wlan_rails_dump(const char *when)
+@@ -6739,6 +7128,332 @@ wlan_rails_dump(const char *when)
  	}
  }
  
@@ -992,7 +1038,7 @@ index c0ed52a..ae75536 100644
  static void
  topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -6754,16 +7450,33 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -6754,16 +7469,33 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
  	wlan_rails_dump("before modem boot");
