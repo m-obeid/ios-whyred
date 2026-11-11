@@ -481,6 +481,19 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   Next build answers lookups as net/qrtr/ns.c (matching NEW_SERVER + all-zero terminator) and logs
   unknown control types and unclaimed data.
 
+- Kernel 42925705109: lookups answered, still FATAL 13.6 s, only DEL_CLIENT control traffic.
+- Diag starvation cause: the apps side must serve diag (Linux drivers/char/diag/diagfwd_socket.c:
+  service 0x1001, MODEM_INST_BASE 0, CNTL 0 / DATA 2 / DCI 4 are apps servers, instance raw in
+  NEW_SERVER). Kernel 42927375140 announces them on ports 0x4005-0x4007 and drops the data: the
+  modem connects at once (cntl from port 0x1b: 15, 9, 2208, 16 ... bytes), and stays up (QRTR
+  traffic at modem t=74 s, no FATAL). Fixed.
+- Still no FW_READY_IND. Linux gets it 2 s after the QMI connect (dmesg 26.58 s -> 28.57 s).
+  MSA assign matches Linux icnss (MSS_MSA + WLAN [+ WLAN_CE]). Suspects: anoc2 SMMU faults every
+  stream (WLAN SIDs 0x1a00/0x1a01, icnss qcom,iommu-dma = "bypass"), and its clock
+  smmu_aggr2_noc_clk = RPM "aggr" id 2 (key "KHz") was never voted.
+- Kernel 42929010942: votes aggr 2 at 19.2 MHz; boot-arg wifi_smmu=2 writes one SMR (sid 0x1a00
+  mask 1) with S2CR type 1 (bypass), logging before each write.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
