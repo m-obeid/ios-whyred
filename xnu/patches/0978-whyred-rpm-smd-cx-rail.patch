@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index c0ed52a..88df5fe 100644
+index c0ed52a..cbb27d2 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -989,14 +989,46 @@ qrtr_rx(const uint8_t *p, uint32_t len)
@@ -138,7 +138,7 @@ index c0ed52a..88df5fe 100644
  	case WLFW_HOST_CAP:
  		LOG("wlfw: host_cap %s err %u", ok ? "ok" : "rejected (not fatal)", err);
  		if (wm_new(&m, WLFW_MSA_INFO)) {
-@@ -3605,8 +3655,31 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+@@ -3605,14 +3655,44 @@ wlfw_rx(const uint8_t *d, uint32_t len)
  			}
  		}
  		w_cap_done = true;
@@ -170,8 +170,22 @@ index c0ed52a..88df5fe 100644
 +		LOG("t=%u ms: wlfw: cap done, waiting for FW_READY (no BDF on SDM636 icnss)", g_ms);
  		break;
  	case WLFW_BDF_DOWNLOAD:
- 		if (!ok) {
-@@ -3698,6 +3771,8 @@ smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
+-		if (!ok) {
++		/*
++		 * whyred: this firmware answers the last segment (end = 1) with err 1, on Linux too
++		 * (cnss-daemon "bdf type 0, result 1, error 1"), and cnss-daemon goes on: cal_report next.
++		 */
++		if (!ok && w_bdf_off < w_bdf_len) {
+ 			LOG("wlfw: bdf segment %u FAILED err %u", w_bdf_seg - 1, err);
+ 			break;
+ 		}
++		if (!ok) {
++			LOG("wlfw: bdf last segment %u err %u (as on Linux), going on", w_bdf_seg - 1, err);
++		}
+ 		if (w_bdf_off < w_bdf_len) {
+ 			w_bdf_segment();
+ 		} else {
+@@ -3698,6 +3778,8 @@ smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
  	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
  }
  
@@ -180,7 +194,7 @@ index c0ed52a..88df5fe 100644
  static bool
  smmu_identity(uint32_t sid, uint32_t mask, const char *name)
  {
-@@ -3755,6 +3830,13 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+@@ -3755,6 +3837,13 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
  		return false;
  	}
  	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
@@ -194,7 +208,7 @@ index c0ed52a..88df5fe 100644
  	w32(cbp, 0x58, 0xFFFFFFFF);                 /* FSR: clear */
  	w32(cbp, 0x20, 0);                          /* TTBR0 */
  	w32(cbp, 0x24, 0);
-@@ -3765,16 +3847,21 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+@@ -3765,16 +3854,21 @@ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
  	w32(gr1, 0x800 + 4 * cb, CB_CLONE_CBA2R);
  	w32(gr1, 0x000 + 4 * cb, CB_CLONE_CBAR);
  	w32(cbp, 0x0, CB_CLONE_SCTLR);              /* SCTLR last */
@@ -220,7 +234,7 @@ index c0ed52a..88df5fe 100644
  	LOG("smmu: %s identity (sid %x mask %x) CB%u SMR%u: SMR %08x S2CR %08x SCTLR %08x -> %s", name, sid, mask, cb,
  	    slot, smr, s2cr, r32(cbp, 0x0), ok ? "OK" : "NOT as written");
  	return ok;
-@@ -6180,6 +6267,117 @@ svc_announce(void)
+@@ -6180,6 +6274,117 @@ svc_announce(void)
  		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
  	}
  	LOG("t=%u ms: announced pd-mapper 0x40, tftp 0x1000, rmtfs 0x0e", g_ms);
@@ -338,7 +352,7 @@ index c0ed52a..88df5fe 100644
  }
  
  static bool
-@@ -6195,6 +6393,19 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6195,6 +6400,19 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		wlfw_rx(data, len);
  		return true;
  	}
@@ -358,7 +372,7 @@ index c0ed52a..88df5fe 100644
  	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
  		return tftp_session(dst_port, data, len);
  	}
-@@ -6212,6 +6423,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
+@@ -6212,6 +6430,10 @@ svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d
  		rmtfs_rx(src_node, src_port, txn, msg, data, len);
  		return true;
  	}
@@ -369,7 +383,7 @@ index c0ed52a..88df5fe 100644
  	return false;
  }
  
-@@ -6219,6 +6434,11 @@ static void
+@@ -6219,6 +6441,11 @@ static void
  svc_summary(void)
  {
  	LOG("WLFW: %s%s", w_step, w_fw_ready ? " (firmware ready)" : "");
@@ -381,7 +395,7 @@ index c0ed52a..88df5fe 100644
  	LOG("services: pd-mapper %u reqs; tftp %u reqs (%u missing, %u writes); rmtfs reads %u writes %u (not kept) errors %u",
  	    pd_reqs, tftp_reqs, tftp_missing, tftp_writes, rmtfs_reads, rmtfs_writes, rmtfs_err);
  }
-@@ -6232,8 +6452,8 @@ static void
+@@ -6232,8 +6459,8 @@ static void
  modem_watch(struct smem_part_hdr *part, unsigned seconds)
  {
  	struct smp2p_hdr *in = NULL, *out = smp2p_create_out(part);
@@ -392,7 +406,7 @@ index c0ed52a..88df5fe 100644
  	bool ready = false;
  
  	if (out == NULL) {
-@@ -6272,6 +6492,18 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+@@ -6272,6 +6499,18 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
  		if (in != NULL && ipa_in == NULL) {
  			ipa_in = smp2p_find(in, "ipa");
  		}
@@ -411,7 +425,7 @@ index c0ed52a..88df5fe 100644
  		if (sk != NULL && *sk != sk_last) {
  			sk_last = *sk;
  			LOG("t=%u ms: slave-kernel %08x%s%s%s", ms, sk_last, (sk_last & 1) ? " FATAL" : "",
-@@ -6739,6 +6971,332 @@ wlan_rails_dump(const char *when)
+@@ -6739,6 +6978,332 @@ wlan_rails_dump(const char *when)
  	}
  }
  
@@ -744,7 +758,7 @@ index c0ed52a..88df5fe 100644
  static void
  topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -6754,16 +7312,33 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -6754,16 +7319,33 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
  	wlan_rails_dump("before modem boot");
