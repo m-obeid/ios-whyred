@@ -407,9 +407,58 @@ wifi_probe(void *unused)
 	return NULL;
 }
 
+/*
+ * assetsd throws "assetsd requires TCCPhotosService access" when -[PLPrivacy
+ * photosAccessAllowedWithScope:] answers nonzero (2026-11-11). Probe: log what it answers.
+ */
+static long (*orig_pl_allowed)(id, SEL, long);
+static int pl_logs;
+
+static long
+pl_allowed(id self, SEL cmd, long scope)
+{
+	long r = orig_pl_allowed(self, cmd, scope);
+	if (pl_logs++ < 6) {
+		char a[24], b[24];
+		say("PLPrivacy photosAccessAllowedWithScope: ", num(a, scope));
+		say("PLPrivacy   -> ", num(b, r));
+	}
+	return r;
+}
+
+static void
+pl_hooks(void)
+{
+	Class c = objc_getClass("PLPrivacy");
+	if (c == NULL) {
+		say("PLPrivacy not loaded", "");
+		return;
+	}
+	SEL sel = sel_registerName("photosAccessAllowedWithScope:");
+	unsigned int count = 0;
+	Method *list = class_copyMethodList(c, &count), m = NULL;
+	for (unsigned int i = 0; list != NULL && i < count; i++) {
+		if (method_getName(list[i]) == sel) {
+			m = list[i];
+		}
+	}
+	free(list);
+	if (m == NULL) {
+		say("PLPrivacy: no photosAccessAllowedWithScope:", "");
+		return;
+	}
+	say("PLPrivacy photosAccessAllowedWithScope: type ", method_getTypeEncoding(m));
+	orig_pl_allowed = (long (*)(id, SEL, long))method_getImplementation(m);
+	method_setImplementation(m, (IMP)pl_allowed);
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
+	if (same_text(getprogname(), "assetsd")) {
+		pl_hooks();
+		return;
+	}
 	fallback_class = objc_getClass("_UIStatusBarVisualProvider_Fallback");
 	legacy_class = objc_getClass("_UIStatusBarVisualProvider_LegacyPhone");
 	if (fallback_class == NULL || legacy_class == NULL) {

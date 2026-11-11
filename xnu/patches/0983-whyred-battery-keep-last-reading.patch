@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 35c9e29..7c26026 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -457,11 +457,16 @@ SweetBattery::pollWhyred(void)
+ void
+ SweetBattery::poll(void)
+ {
++	static bool whyred_measured;            /* a good reading was published once */
+ 	if (fWhyred && pollWhyred()) {
++		whyred_measured = true;
+ 		return;
+ 	}
+ 	if (fWhyred) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		/* a failed SPMI read: keep the last reading (the fallback flashed 100% in the status bar) */
++		if (!whyred_measured) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
+ 		return;
+ 	}
+ 	if (fReal && pollTopaz()) {
