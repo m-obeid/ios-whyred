@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_wled.c b/bsd/dev/sweet_wled.c
+index 6ed3138..879ba50 100644
+--- a/bsd/dev/sweet_wled.c
++++ b/bsd/dev/sweet_wled.c
+@@ -100,16 +100,20 @@ wait_done(vm_offset_t ch, uint32_t *st)
+ static bool
+ w_read(int p, uint8_t addr, uint8_t *out)
+ {
+-	uint32_t st;
+-	wr32(w_rd[p], CMD, (OP_EXT_READL << 27) | ((uint32_t)addr << 4));
+-	if (!wait_done(w_rd[p], &st)) {
+-		if (w_errors++ < 8) {
+-			printf("WHYRED WLED: read %#x:%#x failed, status %#x\n", p == W_CTRL ? 0xd8 : 0xd9, addr, st);
++	uint32_t st = 0;
++	/* whyred: one boot saw a single dropped read (status 0x9) at init: retry a few times */
++	for (unsigned tries = 0; tries < 4; tries++) {
++		wr32(w_rd[p], CMD, (OP_EXT_READL << 27) | ((uint32_t)addr << 4));
++		if (wait_done(w_rd[p], &st)) {
++			*out = (uint8_t)rd32(w_rd[p], RDATA0);
++			return true;
+ 		}
+-		return false;
++		delay(100);
+ 	}
+-	*out = (uint8_t)rd32(w_rd[p], RDATA0);
+-	return true;
++	if (w_errors++ < 8) {
++		printf("WHYRED WLED: read %#x:%#x failed, status %#x\n", p == W_CTRL ? 0xd8 : 0xd9, addr, st);
++	}
++	return false;
+ }
+ 
+ static bool
+@@ -138,9 +142,16 @@ w_write(int p, uint8_t addr, const uint8_t *v, unsigned n)
+ 	for (unsigned i = 0; i < n; i++) {
+ 		data |= (uint32_t)v[i] << (8 * i);
+ 	}
+-	wr32(w_wr[p], WDATA0, data);
+-	wr32(w_wr[p], CMD, (OP_EXT_WRITEL << 27) | ((uint32_t)addr << 4) | (n - 1));
+-	if (!wait_done(w_wr[p], &st)) {
++	bool done = false;
++	for (unsigned tries = 0; tries < 4 && !done; tries++) {
++		wr32(w_wr[p], WDATA0, data);
++		wr32(w_wr[p], CMD, (OP_EXT_WRITEL << 27) | ((uint32_t)addr << 4) | (n - 1));
++		done = wait_done(w_wr[p], &st);
++		if (!done) {
++			delay(100);
++		}
++	}
++	if (!done) {
+ 		if (w_errors++ < 8) {
+ 			printf("WHYRED WLED: write %#x:%#x failed, status %#x\n", p == W_CTRL ? 0xd8 : 0xd9, addr, st);
+ 		}
