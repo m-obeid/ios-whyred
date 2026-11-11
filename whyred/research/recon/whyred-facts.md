@@ -522,6 +522,26 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - WLED: one boot had the init read fail (status 0x9), which disables backlight control for the
   boot (kern.whyred_backlight EIO). Needs a retry.
 
+- First real join (user, Settings): WPA2 to the home AP, DHCP, Safari loads apple.com. Status bar
+  Wi-Fi icon grey: wifid asks RSSI (16) rarely; kernel 0981 now posts APPLE80211_M_LINK_QUALITY (17).
+- Link lost after ~6.6 min: deauth reason 16 (group key handshake timeout); topaz never answered
+  EAPOL group message 1/2. Then the WLAN PD restarted (WLFW on a new port, MSA re-assign ret -2)
+  and our CE/HTC/WMI kept the old state: every scan timed out (errno 60), empty list.
+- Fixes (0978): group key handshake answered (verified: "group key renewed (idx 2)" 3 min after the
+  join, link kept); wlan_host_reset() on WLFW restart, CE/WMI/HTT memory reused; boot-arg
+  wlan_pdr_test=N restarts the PD via servreg-notif RESTART_PD (0x24) to test it.
+- After a reboot wifid does not auto-join the saved network (scans only, no ASSOCIATE). Joining by
+  tapping it in Settings works.
+- 0980: kern.whyred_touch (quad) injects a one-finger tap/swipe: x1 | y1<<12 | x2<<24 | y2<<36 |
+  ms<<48. Unlock after boot: 540,2158 -> 540,700 in 250 ms. scratchpad tap.sh wraps it + webcam.
+- Ghost volume / screenshot presses: garbage SPMI reads (GPIO7 RT 0x10/0x88/0xfc, PON 0x75) with
+  no error bit while the modem runs. 0980 drops implausible values and debounces 3 samples.
+- Keyboard 123/abc dead: UIKit size providers answer 320 pt (iPhone SE) on the 360-pt screen; each
+  keyplane change set another frame size -> updateLayout -> reload -> initial keyplane. whyred_ui
+  wraps the providers (UIKeyboard/UIKeyboardImpl +defaultSize..., -defaultSizeForInterfaceOrientation:)
+  to answer 360 (as danstronics keyboard_native.inc). Lookup with class_copyMethodList:
+  class_getClassMethod in the constructor ran +initialize too early and recursed (stack overflow).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
