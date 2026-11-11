@@ -494,6 +494,16 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
 - Kernel 42929010942: votes aggr 2 at 19.2 MHz; boot-arg wifi_smmu=2 writes one SMR (sid 0x1a00
   mask 1) with S2CR type 1 (bypass), logging before each write.
 
+- Kernel 42929010942 wifi_smmu=2: SMR/S2CR writes land, S2CR bypass (type 1) reads back as fault
+  (type 2), the sTLBGSYNC write stalls the thread. Kernel 42932945989: S1-bypass context bank CB4
+  (CBAR 0x1f000, SCTLR 0xe0), S2CR translate to CB4, SMR0 0x80011a00, no global sync: reads back OK.
+- Kernel 42935086878: l5 + rf_clk1 voted after cap (as icnss_hw_power_on). The modem then sets
+  l6/l9/l19 to mode 05 hw_en 20 and l19 to 3200 mV itself. Still no FW_READY.
+- Kernel 42937371808: QMI sequence now as Linux icnss (ind_register with fw_ready, msa_ready,
+  pin_connect, client_id; no host_cap; dynamic_feature_mask 1 after power on, acked). This
+  firmware rejects rejuvenate_enable (0x19) with err 1. Still no indication of any kind and no
+  tftp request for bdwlan: the WLAN PD stalls before it talks to the chip.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
