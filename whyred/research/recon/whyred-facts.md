@@ -542,6 +542,22 @@ Raw data in this folder: live.dtb/live.dts (/sys/firmware/fdt), iomem.txt, dmesg
   to answer 360 (as danstronics keyboard_native.inc). Lookup with class_copyMethodList:
   class_getClassMethod in the constructor ran +initialize too early and recursed (stack overflow).
 
+- Night 2026-11-11 (unattended, touch injection + webcam):
+  - Keyboard fix verified: 123 switches to numbers-and-punctuation and back; installed for all apps.
+  - Group key fix verified twice (renewals at +3 min, +11 min). Then at +16.5 min the AP ended the
+    link with reason 7: wifid scanned every ~7 s while joined, each scan ~7 s off-channel. Kernel
+    42965871166: while joined, scans are answered from the cache, a real one at most every 60 s
+    (verified: scans 20-23 ~71 s apart while joined).
+  - PD restart recovery verified with wlan_pdr_test (kernel 42965871166): host reset -> FW_READY ->
+    CE reprogrammed on the same memory -> HTC READY -> WMI READY -> HTT -> scans work again (~2 s).
+  - wifid never auto-joins (after boot, after a link loss, after a PD restart): it scans, reads the
+    results, but sends ASSOCIATE (20) only on a tap in Settings. Requests still refused: 383 (set,
+    ~1 per 10 s), 115, 96, 97, 106 RSSI_BOUNDS, 387, 346, 422, 51 COUNTRY_CODE. Next lead for
+    auto-join. DEAUTH (29) is answered now (kernel 42968887721).
+  - Lock screen ignores the unlock swipe while our WLED is off: light it (kern.whyred_backlight=1),
+    swipe 540,2158 -> 540,700 / 250 ms, dark again. Settings dock icon 945,2040, Wi-Fi row 400,960,
+    first known network row 300,787 (after the list loads, ~2 scans).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
