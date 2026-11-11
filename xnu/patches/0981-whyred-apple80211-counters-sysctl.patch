@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
-index e2674ee..d7d70ce 100644
+index e2674ee..c6c750c 100644
 --- a/bsd/dev/redwood_apple80211.c
 +++ b/bsd/dev/redwood_apple80211.c
 @@ -41,6 +41,10 @@
@@ -13,7 +13,38 @@ index e2674ee..d7d70ce 100644
  #include <sys/sockio.h>
  #include <sys/systm.h>
  
-@@ -431,6 +435,8 @@ get(struct apple80211req *request)
+@@ -193,7 +197,29 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+-       EVENT_SCAN_DONE = 10 };
++       EVENT_SCAN_DONE = 10, EVENT_LINK_QUALITY = 17 };
++
++/*
++ * whyred: the status bar's Wi-Fi bars stayed empty: wifid asked RSSI only a few times and expects
++ * APPLE80211_M_LINK_QUALITY events (struct apple80211_link_qual_event_data: rssi dBm, tx rate).
++ * Posted when the link comes up and after every scan while joined.
++ */
++static void post(uint32_t code, const void *data, uint32_t length);
++
++static void
++post_link_quality(void)
++{
++	struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++	if (state == NULL) {
++		return;
++	}
++	redwood_sta_state(state);
++	if (state->phase == REDWOOD_STA_JOINED) {
++		struct { int32_t rssi_dbm; uint32_t tx_rate; } q = { state->bss.rssi, 72 };
++		post(EVENT_LINK_QUALITY, &q, sizeof(q));
++	}
++	kfree_data(state, sizeof(*state));
++}
+ 
+ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
+ 
+@@ -431,6 +457,8 @@ get(struct apple80211req *request)
  			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
  
  		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
@@ -22,7 +53,23 @@ index e2674ee..d7d70ce 100644
  		break;
  	}
  	case 103:                               /* all of it, as a scan's result */
-@@ -694,12 +700,7 @@ note(const struct apple80211req *request, bool is_set, int error)
+@@ -633,6 +661,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		result_next = 0;
+ 		lck_mtx_unlock(&apple80211_lock);
+ 		post(EVENT_SCAN_DONE, NULL, 0);
++		post_link_quality();
+ 		break;
+ 	case REDWOOD_STA_JOIN_DONE:
+ 		lck_mtx_lock(&apple80211_lock);
+@@ -653,6 +682,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
+ 		post(EVENT_BSSID_CHANGED, NULL, 0);
+ 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
++		post_link_quality();
+ 		break;
+ 	}
+ 	}
+@@ -694,12 +724,7 @@ note(const struct apple80211req *request, bool is_set, int error)
  void
  redwood_apple80211_summary(void)
  {
@@ -36,7 +83,7 @@ index e2674ee..d7d70ce 100644
  	for (unsigned i = 0; i < kind_count; i++) {
  		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
  		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
-@@ -737,3 +738,17 @@ redwood_apple80211_ioctl(u_long command, void *data)
+@@ -737,3 +762,17 @@ redwood_apple80211_ioctl(u_long command, void *data)
  	}
  	return error;
  }
