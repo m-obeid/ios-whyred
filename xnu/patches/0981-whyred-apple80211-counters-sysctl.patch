@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee..d7d70ce 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -41,6 +41,10 @@
+ #include <sys/redwood_input.h>
+ #include <sys/redwood_net.h>
+ #include <sys/redwood_sta.h>
++#include <sys/sysctl.h>
++
++static int32_t last_rssi;                       /* whyred: what RSSI (16) answered last */
++static unsigned rssi_asked;
+ #include <sys/sockio.h>
+ #include <sys/systm.h>
+ 
+@@ -431,6 +435,8 @@ get(struct apple80211req *request)
+ 			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
+ 
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		last_rssi = state->bss.rssi;
++		rssi_asked++;
+ 		break;
+ 	}
+ 	case 103:                               /* all of it, as a scan's result */
+@@ -694,12 +700,7 @@ note(const struct apple80211req *request, bool is_set, int error)
+ void
+ redwood_apple80211_summary(void)
+ {
+-	static bool said;
+-
+-	if (said) {
+-		return;
+-	}
+-	said = true;
++	printf("apple80211: RSSI asked %u times, last answer %d dBm\n", rssi_asked, last_rssi);
+ 	for (unsigned i = 0; i < kind_count; i++) {
+ 		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
+ 		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
+@@ -737,3 +738,17 @@ redwood_apple80211_ioctl(u_long command, void *data)
+ 	}
+ 	return error;
+ }
++
++/* whyred: sysctl kern.whyred_a80211=1 prints what was asked so far (the request log stops at 800 lines) */
++static int
++whyred_a80211_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error == 0 && req->newptr != USER_ADDR_NULL && v != 0) {
++		redwood_apple80211_summary();
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_a80211, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    whyred_a80211_sysctl, "I", "print the Apple80211 request counters");

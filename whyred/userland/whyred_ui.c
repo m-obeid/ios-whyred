@@ -25,6 +25,9 @@ extern SEL sel_registerName(const char *name);
 extern Method class_getClassMethod(Class cls, SEL sel);
 extern IMP method_getImplementation(Method m);
 extern IMP method_setImplementation(Method m, IMP imp);
+extern Method class_getInstanceMethod(Class cls, SEL sel);
+extern const char *object_getClassName(id obj);
+extern void objc_msgSend(void);
 extern const char *class_getName(Class cls);
 extern const char *getprogname(void);
 extern int open(const char *path, int flags, ...);
@@ -88,6 +91,96 @@ static Class w2(Class s, SEL c, id a, id b) { return wrap(2, s, c, a, b); }
 static Class w3(Class s, SEL c, id a, id b) { return wrap(3, s, c, a, b); }
 static const provider_fn wrappers[HOOKS] = { w0, w1, w2, w3 };
 
+/*
+ * Keyboard trace (as danstronics kbtrace): the 123 / abc keys (keyplane switches) do nothing,
+ * and the first keyboard shows an iPad-style ".?123" key. Log every keyplane change and what
+ * -[UIKeyboardLayoutStar keyHitTest:] returns for taps in the lower part of the keyboard.
+ */
+typedef struct { double x, y; } pt_t;
+static void (*orig_set_plane)(id, SEL, id);
+static id (*orig_hit)(id, SEL, pt_t);
+static int plane_logs, hit_logs;
+
+static const char *
+utf8(id str)
+{
+	if (str == NULL) {
+		return "nil";
+	}
+	const char *r = ((const char *(*)(id, SEL))objc_msgSend)(str, sel_registerName("UTF8String"));
+	return r ? r : "?";
+}
+
+static const char *
+num(char *buf, double v)
+{
+	long n = (long)v;
+	char t[24];
+	int i = 0, j = 0;
+	if (n < 0) {
+		buf[j++] = '-';
+		n = -n;
+	}
+	do {
+		t[i++] = (char)('0' + n % 10);
+		n /= 10;
+	} while (n && i < 20);
+	while (i) {
+		buf[j++] = t[--i];
+	}
+	buf[j] = 0;
+	return buf;
+}
+
+static void
+kb_set_plane(id self, SEL cmd, id name)
+{
+	orig_set_plane(self, cmd, name);
+	if (plane_logs++ < 40) {
+		say("kb keyplane ", utf8(name));
+	}
+}
+
+static id
+kb_hit(id self, SEL cmd, pt_t p)
+{
+	id key = orig_hit(self, cmd, p);
+	if (p.y > 100 && hit_logs++ < 80) {
+		char bx[24], by[24], line[200];
+		const char *name = key ? utf8(((id (*)(id, SEL))objc_msgSend)(key, sel_registerName("name"))) : "nil";
+		const char *parts[] = { "x ", num(bx, p.x), " y ", num(by, p.y), " -> ", name };
+		size_t o = 0;
+		for (unsigned i = 0; i < 6; i++) {
+			for (size_t n = 0; parts[i][n] && o < sizeof(line) - 1; n++) {
+				line[o++] = parts[i][n];
+			}
+		}
+		line[o] = 0;
+		say("kb hit ", line);
+	}
+	return key;
+}
+
+static void
+kb_hooks(void)
+{
+	Class star = objc_getClass("UIKeyboardLayoutStar");
+	if (star == NULL) {
+		return;
+	}
+	Method m = class_getInstanceMethod(star, sel_registerName("setKeyplaneName:"));
+	if (m != NULL) {
+		orig_set_plane = (void (*)(id, SEL, id))method_getImplementation(m);
+		method_setImplementation(m, (IMP)kb_set_plane);
+	}
+	m = class_getInstanceMethod(star, sel_registerName("keyHitTest:"));
+	if (m != NULL) {
+		orig_hit = (id (*)(id, SEL, pt_t))method_getImplementation(m);
+		method_setImplementation(m, (IMP)kb_hit);
+	}
+	say("kb trace ", orig_hit != NULL && orig_set_plane != NULL ? "installed" : "partial");
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
@@ -119,4 +212,5 @@ whyred_ui_init(void)
 		method_setImplementation(m, (IMP)wrappers[i]);
 		say("hooked ", hook_names[i]);
 	}
+	kb_hooks();
 }
