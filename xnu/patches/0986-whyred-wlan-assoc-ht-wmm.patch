@@ -1,0 +1,77 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 418575f..77d9380 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5638,6 +5638,19 @@ w_send_deauth(void)
+ 	return w_mgmt_tx(f, sizeof(f));
+ }
+ 
++/* the AP's beacon has a WMM parameter/info element (vendor 00:50:F2, type 2) */
++static bool
++w_has_wmm(void)
++{
++	for (uint32_t o = 0; o + 2 <= s_body_len && o + 2 + s_body[o + 1] <= s_body_len; o += 2 + s_body[o + 1]) {
++		if (s_body[o] == 221 && s_body[o + 1] >= 5 && s_body[o + 2] == 0x00 && s_body[o + 3] == 0x50 &&
++		    s_body[o + 4] == 0xF2 && s_body[o + 5] == 0x02) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static void
+ w_build_assoc_req(void)
+ {
+@@ -5670,6 +5683,21 @@ w_build_assoc_req(void)
+ 		memcpy(p, s_rsn_ie, sizeof(s_rsn_ie));
+ 		p += sizeof(s_rsn_ie);
+ 	}
++	/*
++	 * HT capabilities and WMM when the AP has them: an Aruba AP (Hotel_Galeria, 2.4 GHz) answered
++	 * auth but never our assoc request with rates and RSN only (2026-11-23). 20 MHz, SGI 20,
++	 * SM power save off, MCS 0-7, A-MPDU 64 KB / 8 us; WMM info element with QoS info 0.
++	 */
++	if (w_find_ie(s_body, s_body_len, 45) != NULL) {
++		static const uint8_t ht[2 + 26] = { 45, 26, 0x2C, 0x00, 0x17, 0xFF };
++		memcpy(p, ht, sizeof(ht));
++		p += sizeof(ht);
++	}
++	if (w_has_wmm()) {
++		static const uint8_t wmm[2 + 7] = { 221, 7, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00 };
++		memcpy(p, wmm, sizeof(wmm));
++		p += sizeof(wmm);
++	}
+ 	s_assoc_req_len = (uint32_t)(p - f);
+ }
+ 
+@@ -5937,6 +5965,9 @@ w_join_begin(void)
+ 	memcpy(s_body, bss[best].ie, s_body_len);
+ 	const uint8_t *rsn = w_find_ie(s_body, s_body_len, 48);
+ 	s_rsn = rsn != NULL;
++	if (rsn != NULL && rsn[1] >= 2) {
++		LOG("join: AP RSN element %u bytes, last two %02x %02x (capabilities if no PMKID)", rsn[1], rsn[rsn[1]], rsn[rsn[1] + 1]);
++	}
+ 	s_group_cipher = (rsn != NULL && rsn[1] >= 8) ? rsn[2 + 2 + 3] : 4;
+ 	static const uint8_t hdr[4] = { 48, 20, 1, 0 };
+ 	memcpy(s_rsn_ie, hdr, 4);
+@@ -5971,6 +6002,11 @@ w_assoc_mgmt_rx(const uint8_t *f, uint32_t len)
+ 	}
+ 	uint8_t fc = f[0];
+ 	uint16_t v = (uint16_t)(f[24] | f[25] << 8);
++	static uint32_t odd_logs;
++	if ((s_state == S_AUTH || s_state == S_ASSOC) && fc != 0x80 && odd_logs++ < 20) {
++		LOG("t=%u ms: join: from the AP in state %u: fc %02x, %u bytes, %02x %02x %02x %02x", g_ms, s_state, fc, len,
++		    f[24], f[25], len > 27 ? f[26] : 0, len > 27 ? f[27] : 0);
++	}
+ 	if (fc == FC_AUTH && s_state == S_AUTH && len >= 30 && f[26] == 2) {
+ 		v = (uint16_t)(f[28] | f[29] << 8);
+ 		LOG("t=%u ms: join: auth reply status %u", g_ms, v);
+@@ -5981,6 +6017,8 @@ w_assoc_mgmt_rx(const uint8_t *f, uint32_t len)
+ 		s_state = S_ASSOC;
+ 		s_tries = 1;
+ 		w_build_assoc_req();
++		LOG("t=%u ms: join: assoc request %u bytes (HT %u, WMM %u)", g_ms, s_assoc_req_len,
++		    w_find_ie(s_body, s_body_len, 45) != NULL, w_has_wmm());
+ 		w_mgmt_tx(s_assoc_req, s_assoc_req_len);
+ 		s_deadline = g_ms + 400;
+ 	} else if (fc == FC_ASSOC_RESP && s_state == S_ASSOC && len >= 30) {
