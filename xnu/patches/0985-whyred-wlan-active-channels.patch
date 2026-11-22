@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 8e850b8..418575f 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4574,12 +4574,19 @@ scan_start(void)
+ 		return;
+ 	}
+ 	scan_started = true;
+-	/* channel list, every channel passive: nothing is transmitted */
++	/*
++	 * Channel list. Passive (bit 7) only on the 5 GHz radar channels 52-144 (with DFS, bit 10):
++	 * the firmware does not transmit on a passive channel until it has heard a beacon there,
++	 * so joins on channel 13 got no auth or no assoc reply (2026-11-23). The scan itself stays
++	 * passive (scan_send_start), so scanning still transmits nothing.
++	 */
+ 	p = put32(wmi_put_tlv(p, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ);
+ 	p = wmi_put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
+ 	for (uint32_t i = 0; i < NFREQ; i++) {
+ 		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0;
+-		uint32_t flags = mode | (1u << 7) | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
++		bool radar = scan_freqs[i] >= 5260 && scan_freqs[i] <= 5720;
++		uint32_t flags = mode | (radar ? (1u << 7) | (1u << 10) : 0) | (1u << 11) |
++		    (scan_freqs[i] < 4000 ? 0 : (1u << 12));
+ 		c = wmi_put_tlv(p, TAG_CHANNEL, 24);
+ 		c = put32(c, scan_freqs[i]);
+ 		c = put32(c, scan_freqs[i]);
