@@ -452,6 +452,57 @@ pl_hooks(void)
 	method_setImplementation(m, (IMP)pl_allowed);
 }
 
+/*
+ * Typing for unattended tests (Preferences only): text written to /var/mobile/whyred_type is
+ * inserted into the first responder on the main thread (Wi-Fi passwords without tapping keys).
+ */
+extern long read(int fd, void *buf, unsigned long n);
+extern int unlink(const char *path);
+extern void dispatch_async_f(void *queue, void *context, void (*work)(void *));
+extern char _dispatch_main_q;
+static char type_buf[256];
+
+static void
+type_now(void *unused)
+{
+	(void)unused;
+	id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+	id win = app ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : NULL;
+	id fr = win ? ((id (*)(id, SEL))objc_msgSend)(win, sel_registerName("firstResponder")) : NULL;
+	if (fr == NULL) {
+		say("type: no first responder", "");
+		return;
+	}
+	id str = ((id (*)(id, SEL, const char *))objc_msgSend)((id)objc_getClass("NSString"),
+	    sel_registerName("stringWithUTF8String:"), type_buf);
+	((void (*)(id, SEL, id))objc_msgSend)(fr, sel_registerName("insertText:"), str);
+	say("type: inserted into ", object_getClassName(fr));
+}
+
+static void *
+typer(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		sleep(1);
+		int fd = open("/var/mobile/whyred_type", 0);
+		if (fd < 0) {
+			continue;
+		}
+		long n = read(fd, type_buf, sizeof(type_buf) - 1);
+		close(fd);
+		unlink("/var/mobile/whyred_type");
+		while (n > 0 && (type_buf[n - 1] == '\n' || type_buf[n - 1] == '\r')) {
+			n--;
+		}
+		type_buf[n > 0 ? n : 0] = 0;
+		if (n > 0) {
+			dispatch_async_f(&_dispatch_main_q, NULL, type_now);
+		}
+	}
+	return NULL;
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
@@ -489,8 +540,8 @@ whyred_ui_init(void)
 	}
 	kb_hooks();
 	ci_hooks();
-	if (same_text(getprogname(), "SpringBoard")) {
+	if (same_text(getprogname(), "Preferences")) {
 		long t;
-		pthread_create(&t, NULL, wifi_probe, NULL);
+		pthread_create(&t, NULL, typer, NULL);
 	}
 }
