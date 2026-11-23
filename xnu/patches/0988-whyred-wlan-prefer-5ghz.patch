@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 5b0e9e7..6ead2d9 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5961,12 +5961,21 @@ w_join_end(int result)
+ static void
+ w_join_begin(void)
+ {
+-	/* the AP: the strongest one heard with that name (or the BSSID asked for) */
+-	int best = -1;
++	/*
++	 * The AP: the best one heard with that name (or the BSSID asked for). 5 GHz counts 15 dB
++	 * extra when it is heard at -80 dBm or better: band-steering APs (Aruba, Hotel_Galeria)
++	 * ignore a dual-band station on 2.4 GHz; Linux on this phone was steered to 5 GHz at once
++	 * (2026-11-23), our 2.4 GHz assoc requests never got an answer.
++	 */
++	int best = -1, best_score = 0;
+ 	for (uint32_t i = 0; i < nbss; i++) {
+-		if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
+-		    (best < 0 || bss[i].rssi > bss[best].rssi)) {
++		if (bss[i].raw_ssid_len != s_ssid_len || memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) != 0) {
++			continue;
++		}
++		int score = bss[i].rssi + (bss[i].freq > 4000 && bss[i].rssi >= -80 ? 15 : 0);
++		if (best < 0 || score > best_score) {
+ 			best = (int)i;
++			best_score = score;
+ 		}
+ 	}
+ 	bool want_bssid = false;
