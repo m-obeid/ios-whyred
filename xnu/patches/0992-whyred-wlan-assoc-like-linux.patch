@@ -1,0 +1,75 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f04a105..e4ecd4b 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5713,6 +5713,12 @@ w_has_wmm(void)
+ static void
+ w_build_assoc_req(void)
+ {
++	/*
++	 * Laid out as the request Linux (qcacld) sends on this phone, which the hotel's Aruba AP
++	 * answered in 4 ms while ours (rates, ext rates, RSN, HT, WMM) was acked and ignored
++	 * (2026-11-23): SSID, rates, HT capabilities, RSN (capabilities 0x0008), extended rates,
++	 * supported operating classes, extended capabilities (BSS transition), WMM.
++	 */
+ 	uint8_t *f = s_assoc_req, *p = w_mgmt_hdr(f, FC_ASSOC_REQ), rates[16];
+ 	uint32_t n = w_ap_rates(rates), cap = 0x0001 | 0x0020 | 0x0400;   /* ESS, short preamble, short slot */
+ 	if (s_rsn) {
+@@ -5731,6 +5737,15 @@ w_build_assoc_req(void)
+ 	for (uint32_t k = 0; k < n && k < 8; k++) {
+ 		*p++ = rates[k];
+ 	}
++	if (w_find_ie(s_body, s_body_len, 45) != NULL) {
++		static const uint8_t ht[2 + 26] = { 45, 26, 0x2D, 0x01, 0x13, 0xFF };
++		memcpy(p, ht, sizeof(ht));
++		p += sizeof(ht);
++	}
++	if (s_rsn) {
++		memcpy(p, s_rsn_ie, sizeof(s_rsn_ie));
++		p += sizeof(s_rsn_ie);
++	}
+ 	if (n > 8) {
+ 		*p++ = 50;
+ 		*p++ = (uint8_t)(n - 8);
+@@ -5738,20 +5753,18 @@ w_build_assoc_req(void)
+ 			*p++ = rates[k];
+ 		}
+ 	}
+-	if (s_rsn) {
+-		memcpy(p, s_rsn_ie, sizeof(s_rsn_ie));
+-		p += sizeof(s_rsn_ie);
+-	}
+-	/*
+-	 * HT capabilities and WMM when the AP has them: an Aruba AP (Hotel_Galeria, 2.4 GHz) answered
+-	 * auth but never our assoc request with rates and RSN only (2026-11-23). 20 MHz, SGI 20,
+-	 * SM power save off, MCS 0-7, A-MPDU 64 KB / 8 us; WMM info element with QoS info 0.
+-	 */
+-	if (w_find_ie(s_body, s_body_len, 45) != NULL) {
+-		static const uint8_t ht[2 + 26] = { 45, 26, 0x2C, 0x00, 0x17, 0xFF };
+-		memcpy(p, ht, sizeof(ht));
+-		p += sizeof(ht);
+-	}
++	/* supported operating classes: the current one first, then Linux's list */
++	uint8_t cur = s_freq < 4000 ? 81 : s_freq <= 5240 ? 115 : s_freq <= 5320 ? 118 : s_freq <= 5720 ? 121 : 125;
++	static const uint8_t classes[17] = { 0x51, 0x53, 0x54, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x7c, 0x7d, 0x7e,
++		                                 0x7f, 0x80, 0x00, 0x82, 0x80 };
++	*p++ = 59;
++	*p++ = 1 + sizeof(classes);
++	*p++ = cur;
++	memcpy(p, classes, sizeof(classes));
++	p += sizeof(classes);
++	static const uint8_t ext[2 + 3] = { 127, 3, 0x00, 0x00, 0x08 };
++	memcpy(p, ext, sizeof(ext));
++	p += sizeof(ext);
+ 	if (w_has_wmm()) {
+ 		static const uint8_t wmm[2 + 7] = { 221, 7, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00 };
+ 		memcpy(p, wmm, sizeof(wmm));
+@@ -6056,7 +6069,7 @@ w_join_begin(void)
+ 	*q++ = 0x00; *q++ = 0x0F; *q++ = 0xAC; *q++ = s_group_cipher;
+ 	*q++ = 1; *q++ = 0; *q++ = 0x00; *q++ = 0x0F; *q++ = 0xAC; *q++ = 4;   /* pairwise CCMP */
+ 	*q++ = 1; *q++ = 0; *q++ = 0x00; *q++ = 0x0F; *q++ = 0xAC; *q++ = 2;   /* AKM PSK */
+-	*q++ = 0; *q++ = 0;
++	*q++ = 0x08; *q++ = 0;                      /* capabilities: 4 PTKSA replay counters, as Linux */
+ 	uint32_t bcn = bss[best].bintval ? bss[best].bintval : 100, dtim = 1;
+ 	const uint8_t *tim = w_find_ie(s_body, s_body_len, 5);
+ 	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
