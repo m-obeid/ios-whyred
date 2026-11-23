@@ -503,6 +503,42 @@ typer(void *unused)
 	return NULL;
 }
 
+/*
+ * SpringBoard telephony retry loop. CommCenter is not in launchd.plist (Setup hung on it, image v13), so
+ * SpringBoard's CTServerConnection fails and -[SBTelephonyManager _handleTelephonyDaemonRestart] reschedules
+ * itself about once a second. Each run goes handleCallControlFailure: -> updateCalls -> updateSpringBoard,
+ * which resets the backlight idle timer: the lock screen never darkened by itself (2026-11-23, traced with
+ * backtraces from -[SBIdleTimerGlobalCoordinator resetIdleTimer]). The first run goes through, later ones
+ * do nothing.
+ */
+static void (*orig_tel_restart)(id, SEL);
+static int tel_restarts;
+
+static void
+hk_tel_restart(id s, SEL c)
+{
+	if (tel_restarts++ == 0) {
+		orig_tel_restart(s, c);
+		return;
+	}
+	if (tel_restarts == 2) {
+		say("telephony: ", "daemon restart retries ignored (no CommCenter)");
+	}
+}
+
+static void
+telephony_hooks(void)
+{
+	Class cls = objc_getClass("SBTelephonyManager");
+	Method m = cls ? class_getInstanceMethod(cls, sel_registerName("_handleTelephonyDaemonRestart")) : NULL;
+	if (m == NULL || !same_text(method_getTypeEncoding(m), "v16@0:8")) {
+		say("telephony: ", "no -[SBTelephonyManager _handleTelephonyDaemonRestart] with type v16@0:8");
+		return;
+	}
+	orig_tel_restart = (void (*)(id, SEL))method_setImplementation(m, (IMP)hk_tel_restart);
+	say("telephony: ", "hooked _handleTelephonyDaemonRestart");
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
@@ -540,6 +576,9 @@ whyred_ui_init(void)
 	}
 	kb_hooks();
 	ci_hooks();
+	if (same_text(getprogname(), "SpringBoard")) {
+		telephony_hooks();
+	}
 	if (same_text(getprogname(), "Preferences")) {
 		long t;
 		pthread_create(&t, NULL, typer, NULL);

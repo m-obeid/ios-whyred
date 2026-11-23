@@ -691,6 +691,22 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   `-f runner=macos-15-intel`.
 
 
+## Auto-lock: the lock screen never went dark by itself (2026-11-23)
+
+- The lock button worked (0970/0971), but an untouched lock screen stayed lit for minutes.
+- backboardd AttentionAwareness log: "reset attention lost timeout for SpringBoard" about once a second
+  (its own clock, 322, 323, ... s). The unified log parser shows these 19 ms apart: it reads 19.2 MHz
+  ticks as ns (factor 52), so use the AttentionAwareness clock for spacing.
+- Backtraces from a whyred_ui hook on -[SBIdleTimerGlobalCoordinator resetIdleTimer], symbolicated with
+  ipsw dyld a2s (SpringBoard.framework __TEXT 0x1c57ca000): NSFireDelayedPerform ->
+  -[SBTelephonyManager _handleTelephonyDaemonRestart] -> handleCallControlFailure: -> updateCalls ->
+  updateSpringBoard -> resetIdleTimer. CommCenter is not in launchd.plist (image v13), the
+  CTServerConnection fails with (2, 5), and the restart handler reschedules itself every second.
+- Fix in whyred_ui.c (SpringBoard): the first _handleTelephonyDaemonRestart runs, later ones do nothing.
+  Verified: display off and WLED off about 20 s after a SpringBoard restart, and it stays off.
+- Install: whyred/userland/build.sh, then copy out/whyred_ui.dylib to /usr/lib/whyred_ui.dylib on the
+  phone (previous copy /usr/lib/whyred_ui.dylib.bak) and restart SpringBoard.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
