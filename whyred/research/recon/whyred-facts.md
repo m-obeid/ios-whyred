@@ -644,6 +644,8 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   Apple80211CopyValue(106 RSSI_BOUNDS). Our kernel refused 106, so the threshold was 0 dBm.
 - IO80211 decodes 106 as 16 bytes: uint32 version, int32 RSSI_MIN @4, RSSI_MAX @8, RSSI_THRESHOLD @12.
   0995 answers 1, -95, -30, -80. 0994 (noise -95, SNR in scan results, NOISE 17) did not change it.
+- 0995 verified (CI 45155342324, image whyred/out/xnu-ios-0995.img): after a reboot, with no taps, wifid
+  joined the saved Hotel_Galeria 49 s after boot (auth, assoc status 0, 4-way handshake done).
 - Unified logs: the phone clock is 1969, so ls -t on Persist puts new tracev3 files last; take the
   highest numbers. logd does not flush on /sbin/reboot.
 - Tools: ipsw (blacktop) extracts IO80211 from the IPSW's shared cache; 7z reads the local HFS+
