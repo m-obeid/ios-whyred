@@ -627,8 +627,13 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Join chose 2472 MHz again on that boot (the 5 GHz BSS of Hotel_Galeria was not in the scan table).
 - Still open: the AP acks our assoc request and never answers; Linux on the same phone and AP is
   answered. Not content (0992), not the address (0990), not band (5280 MHz also silent), not a scan
-  during the join. Untested ideas: listen interval 10 (Linux 1?), WMI mgmt TX params TLV, firmware
-  mgmt RX filtering of the assoc response, a passive-scan miss of the 5 GHz BSS.
+  during the join.
+- SOLVED by 0993 (kernel 45142594955, image whyred/out/xnu-ios-0993.img): w_mgmt_hdr left the
+  sequence control at 0 in every frame and the firmware sends it as is. The Aruba AP took the assoc
+  request (seq 0) for a repeat of the auth (seq 0), acked it and dropped it. Home APs did not care.
+  Each mgmt frame now carries its own sequence number. Joined Hotel_Galeria at once: auth reply 4 ms,
+  assoc reply (status 0, aid 1) 5 ms after the request, 4-way handshake done 9 ms later (2472 MHz,
+  -49 dBm beat the 5 GHz BSS at -66 +15). 0993 also sets listen interval 1 and logs join candidates.
 
 
 ## Not yet known
