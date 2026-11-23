@@ -1,0 +1,53 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e4ecd4b..e427485 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5666,11 +5666,17 @@ w_install_key(bool group, uint32_t idx, uint32_t cipher, const uint8_t *key, uin
+ static uint8_t *
+ w_mgmt_hdr(uint8_t *f, uint8_t fc)
+ {
++	/* Each frame gets its own sequence number: the firmware sends ours as is, and with all at 0
++	 * the Aruba APs took the assoc request for a repeat of the auth, acked it and dropped it. */
++	static uint16_t seq;
+ 	bzero(f, 24);
+ 	f[0] = fc;
+ 	memcpy(f + 4, s_bssid, 6);
+ 	memcpy(f + 10, our_mac, 6);
+ 	memcpy(f + 16, s_bssid, 6);
++	seq = (uint16_t)((seq + 1) & 0xFFF);
++	f[22] = (uint8_t)(seq << 4);
++	f[23] = (uint8_t)(seq >> 4);
+ 	return f + 24;
+ }
+ 
+@@ -5726,7 +5732,7 @@ w_build_assoc_req(void)
+ 	}
+ 	*p++ = (uint8_t)cap;
+ 	*p++ = (uint8_t)(cap >> 8);
+-	*p++ = 10;
++	*p++ = 1;                                   /* listen interval 1, as Linux */
+ 	*p++ = 0;
+ 	*p++ = 0;
+ 	*p++ = s_ssid_len;
+@@ -6032,6 +6038,8 @@ w_join_begin(void)
+ 			continue;
+ 		}
+ 		int score = bss[i].rssi + (bss[i].freq > 4000 && bss[i].rssi >= -80 ? 15 : 0);
++		LOG("join: candidate %02x:%02x:%02x:**:**:%02x %u MHz rssi %d score %d", bss[i].bssid[0], bss[i].bssid[1],
++		    bss[i].bssid[2], bss[i].bssid[5], bss[i].freq, bss[i].rssi, score);
+ 		if (best < 0 || score > best_score) {
+ 			best = (int)i;
+ 			best_score = score;
+@@ -6093,6 +6101,12 @@ w_join_begin(void)
+ static void
+ w_assoc_mgmt_rx(const uint8_t *f, uint32_t len)
+ {
++	static uint32_t other_logs;
++	if (len >= 24 && s_state == S_ASSOC && memcmp(f + 4, our_mac, 6) == 0 && memcmp(f + 10, s_bssid, 6) != 0 &&
++	    other_logs++ < 10) {
++		LOG("t=%u ms: join: to us from %02x:%02x:%02x:**:**:%02x: fc %02x, %u bytes", g_ms, f[10], f[11], f[12],
++		    f[15], f[0], len);
++	}
+ 	if (len < 26 || s_state == S_IDLE || memcmp(f + 10, s_bssid, 6) != 0) {
+ 		return;
+ 	}
