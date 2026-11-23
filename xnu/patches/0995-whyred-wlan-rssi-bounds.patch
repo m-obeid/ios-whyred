@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e507073..6947e64 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -472,6 +472,20 @@ get(struct apple80211req *request)
+ 		rssi_asked++;
+ 		break;
+ 	}
++	case 106: {                             /* RSSI bounds, read once when wifid opens the interface */
++		/*
++		 * IO80211 turns these into RSSI_MIN, RSSI_MAX and RSSI_THRESHOLD; wifid's auto-join turns down
++		 * every network heard below RSSI_THRESHOLD. Unanswered, it stayed 0 dBm and no saved network
++		 * was ever joined after a reboot ("Below minimum RSSI threshold", 2026-11-23).
++		 */
++		struct {
++			uint32_t version;
++			int32_t min, max, threshold;
++		} answer = { .version = 1, .min = -95, .max = -30, .threshold = -80 };
++
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 17: {                              /* the noise floor, laid out as RSSI (16) */
+ 		struct {
+ 			uint32_t version, radios, unit;
