@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 4df0a31..c3a170c 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -24,7 +24,7 @@ int whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ #define WS_CHNLS_PA     0x08400000u
+ #define WS_CNFG_PA      0x0800a000u
+ #define WS_APIDS        512u
+-#define WS_SLOTS        8u
++#define WS_SLOTS        16u     /* 8 were all taken by SweetBattery and keys before the RTC (0x060) */
+ 
+ static vm_offset_t ws_core, ws_cnfg;
+ static bool ws_ready, ws_tried;
