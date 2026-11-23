@@ -1,0 +1,205 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 3c17608..705845e 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -12,6 +12,7 @@
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <kern/locks.h>
++#include <kern/thread_call.h>
+ #include <sys/sysctl.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -34,6 +35,7 @@ static struct {
+ 	vm_offset_t ch;         /* observer channel; 0 = no apps-owned APID */
+ 	uint16_t apid;
+ 	bool owned;             /* apps (EE 0) owns it: writes allowed */
++	vm_offset_t wch;        /* write channel, mapped on the first write */
+ } ws_slot[WS_SLOTS];
+ static unsigned ws_used;
+ static LCK_GRP_DECLARE(ws_grp, "whyred_spmi");
+@@ -135,13 +137,31 @@ ws_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+ 	return -1;
+ }
+ /*
+- * The only registers this may write: PM660 (SID 1) LDO5 EN_CTL, the WCN3990 vdd-cx-mx supply
+- * (TopazModem.cpp, wifi=1). Linux turns it on through RPM-SMD; ABL leaves it off.
++ * The only registers this may write, all on PM660 (SID 1):
++ *   0x4446       LDO5 EN_CTL, the WCN3990 vdd-cx-mx supply (TopazModem.cpp, wifi=1). Linux turns it on
++ *                through RPM-SMD; ABL leaves it off.
++ *   0xc0xx       the haptics block (live DT qcom,haptic@c000, ERM): EN_CTL 0x46, CFG1 0x4c, SEL 0x4e,
++ *                VMAX 0x51, ILIM 0x52, PLAY 0x70 (whyred_vibrate below).
+  */
++static bool
++ws_write_allowed(unsigned sid, unsigned addr)
++{
++	if (sid != 1) {
++		return false;
++	}
++	switch (addr) {
++	case 0x4446:
++	case 0xc046: case 0xc04c: case 0xc04e: case 0xc051: case 0xc052: case 0xc070:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ static int
+ ws_write_locked(unsigned sid, unsigned addr, uint8_t value)
+ {
+-	if (!ws_ready || !(sid == 1 && addr == 0x4446)) {
++	if (!ws_ready || !ws_write_allowed(sid, addr)) {
+ 		printf("WHYRED SPMI: write %u:%#x refused\n", sid, addr);
+ 		return -1;
+ 	}
+@@ -157,7 +177,10 @@ ws_write_locked(unsigned sid, unsigned addr, uint8_t value)
+ 		printf("WHYRED SPMI: ppid %#x not apps-owned, write refused\n", ppid);
+ 		return -1;
+ 	}
+-	vm_offset_t wr = ml_io_map(WS_CHNLS_PA + 0x8000u * ws_slot[i].apid, 0x1000);
++	if (ws_slot[i].wch == 0) {
++		ws_slot[i].wch = ml_io_map(WS_CHNLS_PA + 0x8000u * ws_slot[i].apid, 0x1000);
++	}
++	vm_offset_t wr = ws_slot[i].wch;
+ 	if (!wr) {
+ 		return -1;
+ 	}
+@@ -270,4 +293,137 @@ whyred_rtc_set_clock(void)
+ 		printf("WHYRED RTC: clock set to %lld (rtc %u + offset %lld)\n", (long long)(secs + off), secs, off);
+ 	}
+ }
++/*
++ * Vibration: the PM660 haptics block drives the ERM motor in direct mode, as Linux qpnp-haptic.c does
++ * with the live DT (actuator erm, play-mode direct, vmax 3000 mV, ilim 800 mA): CFG1 bit 0 = ERM,
++ * SEL [5:4] = 0 (direct), VMAX [5:1] = mV / 116 (overdrive bit 6 clear), ILIM bit 0 = 800 mA. Then
++ * EN_CTL bit 7 and PLAY bit 7 run the motor; both cleared stop it.
++ *
++ * sysctl kern.whyred_vibrate (any user): N > 0 runs the motor for N ms (at most 2000), 0 stops it.
++ */
++#define HAP_BASE        0xc000u
++#define HAP_STATUS      0x0au
++#define HAP_EN_CTL      0x46u
++#define HAP_CFG1        0x4cu
++#define HAP_CFG2        0x4du
++#define HAP_SEL         0x4eu
++#define HAP_VMAX        0x51u
++#define HAP_ILIM        0x52u
++#define HAP_PLAY        0x70u
++#define HAP_VMAX_MV     3000u
++#define HAP_MAX_MS      2000
++
++static LCK_MTX_DECLARE(hap_lock, &ws_grp);
++static bool hap_ready, hap_broken;
++static thread_call_t hap_stop_call;
++static int hap_last_ms;
++
++static int
++hap_rmw(unsigned reg, uint8_t mask, uint8_t val)
++{
++	uint8_t v;
++	if (whyred_spmi_read(1, HAP_BASE + reg, &v) != 0) {
++		return -1;
++	}
++	return whyred_spmi_write(1, HAP_BASE + reg, (uint8_t)((v & ~mask) | (val & mask)));
++}
++
++/* Called with hap_lock held. */
++static int
++hap_setup(void)
++{
++	if (hap_ready || hap_broken) {
++		return hap_ready ? 0 : -1;
++	}
++	static const uint8_t regs[] = { HAP_STATUS, HAP_EN_CTL, HAP_CFG1, HAP_CFG2, HAP_SEL, HAP_VMAX, HAP_ILIM, HAP_PLAY };
++	uint8_t v[sizeof(regs)] = { 0 };
++	for (unsigned i = 0; i < sizeof(regs); i++) {
++		if (whyred_spmi_init() != 0 || whyred_spmi_read(1, HAP_BASE + regs[i], &v[i]) != 0) {
++			printf("WHYRED HAPTIC: read %#x failed\n", HAP_BASE + regs[i]);
++			hap_broken = true;
++			return -1;
++		}
++	}
++	printf("WHYRED HAPTIC: found status %#x en %#x cfg1 %#x cfg2 %#x sel %#x vmax %#x ilim %#x play %#x\n",
++	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++	if (hap_rmw(HAP_CFG1, 0x01, 0x01) || hap_rmw(HAP_SEL, 0x30, 0x00) ||
++	    hap_rmw(HAP_VMAX, 0x7e, (uint8_t)((HAP_VMAX_MV / 116u) << 1)) || hap_rmw(HAP_ILIM, 0x01, 0x01)) {
++		printf("WHYRED HAPTIC: configuration refused, vibration off\n");
++		hap_broken = true;
++		return -1;
++	}
++	hap_ready = true;
++	printf("WHYRED HAPTIC: ERM, direct mode, %u mV, 800 mA\n", HAP_VMAX_MV);
++	return 0;
++}
++
++/* Called with hap_lock held. */
++static void
++hap_off(void)
++{
++	(void)whyred_spmi_write(1, HAP_BASE + HAP_PLAY, 0);
++	(void)whyred_spmi_write(1, HAP_BASE + HAP_EN_CTL, 0);
++}
++
++static void
++hap_stop_work(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	lck_mtx_lock(&hap_lock);
++	if (hap_ready) {
++		hap_off();
++	}
++	lck_mtx_unlock(&hap_lock);
++}
++
++/* Run the motor for ms milliseconds (0: stop now). 0 on success. */
++int whyred_vibrate(int ms);
++int
++whyred_vibrate(int ms)
++{
++	int r = 0;
++	lck_mtx_lock(&hap_lock);
++	if (hap_stop_call == NULL) {
++		hap_stop_call = thread_call_allocate(hap_stop_work, NULL);
++	}
++	if (ms <= 0) {
++		if (hap_stop_call != NULL) {
++			thread_call_cancel(hap_stop_call);
++		}
++		if (hap_ready) {
++			hap_off();
++		}
++	} else if (hap_stop_call == NULL || hap_setup() != 0) {
++		r = -1;
++	} else {
++		if (ms > HAP_MAX_MS) {
++			ms = HAP_MAX_MS;
++		}
++		if (whyred_spmi_write(1, HAP_BASE + HAP_EN_CTL, 0x80) != 0 ||
++		    whyred_spmi_write(1, HAP_BASE + HAP_PLAY, 0x80) != 0) {
++			hap_off();
++			r = -1;
++		} else {
++			uint64_t deadline;
++			clock_interval_to_deadline((uint32_t)ms, NSEC_PER_MSEC, &deadline);
++			thread_call_enter_delayed(hap_stop_call, deadline);
++		}
++	}
++	lck_mtx_unlock(&hap_lock);
++	return r;
++}
++
++static int
++sysctl_whyred_vibrate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = hap_last_ms, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	hap_last_ms = v;
++	return whyred_vibrate(v) == 0 ? 0 : EIO;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_vibrate, "I", "whyred: run the vibration motor for N ms (0 stops it)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
