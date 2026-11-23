@@ -652,6 +652,36 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   snapshot whyred/ipsw/iosroot-snapshot-20261109.img (wifid at iOSRoot/usr/sbin/wifid).
 
 
+## Idle power and the 1970 clock (2026-11-23)
+
+- Before: about 410 CPU-s per 120 s idle, battery -670 mA on USB. After the fixes below: about 25 CPU-s
+  per 120 s, about -60 mA. Measure with `ps -ax -o time,command | sort -r | head` twice, 60 s apart.
+- Main cost: coreduetd at a full core. spindump: its knowledgestorage.execution queue answers
+  _DKPredictionQuery from dasd (about 65 ms each, thousands). dasd log (category budgetModulation):
+  "Last modulated budgets at Wed Dec 31 16:01:06 1969, modulating for 1994946 slots", then one query
+  per 2 hours of 15 min slots back toward 1970.
+- Cause: every boot starts at 1970 until Wi-Fi time sync. dasd writes lastModulation =
+  now into /var/mobile/Library/Preferences/com.apple.dasd.widgetRefreshBudgets.plist about 67 s after
+  boot. The next modulation after the real time arrives walks 56 years.
+- Fix by hand: write the plist with lastModulation = now, and kill cfprefsd, dasd and coreduetd in the
+  same step. cfprefsd caches the plist. An edit without the cfprefsd restart had no effect. killall did
+  not kill dasd. kill -9 by pid works, and launchd restarts them on demand.
+- Also done: Photos "For You" widget removed from IconState.plist (backup /var/root/IconState.plist.orig).
+  Its prediction was NaN and dasd recomputed it in a loop. vmd, wifip2pd and nanotimekitcompaniond
+  disabled with launchctl disable. BTAudioHALPlugin.driver moved to /var/root/disabled-plugins/.
+- The PM660 RTC (SID 0, 0x6048..0x604b) counts seconds and keeps them across reboots. TZ refuses writes
+  (hwclock -w: EPERM). Offset to real time 1767200547 (rtc 28251469 at 2026-11-23 16:40:16 UTC).
+- 0996: sysctl kern.whyred_rtc read -1. All 8 PPID slots of whyred_spmi.c were taken before the RTC.
+  0997: 16 slots, kern.whyred_rtc works (CI 45215490554, macos-15-intel).
+- Launchd job com.whyred.clock (whyred/tools/add-clock.sh, whyred/userland/whyred-clock.sh): sets the
+  clock from the RTC plus /var/root/whyred_rtc_offset and keeps the offset fresh. It works, but its
+  first command ran after dasd had saved a 1970 date. Too late.
+- 0998: the kernel sets the clock from SweetBattery's 1 s timer while it reads before 2023, using
+  boot-arg whyred_rtcoff=1767200547 (added in the image build). CI 45226449453. Not yet verified.
+- CI: macOS arm64 runners often fail with "not acquired by Runner" (capacity). Use
+  `-f runner=macos-15-intel`.
+
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
