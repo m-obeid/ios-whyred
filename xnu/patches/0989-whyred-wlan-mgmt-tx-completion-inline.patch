@@ -1,0 +1,57 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 6ead2d9..ee0e40f 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5537,11 +5537,18 @@ w_ps_off(void)
+ 	return wmi_send(CMD_STA_PS_MODE, m, sizeof(m));
+ }
+ 
++/*
++ * Frames up to 64 bytes travel inside the WMI command (auth: answered); longer ones (assoc
++ * requests, 67-118 bytes) by DMA from s_mgmt_pa. The assoc request was never answered at the
++ * hotel (2026-11-23), so the later tries send the whole frame inline (s_mgmt_inline).
++ */
++static bool s_mgmt_inline;
++
+ static bool
+ w_mgmt_tx(const uint8_t *f, uint32_t len)
+ {
+-	uint8_t m[4 + 28 + 4 + 64] = {}, *p;
+-	uint32_t buf = (MIN(len, 64u) + 3) & ~3u;
++	uint8_t m[4 + 28 + 4 + 256] = {}, *p;
++	uint32_t buf = (MIN(len, s_mgmt_inline ? 256u : 64u) + 3) & ~3u;
+ 	if (s_mgmt_va == NULL) {
+ 		s_mgmt_va = (uint8_t *)pool_alloc(0x1000, &s_mgmt_pa);
+ 	}
+@@ -6151,7 +6158,12 @@ w_join_poll(void)
+ 				}
+ 				w_send_auth();
+ 			} else {
++				s_mgmt_inline = s_tries > 4;
++				if (s_tries == 5) {
++					LOG("t=%u ms: join: no assoc reply, now the whole frame inline", g_ms);
++				}
+ 				w_mgmt_tx(s_assoc_req, s_assoc_req_len);
++				s_mgmt_inline = false;
+ 			}
+ 			s_deadline = g_ms + 400;
+ 		}
+@@ -6385,6 +6397,18 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
+ 		w_join_event(id, d + 4, len - 4);
+ 		break;
++	case 0x7006: {                              /* MGMT_TX_COMPLETION {desc_id, status, pdev} */
++		static uint32_t compl_logs;
++		uint32_t cv[2] = {};
++		if (len >= 4 + 4 + 8) {
++			memcpy(cv, d + 8, 8);
++		}
++		if (compl_logs++ < 40) {
++			LOG("t=%u ms: mgmt tx %u: %s (%u)", g_ms, cv[0], cv[1] == 0 ? "acked" : cv[1] == 1 ? "discarded" :
++			    cv[1] == 3 ? "no ack" : "?", cv[1]);
++		}
++		break;
++	}
+ 	default:
+ 		break;
+ 	}
