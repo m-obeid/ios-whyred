@@ -772,6 +772,29 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   directly. ToneLibrary alerts (ringtones, notifications) are expected to pass VibePattern options; not yet
   seen on the phone (no notifications and no Clock app on this root).
 
+## ADSP boots under XNU (patch 1001, 2026-11-24)
+
+- Hardware (live DT, Linux dmesg): loudspeaker = TI TAS2557 at 0x4c on I2C 0xc1b6000 (i2c6, shared with
+  NFC; reset GPIO 77, irq GPIO 73); earpiece/headset/mics = PM660L analog codec (anlg-cdc@f000) + LPASS
+  digital codec msm-sdw-codec@152c1000. Both codecs wait for the ADSP in Linux ("Adsp is not loaded yet").
+  tasha/tavil (WCD933x/934x) nodes exist but do not probe.
+- ADSP PIL (qcom,lpass@15700000): pil-tz-generic, PAS id 1, firmware "adsp" (image/adsp.* on the modem
+  FAT), carveout adsp_fw 0x92a00000+0x1e00000, SMP2P items 443 in / 429 out (APCS bit 10), GLINK edge
+  "lpass" (SMEM items 478/479/480, APCS bit 9). Channels the ADSP opens: glink_ssr, IPCRTR, apr_audio_svc,
+  apr_apps2, fastrpcglink-apps-dsp, LOOPBACK_CTL_LPASS.
+- 1001 adapts the inherited TopazAudio.cpp (topaz SM6225 ADSP + AudioReach): carveout, GLINK bit, and APR
+  on apr_audio_svc instead of GPR. APR header 0x250 (seq cmd, 5 words), core svc 3, apps 5 -> adsp 4;
+  AVCS_CMD_ADSP_EVENT_GET_STATE 0x1290c, reply 0x1290d.
+- Verified (boot-arg adsp=1, CI 45290295636): PAS init_image/mem_setup/auth_and_reset ret 0, slave-kernel
+  READY at t=20 ms, GLINK and QRTR up (node 5, 20 services), pd-mapper answers "avs/audio". First APR
+  ask (t=32 ms) got APR_BASIC_RSP_RESULT status 0x16 (not ready yet); one second later state 1:
+  "ADSP APR READY". Still up after 60 s. No crypto bus or extra RPM votes were needed.
+- The iOS side exists in the repo: userland/audio/audio_plugin.c (HackiOS RedwoodAudio HAL plug-in:
+  Speaker, Hawking, Actuator = Taptic output, Codec mic) writing to /dev/redwood-audio (and
+  /dev/redwood-haptic); TopazAudio provides /dev/topaz-audio + the redwood alias (0935).
+- Next (milestone 2): AFE on the TAS2557's MI2S port with the LPASS clocks through the ADSP, TAS2557
+  setup over I2C, then PCM through an ASM stream.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
