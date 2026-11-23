@@ -539,9 +539,246 @@ telephony_hooks(void)
 	say("telephony: ", "hooked _handleTelephonyDaemonRestart");
 }
 
+/*
+ * Brightness slider. Control Center (SpringBoard) and Settings (Preferences) set "DisplayBrightness"
+ * (0.0 .. 1.0) on CoreBrightness's BrightnessSystemClient. CoreBrightness has no display module here
+ * (no AppleARMBacklight, sweetbl=0), so the value went nowhere. Here it becomes IOMFBBrightnessLevel on
+ * AppleCLCD (nits in 16.16, 0 .. 500; SweetFramebuffer.cpp sends it to the PM660L WLED), nits =
+ * 500 * v^2 (at least 2). Reading "DisplayBrightness" answers from that property, so the kernel holds
+ * the one value every process sees. As libhakios-brightness.dylib (oosexgang/hakios-xnu-kernel, MIT)
+ * does it for its panels. Other keys go to CoreBrightness as before; the first ones are logged.
+ */
+typedef const void *CFTypeRef;
+typedef const struct __CFString *CFStringRef;
+typedef const struct __CFNumber *CFNumberRef;
+typedef unsigned int io_object_t;
+extern CFStringRef CFStringCreateWithCString(const void *alloc, const char *s, unsigned int encoding);
+extern CFNumberRef CFNumberCreate(const void *alloc, long type, const void *value);
+extern unsigned char CFNumberGetValue(CFNumberRef n, long type, void *value);
+extern void CFRelease(CFTypeRef cf);
+extern unsigned long CFGetTypeID(CFTypeRef cf);
+extern unsigned long CFNumberGetTypeID(void);
+extern void *IOServiceMatching(const char *name);
+extern io_object_t IOServiceGetMatchingService(unsigned int mainPort, void *matching);
+extern int IORegistryEntrySetCFProperty(io_object_t entry, CFStringRef key, CFTypeRef value);
+extern CFTypeRef IORegistryEntryCreateCFProperty(io_object_t entry, CFStringRef key, const void *alloc, unsigned int options);
+extern int IOObjectRelease(io_object_t o);
+
+#define BL_MAX_NITS 500.0
+#define BL_MIN_NITS 2.0
+static int (*orig_bl_set)(id, SEL, id, id);
+static id (*orig_bl_copy)(id, SEL, id);
+static io_object_t bl_fb;
+static CFStringRef bl_key;
+static int bl_logs;
+
+static const char *
+hex(char *buf, unsigned long v)
+{
+	char t[20];
+	int i = 0, j = 0;
+	do {
+		t[i++] = "0123456789abcdef"[v & 15];
+		v >>= 4;
+	} while (v && i < 16);
+	buf[j++] = '0';
+	buf[j++] = 'x';
+	while (i) {
+		buf[j++] = t[--i];
+	}
+	buf[j] = 0;
+	return buf;
+}
+
+static io_object_t
+bl_service(void)
+{
+	if (bl_fb == 0) {
+		bl_fb = IOServiceGetMatchingService(0, IOServiceMatching("AppleCLCD"));
+		bl_key = CFStringCreateWithCString(NULL, "IOMFBBrightnessLevel", 0x08000100);
+	}
+	return bl_fb;
+}
+
+static void
+bl_log(const char *what, id key)
+{
+	if (bl_logs < 16) {
+		bl_logs++;
+		say(what, utf8(key));
+	}
+}
+
+/* slider value 0..1 -> IOMFBBrightnessLevel (nits 16.16) on AppleCLCD */
+static void
+bl_write(double v)
+{
+	if (bl_service() == 0) {
+		return;
+	}
+	v = v < 0 ? 0 : v > 1 ? 1 : v;
+	double nits = BL_MAX_NITS * v * v;
+	long long fixed = (long long)((nits < BL_MIN_NITS ? BL_MIN_NITS : nits) * 65536.0);
+	CFNumberRef n = CFNumberCreate(NULL, 4, &fixed);       /* kCFNumberSInt64Type */
+	int r = IORegistryEntrySetCFProperty(bl_fb, bl_key, n);
+	CFRelease(n);
+	if (r != 0) {
+		char b[24];
+		say("brightness: IOMFBBrightnessLevel refused ", hex(b, (unsigned)r));
+	}
+}
+
+/* the kernel's level back as a slider value, or -1 */
+static double
+bl_read(void)
+{
+	if (bl_service() == 0) {
+		return -1;
+	}
+	CFTypeRef p = IORegistryEntryCreateCFProperty(bl_fb, bl_key, NULL, 0);
+	long long fixed = -1;
+	if (p != NULL) {
+		if (CFGetTypeID(p) == CFNumberGetTypeID()) {
+			CFNumberGetValue((CFNumberRef)p, 4, &fixed);
+		}
+		CFRelease(p);
+	}
+	if (fixed < 0) {
+		return -1;
+	}
+	double x = fixed / 65536.0 / BL_MAX_NITS, r = x;
+	for (int i = 0; i < 20 && r > 0; i++) {
+		r = 0.5 * (r + x / r);                 /* sqrt(x) */
+	}
+	return r > 1 ? 1 : r;
+}
+
+static int
+bl_set(id self, SEL cmd, id value, id key)
+{
+	bl_log("brightness set ", key);
+	if (value != NULL && same_text(utf8(key), "DisplayBrightness")) {
+		bl_write(((float (*)(id, SEL))objc_msgSend)(value, sel_registerName("floatValue")));
+	}
+	return orig_bl_set(self, cmd, value, key);
+}
+
+static id
+bl_copy(id self, SEL cmd, id key)
+{
+	bl_log("brightness copy ", key);
+	double v;
+	if (same_text(utf8(key), "DisplayBrightness") && (v = bl_read()) >= 0) {
+		id num = ((id (*)(Class, SEL, float))objc_msgSend)(objc_getClass("NSNumber"),
+		    sel_registerName("numberWithFloat:"), (float)v);
+		return ((id (*)(id, SEL))objc_msgSend)(num, sel_registerName("retain"));   /* copy: +1 */
+	}
+	return orig_bl_copy(self, cmd, key);
+}
+
+/*
+ * backboardd: the sliders call BKSDisplayBrightnessSet (Settings: -[DBSBrightnessManager
+ * setBacklightValue:specifier:]), which lands in -[BKDisplayBrightnessController
+ * setBrightnessLevel:reason:options:]. kern.exec_inject must name backboardd (it is not in an .app).
+ */
+static void (*orig_bk_set)(id, SEL, float, id, unsigned long long);
+static float (*orig_bk_level)(id, SEL);
+static signed char (*orig_bk_avail)(id, SEL);
+static int bk_logs;
+
+static void
+bk_set(id self, SEL cmd, float level, id reason, unsigned long long options)
+{
+	if (bk_logs < 12) {
+		char b[24];
+		bk_logs++;
+		say("brightness level set, reason ", utf8(reason));
+		say("  level x1000 ", hex(b, (unsigned long)(level * 1000)));
+	}
+	orig_bk_set(self, cmd, level, reason, options);
+	bl_write(level);
+}
+
+static float
+bk_level(id self, SEL cmd)
+{
+	double v = bl_read();
+	return v >= 0 ? (float)v : orig_bk_level(self, cmd);
+}
+
+static signed char
+bk_avail(id self, SEL cmd)
+{
+	static int said;
+	signed char r = orig_bk_avail(self, cmd);
+	if (!said++) {
+		say("brightness: level control available was ", r ? "YES" : "NO");
+	}
+	return 1;
+}
+
+static void
+bk_hook(Class cls, const char *name, IMP imp, void **orig)
+{
+	Method m = class_getInstanceMethod(cls, sel_registerName(name));
+	if (m == NULL) {
+		say("brightness: missing ", name);
+		return;
+	}
+	say(name, method_getTypeEncoding(m));
+	*orig = (void *)method_setImplementation(m, imp);
+}
+
+static void *
+bk_hook_thread(void *arg)
+{
+	(void)arg;
+	for (int i = 0; i < 60; i++) {
+		Class cls = objc_getClass("BKDisplayBrightnessController");
+		if (cls != NULL) {
+			bk_hook(cls, "setBrightnessLevel:reason:options:", (IMP)bk_set, (void **)&orig_bk_set);
+			bk_hook(cls, "brightnessLevel", (IMP)bk_level, (void **)&orig_bk_level);
+			bk_hook(cls, "isBrightnessLevelControlAvailable", (IMP)bk_avail, (void **)&orig_bk_avail);
+			return NULL;
+		}
+		sleep(1);
+	}
+	say("brightness: ", "no BKDisplayBrightnessController");
+	return NULL;
+}
+
+static void *
+bl_hook_thread(void *arg)
+{
+	(void)arg;
+	for (int i = 0; i < 60; i++) {
+		Class cls = objc_getClass("BrightnessSystemClient");
+		if (cls != NULL) {
+			Method ms = class_getInstanceMethod(cls, sel_registerName("setProperty:forKey:"));
+			Method mc = class_getInstanceMethod(cls, sel_registerName("copyPropertyForKey:"));
+			if (ms == NULL || mc == NULL || !same_text(method_getTypeEncoding(ms), "B32@0:8@16@24") ||
+			    !same_text(method_getTypeEncoding(mc), "@24@0:8@16")) {
+				say("brightness: ", "BrightnessSystemClient methods not as expected, left alone");
+				return NULL;
+			}
+			orig_bl_set = (int (*)(id, SEL, id, id))method_setImplementation(ms, (IMP)bl_set);
+			orig_bl_copy = (id (*)(id, SEL, id))method_setImplementation(mc, (IMP)bl_copy);
+			say("brightness: ", "hooked BrightnessSystemClient");
+			return NULL;
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
+	if (same_text(getprogname(), "backboardd")) {
+		long t;
+		pthread_create(&t, NULL, bk_hook_thread, NULL);
+		return;
+	}
 	if (same_text(getprogname(), "assetsd")) {
 		pl_hooks();
 		return;
@@ -578,6 +815,10 @@ whyred_ui_init(void)
 	ci_hooks();
 	if (same_text(getprogname(), "SpringBoard")) {
 		telephony_hooks();
+	}
+	if (same_text(getprogname(), "SpringBoard") || same_text(getprogname(), "Preferences")) {
+		long bt;
+		pthread_create(&bt, NULL, bl_hook_thread, NULL);
 	}
 	if (same_text(getprogname(), "Preferences")) {
 		long t;

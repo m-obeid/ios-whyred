@@ -712,6 +712,26 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Install: whyred/userland/build.sh, then copy out/whyred_ui.dylib to /usr/lib/whyred_ui.dylib on the
   phone (previous copy /usr/lib/whyred_ui.dylib.bak) and restart SpringBoard.
 
+## Brightness slider (2026-11-23)
+
+- Both sliders call BackBoardServices, not CoreBrightness's client: Settings
+  -[DBSBrightnessManager setBacklightValue:specifier:] -> BKSDisplayBrightnessTransactionCreate +
+  BKSDisplayBrightnessSet -> backboardd -[BKDisplayBrightnessController setBrightnessLevel:reason:options:]
+  (v36@0:8f16@20Q28, level 0..1). backboardd's own classes are in /usr/libexec/backboardd, not the cache.
+- whyred_ui.c in backboardd: after the original, the level goes to IOMFBBrightnessLevel on AppleCLCD
+  (nits 16.16 = 500 * level^2, at least 2; SweetFramebuffer.cpp -> PM660L WLED). brightnessLevel answers
+  from that property; isBrightnessLevelControlAvailable answers YES (Control Center's slider did not move).
+  Hooks on BrightnessSystemClient in SpringBoard/Preferences stay for logging; DisplayBrightness never
+  went through them.
+- backboardd is not in an .app, so topaz_inject names it: /usr/lib/whyred_ui.dylib,*app,backboardd.
+  At runtime: sysctl kern.exec_inject="/usr/lib/whyred_ui.dylib *app backboardd", then restart backboardd.
+- Verified: both sliders change the brightness (user). At boot backboardd restores the saved level
+  ("synchronizeALSPreferencesAndDisplayBrightness", 0.337 -> panel level 0xe9).
+- Boot-args of whyred/out/xnu-ios-0998.img (kernel CI 45226449453):
+  debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=emmcroot0 emmcroot=userdata emmcrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetbattery=2 panicreset=60 sweetusb=2 sweetfb_native=1 sweetkeys=1 sweetsyna=2 sweetfb_noconsole=1 sweetfb_hz=30 topaz_inject=/usr/lib/whyred_ui.dylib,*app,backboardd modem=1 wifi=1 wifi_smmu=2 whyred_rtcoff=1767200547
+- Webcam shots (shot.sh) were black at the hotel: no view of the phone, the user tests by hand.
+- Auto-brightness needs the ambient light sensor (behind the sensor DSP); not done.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
