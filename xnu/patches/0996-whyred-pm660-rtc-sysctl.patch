@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 37cc6c5..4df0a31 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -3,13 +3,16 @@
+  * core 0x800f000, obsrvr 0x9400000, cnfg 0x800a000, EE 0). One observer channel per APID at
+  * obsrvr + 0x8000 * apid; EXT_READL of one byte, as sweet_keys.c. One write: whyred_spmi_write,
+  * through the APID's channel (chnls 0x8400000 + 0x8000 * apid), allowlisted registers only.
+- * Used by SweetBattery (sweetbattery=2) for the PM660 fuel gauge and charger status.
++ * Used by SweetBattery (sweetbattery=2) for the PM660 fuel gauge and charger status, and by
++ * kern.whyred_rtc (the PM660 RTC counter).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <kern/locks.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int whyred_spmi_init(void);
+@@ -32,6 +35,8 @@ static struct {
+ 	bool owned;             /* apps (EE 0) owns it: writes allowed */
+ } ws_slot[WS_SLOTS];
+ static unsigned ws_used;
++static LCK_GRP_DECLARE(ws_grp, "whyred_spmi");
++static LCK_MTX_DECLARE(ws_lock, &ws_grp);      /* SweetBattery's work loop and the RTC sysctl */
+ 
+ static uint32_t
+ ws_rd(vm_offset_t b, uint32_t o)
+@@ -101,9 +106,9 @@ ws_channel(uint16_t ppid)
+ 	return ch;
+ }
+ 
+-/* One byte at PMIC sid, 16-bit address addr. 0 on success. Callers are serialized (one work loop). */
+-int
+-whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++/* One byte at PMIC sid, 16-bit address addr. 0 on success. Called with ws_lock held. */
++static int
++ws_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	if (!ws_ready) {
+ 		return -1;
+@@ -132,8 +137,8 @@ whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  * The only registers this may write: PM660 (SID 1) LDO5 EN_CTL, the WCN3990 vdd-cx-mx supply
+  * (TopazModem.cpp, wifi=1). Linux turns it on through RPM-SMD; ABL leaves it off.
+  */
+-int
+-whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++static int
++ws_write_locked(unsigned sid, unsigned addr, uint8_t value)
+ {
+ 	if (!ws_ready || !(sid == 1 && addr == 0x4446)) {
+ 		printf("WHYRED SPMI: write %u:%#x refused\n", sid, addr);
+@@ -173,4 +178,62 @@ whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ 	}
+ 	return -1;
+ }
++int
++whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	lck_mtx_lock(&ws_lock);
++	int r = ws_read_locked(sid, addr, out);
++	lck_mtx_unlock(&ws_lock);
++	return r;
++}
++
++int
++whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	lck_mtx_lock(&ws_lock);
++	int r = ws_write_locked(sid, addr, value);
++	lck_mtx_unlock(&ws_lock);
++	return r;
++}
++
++/*
++ * The PM660 RTC (SID 0, RTC_RW at 0x6000, RDATA0-3 at 0x48, as Linux qpnp-rtc): seconds counted since the
++ * PMIC first got power. TZ refuses writes (hwclock -w: EPERM, 2026-11-23), so it never holds the real date.
++ * A boot script adds a saved offset to it to set the clock before anything writes 1970 dates.
++ */
++static int
++ws_rtc(uint32_t *secs)
++{
++	uint8_t b[4], again;
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (whyred_spmi_read(0, 0x6048 + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		if (whyred_spmi_read(0, 0x6048, &again) != 0) {
++			return -1;
++		}
++		if (again == b[0]) {
++			*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++sysctl_whyred_rtc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t secs = 0;
++	int64_t v = -1;
++	if (whyred_spmi_init() == 0 && ws_rtc(&secs) == 0) {
++		v = secs;
++	}
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_rtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_rtc, "Q", "whyred: PM660 RTC seconds (not the date: add the saved offset)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
