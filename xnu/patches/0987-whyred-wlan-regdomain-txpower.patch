@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 77d9380..5b0e9e7 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4574,6 +4574,32 @@ scan_start(void)
+ 		return;
+ 	}
+ 	scan_started = true;
++	/*
++	 * Regulatory domain and TX power, as ath10k_regd_update() and ath10k_mac_txpower_recalc() send
++	 * them: without them the firmware kept its built-in default, and on 2.4 GHz APs a few metres
++	 * away answered auth only now and then and never our assoc request (2026-11-23). ETSI1_WORLD
++	 * (0x37, Germany) with CTL_ETSI (0x30) on both bands; TX power limit 20 dBm (units of 0.5 dB).
++	 */
++	{
++		uint8_t rd[4 + 24], *q = wmi_put_tlv(rd, 0x51, 24);    /* PDEV_SET_REGDOMAIN_CMD */
++		q = put32(q, 0);
++		q = put32(q, 0x37);
++		q = put32(q, 0x37);
++		q = put32(q, 0x37);
++		q = put32(q, 0x30);
++		put32(q, 0x30);
++		bool r = wmi_send(0x4001, rd, sizeof(rd));
++		bool t2 = true, t5 = true;
++		for (uint32_t k = 0; k < 2; k++) {
++			uint8_t pp[4 + 12], *x = wmi_put_tlv(pp, 0x52, 12);  /* PDEV_SET_PARAM_CMD */
++			x = put32(x, 0);
++			x = put32(x, k == 0 ? 3 : 4);       /* TXPOWER_LIMIT2G / 5G */
++			put32(x, 40);
++			(k == 0 ? t2 : t5) = wmi_send(0x4003, pp, sizeof(pp));
++		}
++		LOG("t=%u ms: wlan: regdomain ETSI %s, tx power limit 2G %s 5G %s", g_ms, r ? "sent" : "FAILED",
++		    t2 ? "sent" : "FAILED", t5 ? "sent" : "FAILED");
++	}
+ 	/*
+ 	 * Channel list. Passive (bit 7) only on the 5 GHz radar channels 52-144 (with DFS, bit 10):
+ 	 * the firmware does not transmit on a passive channel until it has heard a beacon there,
