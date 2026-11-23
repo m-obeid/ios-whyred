@@ -1,0 +1,165 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 6bfe1a2..403947f 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -12,6 +12,11 @@
+  * SMEM, the APCS doorbell, SCM and the pool are TopazModem's (topaz_* calls). Polling only.
+  * Lesson from Windows: never boot the ADSP over SMEM state of an earlier run (the SoC reset):
+  * if item 443 or 480 exists, refuse.
++ *
++ * whyred (SDM636, patch 1001): the same PAS / SMP2P (items 443/429, APCS bit 10) / GLINK (APCS bit 9)
++ * path into the carveout 0x92a00000+0x1e00000. This ADSP speaks APR, not GPR: the GLINK channel
++ * "apr_audio_svc" carries APR packets, and the first goal is the core service's answer to
++ * AVCS_CMD_ADSP_EVENT_GET_STATE (Linux techpack/audio dsp/q6core.c: q6core_is_adsp_ready).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -36,13 +41,13 @@ extern "C" bool     topaz_part_fw_read(const char *path, uint64_t off, void *dst
+ 
+ #define ADSP_PID            2                   /* SMEM host / SMP2P / GLINK remote pid */
+ #define ADSP_PAS_ID         1
+-#define ADSP_CARVE_PA       0x53800000u         /* DT pil_adsp_region */
+-#define ADSP_CARVE_SIZE     0x02300000u
++#define ADSP_CARVE_PA       0x92a00000u         /* whyred DT adsp_fw_region (topaz 0x53800000) */
++#define ADSP_CARVE_SIZE     0x01e00000u         /* (topaz 0x02300000) */
+ #define ITEM_SMP2P_OUT      429                 /* apps -> adsp (DT qcom,smem = <443 429>: in, out) */
+ #define ITEM_SMP2P_IN       443                 /* adsp -> apps */
+ #define ITEM_ADSP_CRASH     423
+ #define ADSP_SMP2P_BIT      10
+-#define ADSP_GLINK_BIT      8
++#define ADSP_GLINK_BIT      9                   /* whyred DT glink adsp mboxes <apcs 9> (topaz 8) */
+ #define SMEM_GLOBAL_HOST    0xFFFE
+ 
+ #define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+@@ -1208,6 +1213,105 @@ gpr_poll(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- APR (whyred) */
++
++#define ACHAN                       "apr_audio_svc"
++#define APR_MSG_TYPE_SEQ_CMD        2
++#define APR_HDR_BYTES               20
++#define APR_HDR_FIELD               ((APR_MSG_TYPE_SEQ_CMD << 8) | ((APR_HDR_BYTES / 4) << 4) | 0)
++#define APR_DOMAIN_ADSP             4
++#define APR_DOMAIN_APPS             5
++#define APR_SVC_ADSP_CORE           3
++#define AVCS_CMD_ADSP_EVENT_GET_STATE       0x0001290Cu
++#define AVCS_CMDRSP_ADSP_EVENT_GET_STATE    0x0001290Du
++#define APR_BASIC_RSP_RESULT        0x000110E8u
++
++struct apr_hdr {
++	uint16_t hdr_field, pkt_size;
++	uint8_t  src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t  dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++static uint32_t apr_state = 0xFFFFFFFFu, apr_asks, apr_rxn, apr_token = 0x100;
++static unsigned apr_last_ask, apr_ready_ms;
++
++static void
++apr_rx(const uint8_t *data, uint32_t len)
++{
++	struct apr_hdr h;
++	if (len < sizeof(h)) {
++		LOG("APR: short packet (%u bytes)", len);
++		return;
++	}
++	memcpy(&h, data, sizeof(h));
++	uint32_t hlen = ((h.hdr_field >> 4) & 0xF) * 4u, p0 = 0, p1 = 0;
++	if (hlen < sizeof(h) || hlen > len) {
++		hlen = sizeof(h);
++	}
++	if (len >= hlen + 4) {
++		memcpy(&p0, data + hlen, 4);
++	}
++	if (len >= hlen + 8) {
++		memcpy(&p1, data + hlen + 4, 4);
++	}
++	if (apr_rxn++ < 16) {
++		LOG("t=%u.%03u APR rx svc %u.%u -> %u.%u opcode %#x token %#x, %u bytes, payload %#x %#x", T,
++		    h.src_domain, h.src_svc, h.dest_domain, h.dest_svc, h.opcode, h.token, len, p0, p1);
++	}
++	if (h.opcode == AVCS_CMDRSP_ADSP_EVENT_GET_STATE) {
++		if (p0 != apr_state) {
++			LOG("t=%u.%03u APR: ADSP state %u", T, p0);
++		}
++		apr_state = p0;
++		if (apr_state == 1 && apr_ready_ms == 0) {
++			apr_ready_ms = ms();
++			LOG("t=%u.%03u *** ADSP APR READY (q6core) ***", T);
++		}
++	}
++}
++
++static bool
++apr_send(uint8_t svc, uint32_t opcode, const void *payload, uint32_t len)
++{
++	uint8_t buf[256];
++	struct apr_hdr h = {};
++	if (APR_HDR_BYTES + len > sizeof(buf)) {
++		return false;
++	}
++	h.hdr_field = APR_HDR_FIELD;
++	h.pkt_size = (uint16_t)(APR_HDR_BYTES + len);
++	h.src_svc = svc;
++	h.src_domain = APR_DOMAIN_APPS;
++	h.dest_svc = svc;
++	h.dest_domain = APR_DOMAIN_ADSP;
++	h.token = apr_token++;
++	h.opcode = opcode;
++	memcpy(buf, &h, sizeof(h));
++	if (len != 0) {
++		memcpy(buf + APR_HDR_BYTES, payload, len);
++	}
++	return glink_send(ACHAN, buf, APR_HDR_BYTES + len);
++}
++
++/* Until the core service says 1: ask once a second (two minutes at most). */
++static void
++apr_poll(void)
++{
++	if (!glink_chan_up(ACHAN) || apr_state == 1 || apr_asks >= 120) {
++		return;
++	}
++	if (apr_asks != 0 && ms() - apr_last_ask < 1000) {
++		return;
++	}
++	apr_last_ask = ms();
++	if (apr_send(APR_SVC_ADSP_CORE, AVCS_CMD_ADSP_EVENT_GET_STATE, NULL, 0) && apr_asks++ < 3) {
++		LOG("t=%u.%03u APR: asked the core service for its state", T);
++	}
++}
++
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
+ 
+ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+@@ -1916,11 +2020,13 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		goto out;
+ 	}
+ 	glink_register(QCHAN, qrtr_rx);
+-	glink_register(GCHAN, gpr_rx);
++	glink_register(ACHAN, apr_rx);             /* whyred: APR (topaz registered GCHAN, gpr_rx) */
++	(void)gpr_rx;                               /* (kept for topaz; its channel is never opened here) */
+ 	for (;;) {
+ 		bool busy = glink_poll();
+ 		qrtr_poll();
+-		gpr_poll();
++		apr_poll();
++		gpr_poll();                             /* (returns at once: GCHAN is not up) */
+ 		stream_poll();
+ 		if (spf_state == 1 && !codec_tried) {
+ 			uint32_t tone = 0;
+@@ -1943,7 +2049,8 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (ms() - last_status >= 60000) {
+ 			last_status = ms();
+ 			LOG("t=%u.%03u status: slave-kernel %08x, qrtr node %x hello %u, %u services, %u lookups, pd-mapper %u, "
+-			    "SPF %d", T, *adsp_state, q_node, q_hello_rx, q_services, q_lookups, q_pdreqs, (int)spf_state);
++			    "SPF %d, APR state %d", T, *adsp_state, q_node, q_hello_rx, q_services, q_lookups, q_pdreqs, (int)spf_state,
++			    (int)apr_state);
+ 			glink_summary();
+ 		}
+ 		if (busy) {
