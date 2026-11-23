@@ -677,7 +677,16 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   clock from the RTC plus /var/root/whyred_rtc_offset and keeps the offset fresh. It works, but its
   first command ran after dasd had saved a 1970 date. Too late.
 - 0998: the kernel sets the clock from SweetBattery's 1 s timer while it reads before 2023, using
-  boot-arg whyred_rtcoff=1767200547 (added in the image build). CI 45226449453. Not yet verified.
+  boot-arg whyred_rtcoff=1767200547 (add it to the image's boot-args). CI 45226449453, image
+  whyred/out/xnu-ios-0998.img. Verified: "WHYRED RTC: clock set" twice before exec launchd (bsd_init
+  resets the calendar once, the next tick sets it again), phone matches the laptop to the second, dasd
+  saved lastModulation 2026-11-23 18:32, coreduetd 0.00 CPU-s per minute.
+- If the RTC loses power, the offset changes: take the new value from /var/root/whyred_rtc_offset
+  (the launchd job keeps it fresh) and rebuild the image with it.
+- Slow artifact downloads at the hotel (about 20 KB/s per connection to the Azure blob store, while the
+  line gives about 1 MB/s): fetch the zip with aria2c -x 8 -s 8 from the artifacts/ID/zip redirect.
+- Laptop note: VMware vmnet8 used 192.168.2.0/24, the hotel LAN, and owned the gateway address
+  192.168.2.1. Moved to 192.168.150.0/24 (backups *.bak in /etc/vmware).
 - CI: macOS arm64 runners often fail with "not acquired by Runner" (capacity). Use
   `-f runner=macos-15-intel`.
 
