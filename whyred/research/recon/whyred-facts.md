@@ -747,6 +747,22 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   InstantAmperage reads about 0 (ioreg prints negative values as unsigned 64-bit).
 - Boot with the screen on: first minute 81 % at row 4 (boot work), then mostly row 1 when idle.
 
+## Vibration motor (patch 1000, 2026-11-23)
+
+- Live DT qcom,haptic@c000 on PM660 (SID 1): ERM, play-mode direct, vmax 3000 mV, ilim 800 mA.
+  Register layout from the phone's Linux qpnp-haptic.c (lineage-21): STATUS 0x0a, EN_CTL 0x46 bit 7,
+  CFG1 0x4c bit 0 (1 = ERM), CFG2 0x4d, SEL 0x4e [5:4] (0 = direct), VMAX 0x51 [5:1] = mV/116, overdrive
+  bit 6, ILIM 0x52 bit 0 (1 = 800 mA), PLAY 0x70 bit 7. SEC_ACCESS 0xd0 (0xa5) only for TEST2 0xe3.
+- PPID 0x1c0 = APID 63, apps-owned: writes work. As found after Linux -> fastboot: status 0, en 0,
+  cfg1 0 (LRA), cfg2 0x1, sel 0, vmax 0x22, ilim 0, play 0.
+- 1000: whyred_spmi.c sets ERM/direct/3000 mV/800 mA on first use; sysctl kern.whyred_vibrate=MS (any
+  user, at most 2000 ms, 0 stops) runs EN_CTL+PLAY and a thread call stops it. Verified by the user:
+  three 700 ms buzzes. Also: SPMI write channels are now mapped once per slot (each write used to map).
+- CI 45260351732, image whyred/out/xnu-ios-1000.img (same boot-args as 0999).
+- iOS side, not done: iOS 16 turns vibration patterns into haptic sequences (VibeToHapticConverter,
+  loadAndPrepareHapticSequenceFromVibePattern:reply:, playVibePattern:gain:...) and plays them to a haptic
+  audio output; needs a HAL plug-in device that drives kern.whyred_vibrate.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
