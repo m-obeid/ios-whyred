@@ -732,6 +732,21 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Webcam shots (shot.sh) were black at the hotel: no view of the phone, the user tests by hand.
 - Auto-brightness needs the ambient light sensor (behind the sensor DSP); not done.
 
+## CPU load governor (patch 0999, 2026-11-23)
+
+- sweet_thermal.c now also picks the Gold OSM row by load every 50 ms: the busiest CPU's busy share
+  (whyred_cpu_idle_mach, osfmk/kern/recount.c, from recount_processor_usage) times the current speed
+  with 25 % headroom; to the top row from 90 % busy; down only after 4 looks. Floor row 1 (1113.6 MHz,
+  same voltage as row 0 at 288 MHz). Thermal steps set the ceiling. sweetgov=0 keeps the ceiling row.
+  Once a minute: "WHYRED GOV: last minute % at rows 0..4 ...". CI 45250324901, image xnu-ios-0999.img.
+- A/B, same kernel, screen off, 6 min settle then 4 min of sweettherm=2 readings, on USB power:
+  sweetgov=0: row 4 all the time, CPRH 792 mV, Gold 44.0 C. Governor: row 1 88-99 % of most minutes
+  (one minute 34 % at row 4 during background work), CPRH 684 mV average (664-668 at row 1), 43.2 C.
+- CPRH closed loop trims below the table: 792 mV at row 4 (table 840), about 666 at row 1 (table 700).
+- Battery current cannot show the gain while plugged in: near full the charger feeds the phone and
+  InstantAmperage reads about 0 (ioreg prints negative values as unsigned 64-bit).
+- Boot with the screen on: first minute 81 % at row 4 (boot work), then mostly row 1 when idle.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
