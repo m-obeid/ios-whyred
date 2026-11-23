@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index ee0e40f..04c4a31 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -4513,7 +4513,27 @@ static const uint16_t scan_freqs[] = {
+ 	5745, 5765, 5785, 5805, 5825,
+ };
+ #define NFREQ ((uint32_t)(sizeof(scan_freqs) / sizeof(scan_freqs[0])))
+-static const uint8_t our_mac[6] = { 0x02, 0x54, 0x4F, 0x50, 0x41, 0x5A };   /* locally administered */
++/*
++ * Our station address: random and locally administered, new each boot (as an iPhone's private
++ * address). It was fixed (02:54:4F:50:41:5A) and after about a dozen failed joins the hotel's
++ * Aruba APs acked our assoc requests but never answered them (2026-11-23); Linux on the same
++ * phone, with the factory address, joined at once.
++ */
++static uint8_t our_mac[6];
++static bool our_mac_set;
++
++static void
++w_mac_init(void)
++{
++	if (our_mac_set) {
++		return;
++	}
++	read_random(our_mac, sizeof(our_mac));
++	our_mac[0] = (uint8_t)((our_mac[0] & 0xFC) | 0x02);    /* unicast, locally administered */
++	our_mac_set = true;
++	LOG("wlan: station address %02x:%02x:%02x:%02x:%02x:%02x (random this boot)", our_mac[0], our_mac[1],
++	    our_mac[2], our_mac[3], our_mac[4], our_mac[5]);
++}
+ struct bss {
+ 	uint8_t bssid[6]; char ssid[33]; uint8_t chan; int8_t rssi; uint16_t seen;
+ 	uint8_t raw_ssid[32], raw_ssid_len; uint16_t freq, bintval, capab, ie_len; uint32_t last_ms; uint8_t ie[768];
+@@ -4627,6 +4647,7 @@ scan_start(void)
+ 	c = put32(c, 0);                            /* vdev 0 */
+ 	c = put32(c, 2);                            /* station */
+ 	c = put32(c, 0);
++	w_mac_init();
+ 	memcpy(c, our_mac, 6);
+ 	bool b = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
+ 	scanning = scan_send_start();
+@@ -4990,6 +5011,7 @@ topaz_wlan_ready(void)
+ void
+ topaz_wlan_address(uint8_t address[6])
+ {
++	w_mac_init();
+ 	memcpy(address, our_mac, 6);
+ }
+ 
