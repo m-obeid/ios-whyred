@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 04c4a31..f04a105 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5589,7 +5589,11 @@ w_mgmt_tx(const uint8_t *f, uint32_t len)
+ 	p = w_p32(p, buf);
+ 	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, buf);
+ 	memcpy(p, s_mgmt_va, buf);
+-	return wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++	bool sent = wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++	if (!sent) {
++		LOG("t=%u ms: mgmt tx %u: wmi_send FAILED", g_ms, s_desc);
++	}
++	return sent;
+ }
+ 
+ static uint32_t
+@@ -5963,6 +5967,19 @@ w_teardown(void)
+ 			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
+ 		}
+ 		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++		/*
++		 * Then a fresh vdev: after a failed join the firmware sent nothing more (no mgmt TX
++		 * completions for the next join, and the scans stopped; 2026-11-23). Delete vdev 0 and
++		 * create it again, as a station with our address.
++		 */
++		w_vdev_simple(0x5002, 0x57);                /* VDEV_DELETE */
++		uint8_t v[4 + 20] = {}, *c = wmi_put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
++		c = put32(c, 0);
++		c = put32(c, 2);                            /* station */
++		c = put32(c, 0);
++		memcpy(c, our_mac, 6);
++		bool ok = wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
++		LOG("t=%u ms: join: vdev 0 deleted and created again (%s)", g_ms, ok ? "sent" : "FAILED");
+ 	}
+ 	if (s_state == S_UP) {
+ 		w_link(false);
+@@ -6047,6 +6064,8 @@ w_join_begin(void)
+ 	}
+ 	s_msg1s = 0;
+ 	s_start_resp = false;
++	LOG("t=%u ms: join: wmi credits %u, queued %u, scanning %u", g_ms, wmi_eid != 0xFF ? ep[wmi_eid].credits : 0,
++	    wmiq_tail - wmiq_head, scanning);
+ 	LOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
+ 	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
+ 	w_ps_off();
