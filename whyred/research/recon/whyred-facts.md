@@ -635,6 +635,20 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   assoc reply (status 0, aid 1) 5 ms after the request, 4-way handshake done 9 ms later (2472 MHz,
   -49 dBm beat the 5 GHz BSS at -66 +15). 0993 also sets listen interval 1 and logs join candidates.
 
+## Wi-Fi auto-join after a reboot (2026-11-23)
+
+- wifid scans and finds the saved network, then logs "Join candidate ... is not allowed (error=(1 'Below
+  minimum RSSI threshold'))" for every BSS (-64 dBm included). Read with the unified log parser.
+- wifid (/usr/sbin/wifid, 0x100128a20): reject when scanResult.RSSI < threshold; the threshold
+  (0x10010b0a0) defaults to device[+0x80], set from driver[+0x100] = RSSI_THRESHOLD of
+  Apple80211CopyValue(106 RSSI_BOUNDS). Our kernel refused 106, so the threshold was 0 dBm.
+- IO80211 decodes 106 as 16 bytes: uint32 version, int32 RSSI_MIN @4, RSSI_MAX @8, RSSI_THRESHOLD @12.
+  0995 answers 1, -95, -30, -80. 0994 (noise -95, SNR in scan results, NOISE 17) did not change it.
+- Unified logs: the phone clock is 1969, so ls -t on Persist puts new tracev3 files last; take the
+  highest numbers. logd does not flush on /sbin/reboot.
+- Tools: ipsw (blacktop) extracts IO80211 from the IPSW's shared cache; 7z reads the local HFS+
+  snapshot whyred/ipsw/iosroot-snapshot-20261109.img (wifid at iOSRoot/usr/sbin/wifid).
+
 
 ## Not yet known
 
