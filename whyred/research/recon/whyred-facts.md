@@ -704,6 +704,11 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   CTServerConnection fails with (2, 5), and the restart handler reschedules itself every second.
 - Fix in whyred_ui.c (SpringBoard): the first _handleTelephonyDaemonRestart runs, later ones do nothing.
   Verified: display off and WLED off about 20 s after a SpringBoard restart, and it stays off.
+- ReportCrash then stood out (4 CPU-min): AegirPoster (Astronomy lock-screen wallpaper extension) crashed
+  96 times in one boot and PosterBoard relaunched it. Moved
+  /System/Library/CoreServices/AegirProxyApp.app/PlugIns/AegirPoster.appex to /var/root/disabled-plugins/.
+- Idle with both fixes and the screen off by auto-lock: about 6 CPU-s per 120 s, all processes summed
+  (ps time, whole seconds). Was about 25 earlier today, about 410 before the power work.
 - Install: whyred/userland/build.sh, then copy out/whyred_ui.dylib to /usr/lib/whyred_ui.dylib on the
   phone (previous copy /usr/lib/whyred_ui.dylib.bak) and restart SpringBoard.
 
