@@ -598,6 +598,29 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Wi-Fi icon: SBWiFiManager (bars from wifid SCALED_RSSI, dBm from RSSI.RSSI_CTL_AGR) reports
   bars 3, rssi -66, associated, primary interface (whyred_ui probe in SpringBoard, 2026-11-11).
 
+## Wi-Fi away from home (2026-11-23, hotel, Aruba APs)
+
+- 0984 (sandbox extensions) verified: Photos opens, library created.
+- Joins failed at the hotel. Findings, in order:
+  - 0985: the channel list marked every channel passive (bit 7); the firmware does not transmit on a
+    passive channel until it hears a beacon. Now passive only on radar channels 52-144 (+DFS bit 10).
+  - 0986: assoc request now carries HT capabilities and WMM when the AP has them; joins log frames
+    from the AP. 0987: regdomain ETSI1_WORLD (0x37, CTL 0x30) and TX power limit 20 dBm after WMI
+    ready, as ath10k does.
+  - Linux on the phone joined Hotel_Galeria at once, but was steered from the 2.4 GHz BSS to the same
+    AP's 5 GHz BSS (Aruba band steering). 0988 prefers 5 GHz (+15 dB when >= -80 dBm).
+  - 0989 logs WMI MGMT_TX_COMPLETION (event 0x7006: 0 acked, 1 discarded, 3 no ack): every auth and
+    assoc request is acked by the AP, inline or by DMA. The AP answers auth, never assoc.
+  - 0990: random locally administered address each boot (blacklist theory): no change, assoc still
+    unanswered on 5280 MHz.
+  - After a failed join the next join transmits nothing (no completions) and scans stop. 0991 deletes
+    and recreates vdev 0 after a failed join and logs WMI credits/queue at each join.
+- Unattended UI here: webcam sees the phone (shot.sh crop 620:320:570:530, transpose=1); tap mapping
+  phone_x = (cx-30)*2, phone_y = (cy-100)*2.15+45 on the 1200-px-tall crop. Keyboard join key
+  880,1958; backspace 950,1791. whyred_ui in Preferences types /var/mobile/whyred_type into the
+  first responder (owned by mobile).
+- Open: why the Aruba AP ignores our assoc request (content?). Next: compare with Linux's request.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
