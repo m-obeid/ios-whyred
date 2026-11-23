@@ -759,9 +759,18 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   user, at most 2000 ms, 0 stops) runs EN_CTL+PLAY and a thread call stops it. Verified by the user:
   three 700 ms buzzes. Also: SPMI write channels are now mapped once per slot (each write used to map).
 - CI 45260351732, image whyred/out/xnu-ios-1000.img (same boot-args as 0999).
-- iOS side, not done: iOS 16 turns vibration patterns into haptic sequences (VibeToHapticConverter,
-  loadAndPrepareHapticSequenceFromVibePattern:reply:, playVibePattern:gain:...) and plays them to a haptic
-  audio output; needs a HAL plug-in device that drives kern.whyred_vibrate.
+- iOS side: mediaserverd hosts AVHapticServer (AudioToolbox), but it never starts here: "ServerManager:
+  Failed to allocate HapticSynth (exception)", "-[AVHapticServer init]: ... server bailing out" (no
+  haptic audio output). So -[AVHapticServer playVibePattern:...] is never called (a hook there stayed silent).
+- whyred_ui.c interposes (dyld __interpose) AudioServicesPlaySystemSound, ...WithCompletion,
+  ...WithOptions, ...WithVibration and AudioServicesStopSystemSound in every injected process: a VibePattern
+  array (pairs on, ms) plays on the motor; system sound IDs that vibrate on an iPhone use a table (4095
+  vibrate 400 ms, 1011 400, 1106 power connected 150, 1350/1351 400, 1519/1520 80, 1521 three 80 ms).
+  Verified: the vibe test tool (whyred/userland/tools/vibe.c, needs "vibe" in kern.exec_inject) and
+  plugging in USB (SpringBoard plays 1106 with options nil) buzz the motor (user).
+- Not covered yet: CoreHaptics and UIKit feedback (UIImpactFeedbackGenerator), which go to AVHapticServer
+  directly. ToneLibrary alerts (ringtones, notifications) are expected to pass VibePattern options; not yet
+  seen on the phone (no notifications and no Clock app on this root).
 
 ## Not yet known
 

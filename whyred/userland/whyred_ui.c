@@ -771,6 +771,225 @@ bl_hook_thread(void *arg)
 	return NULL;
 }
 
+/*
+ * Vibration. iOS 16 renders vibrations in mediaserverd's AVHapticServer to a haptic audio output this
+ * phone lacks: "Failed to allocate HapticSynth", the server bails out and nothing plays. So the requests
+ * are caught where apps and SpringBoard make them (AudioToolbox's AudioServicesPlaySystemSound calls,
+ * interposed below) and drive the PM660 ERM motor through sysctl kern.whyred_vibrate (patch 1000).
+ */
+extern int sysctlbyname(const char *name, void *oldp, unsigned long *oldlenp, void *newp, unsigned long newlen);
+extern int usleep(unsigned int us);
+static volatile int vibe_gen;
+#define VIBE_MAX_STEPS 64
+
+struct vibe_job {
+	int gen, n;
+	int on[VIBE_MAX_STEPS], ms[VIBE_MAX_STEPS];
+};
+static struct vibe_job vibe_jobs[4];
+static int vibe_slot;
+
+static void
+motor(int ms)
+{
+	(void)sysctlbyname("kern.whyred_vibrate", NULL, NULL, &ms, sizeof(ms));
+}
+
+static void *
+vibe_thread(void *arg)
+{
+	struct vibe_job *j = arg;
+	for (int i = 0; i < j->n && j->gen == vibe_gen; i++) {
+		int ms = j->ms[i];
+		if (j->on[i] && ms > 0) {
+			motor(ms);
+		}
+		for (int t = 0; t < ms && j->gen == vibe_gen; t += 10) {
+			usleep(10000);
+		}
+	}
+	if (j->gen == vibe_gen) {
+		motor(0);
+	}
+	return NULL;
+}
+
+static id
+nsstr(const char *c)
+{
+	return (id)CFStringCreateWithCString(NULL, c, 0x08000100);
+}
+
+/* Play a VibePattern array (pairs: on, milliseconds) on the motor. 0 if it held no pattern. */
+static int
+vibe_array(id arr)
+{
+	unsigned long n = arr ? ((unsigned long (*)(id, SEL))objc_msgSend)(arr, sel_registerName("count")) : 0;
+	if (n < 2) {
+		return 0;
+	}
+	struct vibe_job *j = &vibe_jobs[vibe_slot++ & 3];
+	j->gen = ++vibe_gen;
+	j->n = 0;
+	for (unsigned long i = 0; i + 1 < n && j->n < VIBE_MAX_STEPS; i += 2) {
+		id a = ((id (*)(id, SEL, unsigned long))objc_msgSend)(arr, sel_registerName("objectAtIndex:"), i);
+		id b = ((id (*)(id, SEL, unsigned long))objc_msgSend)(arr, sel_registerName("objectAtIndex:"), i + 1);
+		j->on[j->n] = ((int (*)(id, SEL))objc_msgSend)(a, sel_registerName("intValue")) != 0;
+		j->ms[j->n] = ((int (*)(id, SEL))objc_msgSend)(b, sel_registerName("intValue"));
+		j->n++;
+	}
+	long t;
+	pthread_create(&t, NULL, vibe_thread, j);
+	return 1;
+}
+
+/* A dictionary that holds "VibePattern" (directly or under a vibration-pattern option): play it. */
+static int
+vibe_dict(id dict)
+{
+	if (dict == NULL) {
+		return 0;
+	}
+	static const char *const keys[] = { "VibePattern", "VibrationPattern", "AudioServicesPlaySystemSoundOptionVibrationPatternKey" };
+	for (unsigned k = 0; k < 3; k++) {
+		id key = nsstr(keys[k]);
+		id v = ((id (*)(id, SEL, id))objc_msgSend)(dict, sel_registerName("objectForKey:"), key);
+		CFRelease(key);
+		if (v == NULL) {
+			continue;
+		}
+		if (((signed char (*)(id, SEL, Class))objc_msgSend)(v, sel_registerName("isKindOfClass:"), objc_getClass("NSArray"))) {
+			return vibe_array(v);
+		}
+		if (((signed char (*)(id, SEL, Class))objc_msgSend)(v, sel_registerName("isKindOfClass:"), objc_getClass("NSDictionary"))) {
+			return vibe_dict(v);
+		}
+	}
+	return 0;
+}
+
+static void
+vibe_once(int ms)
+{
+	vibe_gen++;
+	motor(ms);
+}
+
+/*
+ * AudioToolbox's client calls, in every process with this library (dyld interposing). 4095 =
+ * kSystemSoundID_Vibrate.
+ */
+#define SSID_VIBRATE 4095u
+extern void AudioServicesPlaySystemSound(unsigned int ssid);
+extern void AudioServicesPlaySystemSoundWithCompletion(unsigned int ssid, id done);
+extern void AudioServicesPlaySystemSoundWithOptions(unsigned int ssid, id options, id done);
+extern void AudioServicesPlaySystemSoundWithVibration(unsigned int ssid, id unknown, id pattern);
+extern void AudioServicesStopSystemSound(unsigned int ssid, long a1, long a2);
+static int ss_logs;
+
+static void
+ss_log(const char *what, unsigned int ssid, id dict)
+{
+	if (ss_logs >= 12) {
+		return;
+	}
+	ss_logs++;
+	char b[24];
+	say(what, hex(b, ssid));
+	if (dict != NULL) {
+		say("  ", utf8(((id (*)(id, SEL))objc_msgSend)(dict, sel_registerName("description"))));
+	}
+}
+
+/*
+ * System sounds that vibrate on an iPhone, whose vibration mediaserverd adds by sound ID (not in the
+ * call). An ERM motor needs about 80 ms to be felt at all, so the short taps are 80 ms.
+ */
+static int
+ss_buzz(unsigned int ssid)
+{
+	static const struct { unsigned int id; int ms; } table[] = {
+		{ SSID_VIBRATE, 400 },  /* kSystemSoundID_Vibrate */
+		{ 1011, 400 },          /* SMS received, vibrate */
+		{ 1106, 150 },          /* power connected */
+		{ 1350, 400 },          /* ringer switched to vibrate */
+		{ 1351, 400 },          /* silent, vibrate */
+		{ 1519, 80 },           /* peek */
+		{ 1520, 80 },           /* pop */
+	};
+	for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+		if (table[i].id == ssid) {
+			vibe_once(table[i].ms);
+			return 1;
+		}
+	}
+	if (ssid == 1521) {                     /* "nope": three short */
+		struct vibe_job *j = &vibe_jobs[vibe_slot++ & 3];
+		j->gen = ++vibe_gen;
+		j->n = 6;
+		for (int i = 0; i < 6; i++) {
+			j->on[i] = (i % 2) == 0;
+			j->ms[i] = 80;
+		}
+		long t;
+		pthread_create(&t, NULL, vibe_thread, j);
+		return 1;
+	}
+	return 0;
+}
+
+static void
+my_play(unsigned int ssid)
+{
+	ss_log("system sound ", ssid, NULL);
+	(void)ss_buzz(ssid);
+	AudioServicesPlaySystemSound(ssid);
+}
+
+static void
+my_play_done(unsigned int ssid, id done)
+{
+	ss_log("system sound (completion) ", ssid, NULL);
+	(void)ss_buzz(ssid);
+	AudioServicesPlaySystemSoundWithCompletion(ssid, done);
+}
+
+static void
+my_play_opts(unsigned int ssid, id options, id done)
+{
+	ss_log("system sound (options) ", ssid, options);
+	if (!vibe_dict(options)) {
+		(void)ss_buzz(ssid);
+	}
+	AudioServicesPlaySystemSoundWithOptions(ssid, options, done);
+}
+
+static void
+my_play_vibe(unsigned int ssid, id unknown, id pattern)
+{
+	ss_log("system sound (vibration) ", ssid, pattern);
+	if (!vibe_dict(pattern)) {
+		(void)ss_buzz(ssid);
+	}
+	AudioServicesPlaySystemSoundWithVibration(ssid, unknown, pattern);
+}
+
+static void
+my_stop(unsigned int ssid, long a1, long a2)
+{
+	vibe_once(0);
+	AudioServicesStopSystemSound(ssid, a1, a2);
+}
+
+#define INTERPOSE(mine, theirs) \
+	__attribute__((used)) static const struct { const void *replacement, *replacee; } \
+	interpose_##theirs __attribute__((section("__DATA,__interpose"))) = { (const void *)mine, (const void *)theirs }
+INTERPOSE(my_play, AudioServicesPlaySystemSound);
+INTERPOSE(my_play_done, AudioServicesPlaySystemSoundWithCompletion);
+INTERPOSE(my_play_opts, AudioServicesPlaySystemSoundWithOptions);
+INTERPOSE(my_play_vibe, AudioServicesPlaySystemSoundWithVibration);
+INTERPOSE(my_stop, AudioServicesStopSystemSound);
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {

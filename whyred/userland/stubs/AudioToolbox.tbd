@@ -1,0 +1,8 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-ios ]
+install-name:    '/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox'
+exports:
+  - targets:     [ arm64-ios ]
+    symbols:     [ _AudioServicesPlaySystemSound, _AudioServicesPlaySystemSoundWithCompletion, _AudioServicesPlaySystemSoundWithOptions, _AudioServicesPlaySystemSoundWithVibration, _AudioServicesStopSystemSound ]
+...
