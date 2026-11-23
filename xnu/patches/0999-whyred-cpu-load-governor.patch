@@ -1,0 +1,258 @@
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 628a4c4..0701d8d 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -7,14 +7,23 @@
+  * OSM performance request (DCVS_PERF_STATE_DESIRED, perf block 0x179c3f10) down when hot and back
+  * up when cool. Linux's own step trip for these zones is 105 C, critical 115/125 C.
+  *
++ * Patch 0999 adds a load governor in the same thread. Every 50 ms it takes the busy share of the
++ * busiest CPU (whyred_cpu_idle_mach, osfmk/kern/recount.c) and picks the lowest OSM row that covers
++ * that load at the current speed with a quarter to spare; at once up, to the top row from 90 % busy,
++ * and down only after four looks in a row wanted less (to the most any of them wanted). The floor is
++ * row 1 (1113.6 MHz, 700 mV like row 0 at 288 MHz); the thermal steps set the ceiling. The idea and
++ * the numbers follow oosexgang/hakios-xnu-kernel drivers/board/cpufreq.c (MIT). The gain at idle is
++ * the voltage: 700 mV instead of 840 mV.
++ *
+  * boot-args: sweettherm=0 off, 1 on (default), 2 also log the temperature and LSE emulation
+- *            rates every 10 s. sweettherm_hot / sweettherm_cool: step thresholds in deci-C
++ *            rates every 10 s. sweetgov=0: no load governor, the ceiling row all the time. sweettherm_hot / sweettherm_cool: step thresholds in deci-C
+  *            (default 900 / 750, for testing the steps; the 105 C trip is fixed).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -40,6 +49,17 @@ static int COOL_DC = 750;                       /* step up at 75.0 C */
+ #define NO_TEMP                 (-100000)       /* no valid sensor */
+ #define POLL_MS                 500
+ #define UP_HOLD_POLLS           4               /* at most one step up every 2 s */
++#define GOV_MS                  50              /* how often the load is looked at */
++#define THERM_EVERY             (POLL_MS / GOV_MS)
++#define GOV_ROWS                5
++#define GOV_FLOOR               1
++#define GOV_HEADROOM_PCT        125
++#define GOV_UP_BUSY             90
++#define GOV_DOWN_LOOKS          4
++#define GOV_CPUS                8
++static const uint32_t gov_mhz[GOV_ROWS] = { 288, 1114, 1402, 1747, 1805 };   /* OSM rows 0..4 (shim) */
++extern uint64_t whyred_cpu_idle_mach(int cpu);  /* osfmk/kern/recount.c (patch 0999) */
++static int gov_on = 1;
+ 
+ /* osfmk/arm64/sleh.c (patch 0968): LSE/LDAPR emulation statistics. */
+ extern uint64_t sweet_lse_ops[11];
+@@ -88,11 +108,62 @@ gold_temp_dc(void)
+ }
+ 
+ static void
+-set_row(uint32_t row, int temp)
++write_row(uint32_t row)
+ {
+ 	*(volatile uint32_t *)(osm + OSM_DESIRED) = row;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	printf("WHYRED THERMAL: gold %d.%d C -> OSM row %u\n", temp / 10, temp % 10, row);
++}
++
++/* The busiest CPU's busy share since the last call, in percent. */
++static uint32_t
++gov_busy(void)
++{
++	static uint64_t last_idle[GOV_CPUS], last_t;
++	uint64_t now = mach_absolute_time(), dt = now - last_t;
++	uint32_t most = 0;
++	for (int c = 0; c < GOV_CPUS; c++) {
++		uint64_t idle = whyred_cpu_idle_mach(c);
++		if (idle == UINT64_MAX) {
++			continue;
++		}
++		if (last_t != 0 && dt != 0) {
++			uint64_t di = idle - last_idle[c];
++			uint32_t busy = di >= dt ? 0 : (uint32_t)((dt - di) * 100 / dt);
++			if (busy > most) {
++				most = busy;
++			}
++		}
++		last_idle[c] = idle;
++	}
++	last_t = now;
++	return most;
++}
++
++/* The row for the next GOV_MS, from the current one, the thermal ceiling and the load. */
++static uint32_t
++gov_pick(uint32_t cur, uint32_t cap, uint32_t busy)
++{
++	static uint32_t down_looks, down_most;
++	uint32_t need = gov_mhz[cur] * busy * GOV_HEADROOM_PCT / 10000, want = GOV_FLOOR;
++	while (want < cap && gov_mhz[want] < need) {
++		want++;
++	}
++	if (busy >= GOV_UP_BUSY || want > cap) {
++		want = cap;
++	}
++	if (want >= cur) {
++		down_looks = down_most = 0;
++		return want;
++	}
++	if (want > down_most) {
++		down_most = want;
++	}
++	if (++down_looks < GOV_DOWN_LOOKS) {
++		return cur;
++	}
++	want = down_most;
++	down_looks = down_most = 0;
++	return want;
+ }
+ 
+ /* Emulated LSE ops in the last interval, by op, and the four hottest PCs overall. */
+@@ -136,51 +207,78 @@ lse_report(unsigned secs)
+ static void
+ therm_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint32_t max_row = rd(osm, OSM_DESIRED), row = max_row;
+-	unsigned cool = 0, polls = 0, invalid = 0;
++	uint32_t max_row = rd(osm, OSM_DESIRED), cap = max_row, row = max_row;
++	unsigned cool = 0, polls = 0, invalid = 0, changes = 0;
++	uint64_t at_row[GOV_ROWS] = { 0 };
+ 
+ 	printf("WHYRED THERMAL: tsens trdy %#x, OSM enable %u, boot row %u, step down %d.%d C, up %d.%d C\n",
+ 	    rd(tsens, TSENS_TRDY), rd(osm, OSM_ENABLE), max_row, HOT_DC / 10, HOT_DC % 10,
+ 	    COOL_DC / 10, COOL_DC % 10);
+-	if (!(rd(osm, OSM_ENABLE) & 1u) || max_row == 0) {
++	if (!(rd(osm, OSM_ENABLE) & 1u) || max_row == 0 || max_row >= GOV_ROWS) {
+ 		printf("WHYRED THERMAL: OSM not enabled by the shim, nothing to govern\n");
+ 		return;
+ 	}
+-	for (;;) {
+-		int t = gold_temp_dc();
+-		if (t == NO_TEMP) {
+-			if ((invalid++ % 20u) == 0) {
+-				printf("WHYRED THERMAL: no valid Gold sensor reading (trdy %#x)\n", rd(tsens, TSENS_TRDY));
+-			}
+-		} else {
+-			invalid = 0;
+-			if (t >= CRIT_DC && row != 0) {
+-				row = 0;
+-				set_row(row, t);
+-				cool = 0;
+-			} else if (t >= HOT_DC && row > 1) {
+-				row--;
+-				set_row(row, t);
+-				cool = 0;
+-			} else if (t <= COOL_DC && row < max_row) {
+-				if (++cool >= UP_HOLD_POLLS) {
+-					row++;
+-					set_row(row, t);
+-					cool = 0;
++	printf("WHYRED GOV: %s, rows %u..%u, every %u ms\n", gov_on ? "by load" : "off (sweetgov=0)",
++	    GOV_FLOOR, max_row, GOV_MS);
++	for (;; polls++) {
++		if (polls % THERM_EVERY == 0) {
++			int t = gold_temp_dc();
++			uint32_t was = cap;
++			if (t == NO_TEMP) {
++				if ((invalid++ % 20u) == 0) {
++					printf("WHYRED THERMAL: no valid Gold sensor reading (trdy %#x)\n", rd(tsens, TSENS_TRDY));
+ 				}
+ 			} else {
+-				cool = 0;
++				invalid = 0;
++				if (t >= CRIT_DC && cap != 0) {
++					cap = 0;
++					cool = 0;
++				} else if (t >= HOT_DC && cap > 1) {
++					cap--;
++					cool = 0;
++				} else if (t <= COOL_DC && cap < max_row) {
++					if (++cool >= UP_HOLD_POLLS) {
++						cap++;
++						cool = 0;
++					}
++				} else {
++					cool = 0;
++				}
++				if (cap != was) {
++					printf("WHYRED THERMAL: gold %d.%d C -> OSM ceiling row %u\n", t / 10, t % 10, cap);
++				}
++				if (therm_mode == 2 && (polls % (10000 / GOV_MS)) == 0) {
++					uint32_t cs = rd(cprh, CPRH_STATUS);
++					printf("WHYRED THERMAL: gold %d.%d C, OSM row %u, CPRH corner %u %u mV\n", t / 10, t % 10,
++					    row, cs & 0x3fu, (cs >> 6) & 0xfffu);
++					lse_report(10);
++				}
+ 			}
+-			if (therm_mode == 2 && (polls % (10000 / POLL_MS)) == 0) {
+-				uint32_t cs = rd(cprh, CPRH_STATUS);
+-				printf("WHYRED THERMAL: gold %d.%d C, OSM row %u, CPRH corner %u %u mV\n", t / 10, t % 10,
+-				    row, cs & 0x3fu, (cs >> 6) & 0xfffu);
+-				lse_report(10);
++		}
++		uint32_t busy = gov_busy();
++		uint32_t next = gov_on ? gov_pick(row, cap, busy) : cap;
++		if (next > cap) {
++			next = cap;
++		}
++		if (next != row) {
++			write_row(next);
++			row = next;
++			changes++;
++		}
++		at_row[row]++;
++		if (polls % (60000 / GOV_MS) == 60000 / GOV_MS - 1) {
++			uint64_t n = polls + 1;
++			printf("WHYRED GOV: last minute %% at rows 0..4: %llu %llu %llu %llu %llu, %u changes, ceiling %u\n",
++			    at_row[0] * 100 / n, at_row[1] * 100 / n, at_row[2] * 100 / n, at_row[3] * 100 / n,
++			    at_row[4] * 100 / n, changes, cap);
++			for (int i = 0; i < GOV_ROWS; i++) {
++				at_row[i] = 0;
+ 			}
++			changes = 0;
++			polls = (unsigned)-1;           /* (the loop's increment makes it 0) */
+ 		}
+-		polls++;
+ 		uint64_t deadline;
+-		clock_interval_to_deadline(POLL_MS, NSEC_PER_MSEC, &deadline);
++		clock_interval_to_deadline(GOV_MS, NSEC_PER_MSEC, &deadline);
+ 		(void)assert_wait_deadline(&therm_chan, THREAD_UNINT, deadline);
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+@@ -197,6 +295,7 @@ sweet_thermal_init(void)
+ 	}
+ 	therm_mode = mode;
+ 	(void)PE_parse_boot_argn("sweettherm_hot", &HOT_DC, sizeof(HOT_DC));
++	(void)PE_parse_boot_argn("sweetgov", &gov_on, sizeof(gov_on));
+ 	(void)PE_parse_boot_argn("sweettherm_cool", &COOL_DC, sizeof(COOL_DC));
+ 	if (HOT_DC > CRIT_DC || COOL_DC >= HOT_DC) {
+ 		HOT_DC = 900;
+diff --git a/osfmk/kern/recount.c b/osfmk/kern/recount.c
+index 7c30ee9..5f30213 100644
+--- a/osfmk/kern/recount.c
++++ b/osfmk/kern/recount.c
+@@ -1196,3 +1196,22 @@ recount_usage_free(recount_topo_t topo, struct recount_usage *usage)
+ 	kfree_type(struct recount_usage, recount_topo_count(topo),
+ 	    usage);
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * whyred CPU governor (bsd/dev/sweet_thermal.c): a CPU's idle time so far, in Mach time, including the
++ * idle period it is in now. UINT64_MAX for a CPU number without a processor.
++ */
++uint64_t whyred_cpu_idle_mach(int cpu);
++uint64_t
++whyred_cpu_idle_mach(int cpu)
++{
++	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || processor_array[cpu] == PROCESSOR_NULL) {
++		return UINT64_MAX;
++	}
++	struct recount_usage usage = { 0 };
++	uint64_t idle = 0;
++	recount_processor_usage(&processor_array[cpu]->pr_recount, &usage, &idle);
++	return idle;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
