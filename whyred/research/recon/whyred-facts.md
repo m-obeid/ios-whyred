@@ -619,7 +619,17 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   phone_x = (cx-30)*2, phone_y = (cy-100)*2.15+45 on the 1200-px-tall crop. Keyboard join key
   880,1958; backspace 950,1791. whyred_ui in Preferences types /var/mobile/whyred_type into the
   first responder (owned by mobile).
-- Open: why the Aruba AP ignores our assoc request (content?). Next: compare with Linux's request.
+- Linux's assoc request to the same AP (wpa_supplicant "req_ies", 2.4 GHz): SSID, rates
+  82 84 0b 16 0c 12 18 24, HT cap 2d 01 13 ff.., RSN caps 08 00, ext rates 30 48 60 6c, op classes
+  51 53 54 73-78 7c-80 00 82 80, ext caps 00 00 08, WMM, Qualcomm vendor IE. AP answered in 4 ms.
+- 0992 sends the same layout: still acked and never answered (2026-11-23, kernel 45093259324).
+- 0991 verified: after a failed join the next one transmits again (completions logged).
+- Join chose 2472 MHz again on that boot (the 5 GHz BSS of Hotel_Galeria was not in the scan table).
+- Still open: the AP acks our assoc request and never answers; Linux on the same phone and AP is
+  answered. Not content (0992), not the address (0990), not band (5280 MHz also silent), not a scan
+  during the join. Untested ideas: listen interval 10 (Linux 1?), WMI mgmt TX params TLV, firmware
+  mgmt RX filtering of the assoc response, a passive-scan miss of the 5 GHz BSS.
+
 
 ## Not yet known
 
