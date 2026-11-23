@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index 2e52132..e507073 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -45,6 +45,9 @@
+ 
+ static int32_t last_rssi;                       /* whyred: what RSSI (16) answered last */
+ static unsigned rssi_asked;
++/* whyred: the firmware gives no noise floor; this one is typical (wifid turned down every network as "below
++ * minimum RSSI threshold" with noise 0 and SNR 0) */
++#define NOISE_DBM               (-95)
+ #include <sys/sockio.h>
+ #include <sys/systm.h>
+ 
+@@ -285,6 +288,9 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
+ 	result->rssi = bss->rssi;
++	result->noise_known = 1;
++	result->noise = NOISE_DBM;
++	result->snr = (int16_t)(bss->rssi - NOISE_DBM);
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+ 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
+@@ -466,6 +472,16 @@ get(struct apple80211req *request)
+ 		rssi_asked++;
+ 		break;
+ 	}
++	case 17: {                              /* the noise floor, laid out as RSSI (16) */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { NOISE_DBM }, .all = NOISE_DBM,
++			     .each_ext = { NOISE_DBM }, .all_ext = NOISE_DBM };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+@@ -682,6 +698,8 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		if (state != NULL) {
+ 			redwood_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			link.noise = status == 1 ? (uint16_t)NOISE_DBM : 0;
++			link.snr = status == 1 ? (uint16_t)(state->bss.rssi - NOISE_DBM) : 0;
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
