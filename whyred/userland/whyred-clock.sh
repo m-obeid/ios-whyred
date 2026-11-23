@@ -8,12 +8,25 @@ VALID=1700000000
 
 rtc() { /usr/sbin/sysctl -n kern.whyred_rtc 2>/dev/null; }
 
-r=$(rtc)
-now=$(/usr/bin/date +%s)
-if [ "${r:--1}" -ge 0 ] 2>/dev/null && [ -s "$F" ] && [ "$now" -lt "$VALID" ]; then
-	/usr/bin/date -u -s "@$((r + $(cat "$F")))" >/dev/null
-	echo "whyred-clock: set $(/usr/bin/date -u) from rtc $r"
-fi
+# Retry for a minute: at launchd start the RTC read or /var may not be ready yet.
+i=0
+while [ $i -lt 30 ]; do
+	r=$(rtc)
+	now=$(/usr/bin/date +%s)
+	off=$(cat "$F" 2>/dev/null)
+	if [ "$now" -ge "$VALID" ]; then
+		echo "whyred-clock: clock already valid ($now)"
+		break
+	fi
+	if [ "${r:--1}" -ge 0 ] 2>/dev/null && [ -n "$off" ]; then
+		/usr/bin/date -u -s "@$((r + off))" >/dev/null
+		echo "whyred-clock: set $(/usr/bin/date -u) from rtc $r, try $i"
+		break
+	fi
+	echo "whyred-clock: try $i: rtc '$r' offset '$off' now $now"
+	i=$((i + 1))
+	sleep 2
+done
 
 while :; do
 	r=$(rtc)

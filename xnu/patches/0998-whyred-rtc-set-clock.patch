@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index c3a170c..3c17608 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -13,6 +13,7 @@
+ #include <machine/machine_routines.h>
+ #include <kern/locks.h>
+ #include <sys/sysctl.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int whyred_spmi_init(void);
+@@ -236,4 +237,37 @@ sysctl_whyred_rtc SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_rtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_whyred_rtc, "Q", "whyred: PM660 RTC seconds (not the date: add the saved offset)");
++
++/*
++ * Called from SweetBattery's 1 s timer. While the calendar reads before 2023, set it to the RTC plus
++ * boot-arg whyred_rtcoff (the phone's /var/root/whyred_rtc_offset). This runs before launchd, so dasd
++ * no longer saves 1970 dates; the launchd job started too late for that (2026-11-23).
++ */
++void whyred_rtc_set_clock(void);
++void
++whyred_rtc_set_clock(void)
++{
++	static bool parsed;
++	static int64_t off = -1;
++	if (!parsed) {
++		parsed = true;
++		if (!PE_parse_boot_argn("whyred_rtcoff", &off, sizeof(off))) {
++			off = -1;
++		}
++	}
++	if (off <= 0) {
++		return;
++	}
++	clock_sec_t s;
++	clock_usec_t us;
++	clock_get_calendar_microtime(&s, &us);
++	if (s >= 1700000000) {
++		return;
++	}
++	uint32_t secs;
++	if (whyred_spmi_init() == 0 && ws_rtc(&secs) == 0) {
++		clock_set_calendar_microtime((clock_sec_t)(secs + off), 0);
++		printf("WHYRED RTC: clock set to %lld (rtc %u + offset %lld)\n", (long long)(secs + off), secs, off);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 7c26026..b9bf6c2 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -23,6 +23,7 @@ extern "C" int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
+ /* bsd/dev/whyred_spmi.c: read-only PMIC access on the whyred SPMI arbiter v3 */
+ extern "C" int whyred_spmi_init(void);
+ extern "C" int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" void whyred_rtc_set_clock(void);    /* PM660 RTC + boot-arg whyred_rtcoff */
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -526,6 +527,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 			 * whyred: the USBIN plugin bit every second, the full gauge read every 10 s or at once
+ 			 * when the cable comes or goes, so the charging state follows a plug within ~1 s.
+ 			 */
++			whyred_rtc_set_clock();
+ 			uint8_t usb;
+ 			int now = whyred_spmi_read(0, 0x1310, &usb) == 0 ? (usb & 0x10u) != 0 : -1;
+ 			if (++self->fTick >= 10 || (now >= 0 && now != self->fLastUsb)) {
