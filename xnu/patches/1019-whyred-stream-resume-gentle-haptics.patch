@@ -1,0 +1,172 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 38cd30d..bb7cbbd 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -315,6 +315,7 @@ whyred_rtc_set_clock(void)
+ 
+ static LCK_MTX_DECLARE(hap_lock, &ws_grp);
+ static bool hap_ready, hap_broken;
++static unsigned hap_mv = HAP_VMAX_MV;           /* VMAX as set now */
+ static thread_call_t hap_stop_call;
+ static int hap_last_ms;
+ 
+@@ -375,10 +376,9 @@ hap_stop_work(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	lck_mtx_unlock(&hap_lock);
+ }
+ 
+-/* Run the motor for ms milliseconds (0: stop now). 0 on success. */
+-int whyred_vibrate(int ms);
+-int
+-whyred_vibrate(int ms)
++/* Run the motor for ms milliseconds at mv millivolts (0 ms: stop now). 0 on success. */
++static int
++whyred_vibrate_mv(int ms, unsigned mv)
+ {
+ 	int r = 0;
+ 	lck_mtx_lock(&hap_lock);
+@@ -398,6 +398,10 @@ whyred_vibrate(int ms)
+ 		if (ms > HAP_MAX_MS) {
+ 			ms = HAP_MAX_MS;
+ 		}
++		mv = mv < 116u ? 116u : (mv > HAP_VMAX_MV ? HAP_VMAX_MV : mv);
++		if (mv / 116u != hap_mv / 116u && hap_rmw(HAP_VMAX, 0x7e, (uint8_t)((mv / 116u) << 1)) == 0) {
++			hap_mv = mv;
++		}
+ 		if (whyred_spmi_write(1, HAP_BASE + HAP_EN_CTL, 0x80) != 0 ||
+ 		    whyred_spmi_write(1, HAP_BASE + HAP_PLAY, 0x80) != 0) {
+ 			hap_off();
+@@ -412,6 +416,14 @@ whyred_vibrate(int ms)
+ 	return r;
+ }
+ 
++/* Run the motor for ms milliseconds at full strength (0: stop now). 0 on success. */
++int whyred_vibrate(int ms);
++int
++whyred_vibrate(int ms)
++{
++	return whyred_vibrate_mv(ms, HAP_VMAX_MV);
++}
++
+ static int
+ sysctl_whyred_vibrate SYSCTL_HANDLER_ARGS
+ {
+@@ -429,9 +441,9 @@ SYSCTL_PROC(_kern, OID_AUTO, whyred_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
+ 
+ /*
+  * /dev/redwood-haptic: the HAL plug-in's Actuator output (mono 16-bit, 48 kHz, one write per IO cycle)
+- * as motor time. The ERM motor has one speed, so a write whose peak reaches HAP_DEV_FLOOR keeps it
+- * running for the write's length plus HAP_DEV_TAIL ms, at least HAP_DEV_MIN ms (a tap). The motor is
+- * asked for HAP_DEV_AHEAD ms more, so a long waveform renews it every few writes, not on each one.
++ * as motor time. A write whose peak reaches HAP_DEV_FLOOR keeps the ERM motor running for the write's
++ * length, at least HAP_DEV_MIN ms (a tap), plus HAP_DEV_AHEAD ms so a long waveform renews it every
++ * other write. The peak sets the drive: HAP_DEV_LOW_MV at the floor up to full VMAX at full scale.
+  * Quiet writes let it stop on its own. Created by TopazAudio's thread (devfs is up by then).
+  */
+ #include <sys/conf.h>
+@@ -439,9 +451,9 @@ SYSCTL_PROC(_kern, OID_AUTO, whyred_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_
+ #include <miscfs/devfs/devfs.h>
+ 
+ #define HAP_DEV_FLOOR   1000    /* of 32768, about -30 dBFS */
+-#define HAP_DEV_MIN     30
+-#define HAP_DEV_TAIL    20
+-#define HAP_DEV_AHEAD   40
++#define HAP_DEV_MIN     20      /* 1018 ran a tap for 70 ms at 3000 mV: too strong for icon presses */
++#define HAP_DEV_AHEAD   15
++#define HAP_DEV_LOW_MV  1200u
+ 
+ static uint64_t hap_dev_until;  /* mach absolute time the motor was last asked to run until */
+ static unsigned hap_dev_said;
+@@ -481,18 +493,20 @@ hapdev_write(__unused dev_t dev, struct uio *uio, __unused int flag)
+ 	if (peak < HAP_DEV_FLOOR) {
+ 		return 0;
+ 	}
+-	uint32_t ms = frames / 48 + HAP_DEV_TAIL;
++	uint32_t ms = frames / 48;
+ 	ms = ms < HAP_DEV_MIN ? HAP_DEV_MIN : ms;
+ 	uint64_t now = mach_absolute_time(), need, ahead;
+ 	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &need);
+ 	nanoseconds_to_absolutetime((uint64_t)(ms + HAP_DEV_AHEAD) * NSEC_PER_MSEC, &ahead);
+ 	if (now + need > hap_dev_until) {
+ 		hap_dev_until = now + ahead;
+-		(void)whyred_vibrate((int)(ms + HAP_DEV_AHEAD));
+-		if (hap_dev_said < 8) {
++		unsigned mv = HAP_DEV_LOW_MV + (HAP_VMAX_MV - HAP_DEV_LOW_MV) * (unsigned)(peak - HAP_DEV_FLOOR) /
++		    (32768u - HAP_DEV_FLOOR);
++		(void)whyred_vibrate_mv((int)(ms + HAP_DEV_AHEAD), mv);
++		if (hap_dev_said < 32) {
+ 			hap_dev_said++;
+-			printf("WHYRED HAPTIC: actuator write %u frames, peak %d: motor %u ms\n", frames, peak,
+-			    ms + HAP_DEV_AHEAD);
++			printf("WHYRED HAPTIC: actuator write %u frames, peak %d: motor %u ms at %u mV\n", frames, peak,
++			    ms + HAP_DEV_AHEAD, mv);
+ 		}
+ 	}
+ 	return 0;
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index b2e6624..1c1ceff 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1242,6 +1242,9 @@ static uint32_t apr_state = 0xFFFFFFFFu, apr_asks, apr_rxn, apr_token = 0x100;
+ static volatile uint32_t apr_call_token, apr_call_op, apr_call_p0, apr_call_p1;
+ static volatile bool apr_call_done;
+ static volatile uint32_t apr_writes_done, apr_write_errs;
++/* the buffer address (lsw) of each write done, by count: the chunk the ADSP is finished with */
++#define APR_DONE_SLOTS  16
++static volatile uint32_t apr_done_lsw[APR_DONE_SLOTS];
+ static unsigned apr_last_ask, apr_ready_ms;
+ 
+ static void
+@@ -1272,6 +1275,7 @@ apr_rx(const uint8_t *data, uint32_t len)
+ 		if (len >= hlen + 16) {
+ 			memcpy(&status, data + hlen + 12, 4);
+ 		}
++		apr_done_lsw[apr_writes_done % APR_DONE_SLOTS] = p0;
+ 		apr_writes_done++;
+ 		if (status != 0 && apr_write_errs++ < 4) {
+ 			LOG("t=%u.%03u ASM: write done with status %#x", T, status);
+@@ -2307,7 +2311,7 @@ lpass_smmu_sid1(void)
+ 
+ static uint8_t *as_ring;
+ static uint64_t as_pa;
+-static uint32_t as_handle, as_sent, as_done_base, as_start_off, as_zeroed;
++static uint32_t as_handle, as_sent, as_zeroed;  /* counted across pauses, like apr_writes_done */
+ static bool as_ready;
+ static volatile bool as_playing;
+ static volatile uint32_t as_sent_off, as_write_off;
+@@ -2493,10 +2497,10 @@ as_start(void)
+ 	uint32_t p[4] = { 0, 0, 0, 0 };
+ 	int amp = tas_power(true);
+ 	int r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
+-	as_done_base = apr_writes_done;
+-	as_sent = 0;
+-	as_zeroed = 0;
+-	as_start_off = as_sent_off;
++	/*
++	 * No counter reset here: buffers sent before the last PAUSE are still with the ADSP and come back
++	 * first after RUN. Counting them as new ones blanked each new chunk before it played (1019).
++	 */
+ 	as_playing = true;
+ 	LOG("t=%u.%03u stream: playing (amp %d, run %d)", T, amp, r);
+ }
+@@ -2539,11 +2543,17 @@ as_poll(uint32_t below, uint32_t muted, bool vol_changed)
+ 	 * Chunks the ADSP is done with become silence: when the writer falls behind (or stops), what the
+ 	 * ADSP is handed next is zeros, not the ring's content of a second ago.
+ 	 */
+-	uint32_t done = apr_writes_done - as_done_base;
+-	if (as_zeroed < done) {
++	uint32_t done = apr_writes_done;
++	if (done - as_zeroed > APR_DONE_SLOTS) {
++		as_zeroed = done - APR_DONE_SLOTS;
++	}
++	if (as_zeroed != done) {
+ 		IOLockLock(as_lock);
+-		while (as_zeroed < done) {
+-			bzero(as_ring + (as_start_off + as_zeroed * AS_CHUNK) % AS_RING_BYTES, AS_CHUNK);
++		while (as_zeroed != done) {
++			uint32_t off = apr_done_lsw[as_zeroed % APR_DONE_SLOTS] - (uint32_t)as_pa;
++			if (off < AS_RING_BYTES) {
++				bzero(as_ring + off, MIN((uint32_t)AS_CHUNK, AS_RING_BYTES - off));
++			}
+ 			as_zeroed++;
+ 		}
+ 		IOLockUnlock(as_lock);
