@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 7a547a5..859bfd1 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2191,6 +2191,9 @@ static uint32_t audio_sid_msw;
+ #define AUDIO_SID_BITS_MSW              audio_sid_msw
+ 
+ extern "C" void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++extern "C" uint64_t topaz_scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count);
++#define VMID_HLOS                       3
++#define VMID_LPASS                      6       /* Linux techpack/audio msm_mdf.c */
+ 
+ /*
+  * SMMUv2 global space: sCR0, IDR0 (number of SMRs), SMR (0x800 + 4n) / S2CR (0xC00 + 4n). Nothing matches
+@@ -2263,6 +2266,18 @@ spk_tone(unsigned seconds)
+ 	}
+ 	mb();
+ 	LOG("stream: buffer %u bytes at pa %#llx", TONE_BUF_BYTES, pa);
++	/*
++	 * DDR outside the carve-outs belongs to HLOS; the ADSP's first read of an unshared buffer reset the
++	 * SoC (1008-1012, silently, also with the amplifier off). Share it with LPASS, as msm_mdf does.
++	 */
++	{
++		static const uint32_t vm[2] = { VMID_HLOS, VMID_LPASS };
++		uint64_t ar = topaz_scm_assign(pa, TONE_MAP_BYTES, vm, 2);
++		LOG("stream: buffer shared with HLOS + LPASS (hyp_assign): %#llx", ar);
++		if (ar != 0) {
++			return false;
++		}
++	}
+ 	IOSleep(1500);
+ 
+ 	bzero(p, sizeof(p));
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e427485..ffc74d7 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7258,6 +7258,13 @@ topaz_part_fw_read(const char *path, uint64_t off, void *dst, uint64_t n)
+ 	return i >= 0 && off + n <= fat_files[i].size && fw_all_read(i, off, dst, n);
+ }
+ 
++/* TopazAudio (whyred): share pool memory with other VMIDs (hyp_assign from HLOS, read-write) */
++extern "C" uint64_t
++topaz_scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count)
++{
++	return scm_assign(addr, size, vmids, count);
++}
++
+ extern "C" bool
+ topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ {
