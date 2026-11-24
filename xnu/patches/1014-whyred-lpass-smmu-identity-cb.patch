@@ -1,0 +1,132 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 859bfd1..9bdb485 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2196,44 +2196,83 @@ extern "C" uint64_t topaz_scm_assign(uint64_t addr, uint64_t size, const uint32_
+ #define VMID_LPASS                      6       /* Linux techpack/audio msm_mdf.c */
+ 
+ /*
+- * SMMUv2 global space: sCR0, IDR0 (number of SMRs), SMR (0x800 + 4n) / S2CR (0xC00 + 4n). Nothing matches
+- * stream id 1 after boot and unmatched streams fault (sCR0.USFCFG), so the ADSP cannot reach apps
+- * buffers. Linux's audio ION attaches SID 1 to a context bank; here a free SMR takes SID 1 with an
+- * S2CR of type bypass: buffer addresses are physical (identity).
++ * LPASS Q6 SMMU (0x5100000, qcom,skip-init): stream id 1 carries the ADSP's accesses to apps audio
++ * buffers (DT msm-audio-ion iommus <lpass_q6_smmu 1>). Nothing matches it after boot and unmatched
++ * streams fault. An S2CR of type bypass reads back as fault here (as on the anoc2 SMMU for WLAN), and
++ * the ADSP's first read of the buffer through it reset the SoC (1008-1012). So, as TopazModem's
++ * smmu_identity for WLAN: a free context bank with stage 1 off (SCTLR.M = 0, CBAR S1 translate / S2
++ * fault, like msm arm-smmu DOMAIN_ATTR_S1_BYPASS) and an SMR + S2CR (translate) pointing at it.
+  */
++#define LS_SIZE                         0x00040000u
++#define LS_CBAR                         0x0001f000u     /* S1_TRANS_S2_FAULT, S1 memattr WB */
++#define LS_CBA2R                        0x00000001u     /* VA64 */
++#define LS_SCTLR                        0x000000e0u     /* CFCFG|CFIE|CFRE, M = 0 */
++
+ static bool
+ lpass_smmu_sid1(void)
+ {
+-	vm_offset_t g = ml_io_map(LPASS_SMMU_PA, 0x1000);
+-	if (g == 0) {
++	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(LPASS_SMMU_PA, LS_SIZE);
++	if (s == NULL) {
+ 		LOG("stream: LPASS SMMU not mapped");
+ 		return false;
+ 	}
+-	uint32_t scr0 = trd(g, 0x0), idr0 = trd(g, 0x20), n = idr0 & 0xff, free_smr = 0xffffffffu;
+-	LOG("stream: LPASS SMMU sCR0 %#x (CLIENTPD %u, USFCFG %u) IDR0 %#x, %u SMRs", scr0, scr0 & 1, (scr0 >> 10) & 1, idr0, n);
+-	for (uint32_t i = 0; i < n && i < 128; i++) {
+-		uint32_t smr = trd(g, 0x800 + 4 * i), s2cr = trd(g, 0xC00 + 4 * i);
+-		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+-		if (!(smr & (1u << 31))) {
+-			if (free_smr == 0xffffffffu) {
+-				free_smr = i;
++	uint32_t cr0 = *(volatile uint32_t *)(s + 0x0), id0 = *(volatile uint32_t *)(s + 0x20), id1 = *(volatile uint32_t *)(s + 0x24);
++	uint32_t nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	uint32_t psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000, npage = 1u << (((id1 >> 28) & 7) + 1);
++	uint32_t slot = ~0u, cb = ~0u;
++	uint64_t used = 0;
++
++	LOG("stream: LPASS SMMU sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs, page %#x x%u", cr0, id0, id1, nsmr, ncb, psize, npage);
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = *(volatile uint32_t *)(s + 0x800 + 4 * i), s2cr = *(volatile uint32_t *)(s + 0xC00 + 4 * i);
++		bool valid = (smr >> 31) != 0;
++		if (valid && ((smr & 0x7fff) & ~((smr >> 16) & 0x7fff)) == (1u & ~((smr >> 16) & 0x7fff))) {
++			LOG("stream: SMR%u %08x S2CR %08x already matches SID 1", i, smr, s2cr);
++			if (((s2cr >> 16) & 3) == 0) {
++				return true;            /* translating to a bank already */
+ 			}
+-			continue;
++			slot = i;
++		} else if (!valid && slot == ~0u) {
++			slot = i;
+ 		}
+-		if ((1u & ~mask) == (id & ~mask)) {
+-			LOG("stream: SMR %u %#x S2CR %#x already matches SID 1", i, smr, s2cr);
+-			return true;
++		if (valid && ((s2cr >> 16) & 3) == 0) {
++			used |= 1ull << (s2cr & 0x3f);
+ 		}
+ 	}
+-	if (free_smr == 0xffffffffu) {
+-		LOG("stream: no free SMR");
++	for (uint32_t i = 4; i < ncb && i < 64; i++) {
++		if ((used & (1ull << i)) == 0) {
++			cb = i;
++			break;
++		}
++	}
++	if (slot == ~0u || cb == ~0u || (uint64_t)(npage + cb + 1) * psize > LS_SIZE) {
++		LOG("stream: no free SMR/CB (slot %u cb %u)", slot, cb);
+ 		return false;
+ 	}
+-	twr(g, 0xC00 + 4 * free_smr, 1u << 16);         /* S2CR: type bypass */
+-	twr(g, 0x800 + 4 * free_smr, (1u << 31) | 1u);  /* SMR: valid, id 1, mask 0 */
+-	LOG("stream: SMR %u -> SID 1, S2CR bypass (now SMR %#x S2CR %#x)", free_smr, trd(g, 0x800 + 4 * free_smr),
+-	    trd(g, 0xC00 + 4 * free_smr));
+-	return true;
++	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
++	LOG("stream: CB%u at +%llx, SMR%u: programming", cb, (uint64_t)(cbp - s), slot);
++	mb();
++	*(volatile uint32_t *)(cbp + 0x58) = 0xFFFFFFFFu;      /* FSR: clear */
++	*(volatile uint32_t *)(cbp + 0x20) = 0;                /* TTBR0 */
++	*(volatile uint32_t *)(cbp + 0x24) = 0;
++	*(volatile uint32_t *)(cbp + 0x30) = 0;                /* TCR */
++	*(volatile uint32_t *)(cbp + 0x10) = 0;                /* TCR2 */
++	*(volatile uint32_t *)(cbp + 0x38) = 0;                /* MAIR */
++	*(volatile uint32_t *)(cbp + 0x3C) = 0;
++	*(volatile uint32_t *)(gr1 + 0x800 + 4 * cb) = LS_CBA2R;
++	*(volatile uint32_t *)(gr1 + 0x000 + 4 * cb) = LS_CBAR;
++	mb();
++	*(volatile uint32_t *)(cbp + 0x0) = LS_SCTLR;          /* SCTLR last */
++	mb();
++	*(volatile uint32_t *)(s + 0xC00 + 4 * slot) = cb;     /* S2CR: translate, this bank */
++	mb();
++	*(volatile uint32_t *)(s + 0x800 + 4 * slot) = (1u << 31) | 1u;   /* SMR: valid, id 1, mask 0 (last) */
++	mb();
++	LOG("stream: CB%u SCTLR %08x CBAR %08x, SMR%u %08x S2CR %08x (type %u cb %u)", cb, *(volatile uint32_t *)(cbp + 0x0),
++	    *(volatile uint32_t *)(gr1 + 4 * cb), slot, *(volatile uint32_t *)(s + 0x800 + 4 * slot),
++	    *(volatile uint32_t *)(s + 0xC00 + 4 * slot), (*(volatile uint32_t *)(s + 0xC00 + 4 * slot) >> 16) & 3,
++	    *(volatile uint32_t *)(s + 0xC00 + 4 * slot) & 0x3f);
++	return ((*(volatile uint32_t *)(s + 0xC00 + 4 * slot) >> 16) & 3) == 0;
+ }
+ 
+ static bool
+@@ -2266,18 +2305,6 @@ spk_tone(unsigned seconds)
+ 	}
+ 	mb();
+ 	LOG("stream: buffer %u bytes at pa %#llx", TONE_BUF_BYTES, pa);
+-	/*
+-	 * DDR outside the carve-outs belongs to HLOS; the ADSP's first read of an unshared buffer reset the
+-	 * SoC (1008-1012, silently, also with the amplifier off). Share it with LPASS, as msm_mdf does.
+-	 */
+-	{
+-		static const uint32_t vm[2] = { VMID_HLOS, VMID_LPASS };
+-		uint64_t ar = topaz_scm_assign(pa, TONE_MAP_BYTES, vm, 2);
+-		LOG("stream: buffer shared with HLOS + LPASS (hyp_assign): %#llx", ar);
+-		if (ar != 0) {
+-			return false;
+-		}
+-	}
+ 	IOSleep(1500);
+ 
+ 	bzero(p, sizeof(p));
