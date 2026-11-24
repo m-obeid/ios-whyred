@@ -804,8 +804,30 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   Reset GPIO 77 low 5 ms then high. 1003 (verified): book 0 / page 0, register 3 = 0xa0 (PG2.1): the
   firmware is tas2557_uCDSP.bin (24 KB, in whyred-linux build/firmware; vendor file, not in git).
   pm660l_l6 (its supply) was already on.
-- Next: the TAS2557 configuration (TI firmware format: programs, configurations, register blocks) and
-  PCM through ASM + ADM routing to PRI_MI2S_RX.
+- TAS2557 configuration (1004, 1006): our parser of tas2557_uCDSP.bin (TI PPC format, driver version
+  0x400: 4 PLLs, 4 programs, 7 configurations; program 0 "Tuning Mode", configuration 0 48 kHz / BCLK
+  1.536 MHz). Sequence as tas2557_set_program + enable: SW reset, defaults (SAR ADC2, clock error
+  controls, safe guard 0x5a, ASI1 16 bit + DOUT tri-state), program blocks (type 1, program checksum
+  verified via CRC regs 0/0/33 + 0/0/32), PLL, configuration pre (4) and coefficients (3), startup,
+  unmute (soft mute is book 100). Result: power 0xf8/0xa3, speaker control 0x7c. The QUP staging buffer
+  must hold the 48-byte bursts (1006: 40 refused them).
+- Stream (1005-1015): APR ASM (svc 7, port session << 8 | 1) and ADM (svc 8). ASM_CMD_SHARED_MEM_MAP_REGIONS
+  (pool 3 = 4K: whole pages only, else EBADPARAM) -> ASM_CMDRSP handle; OPEN_WRITE_V3 (PCM v2, no
+  post-proc 0x10C68); MEDIA_FMT_UPDATE_V2 (24 bytes); ADM_CMD_DEVICE_OPEN_V5 (28 bytes exactly, 32 gave
+  EBADPARAM; RX COPP, port 0x1000, NULL_COPP_TOPOLOGY) -> COPP 0; MATRIX_MAP_ROUTINGS_V5; RUN_V2;
+  DATA_CMD_WRITE_V2. WRITE_DONE payload is {addr lsw, addr msw, handle, status}.
+- LPASS Q6 SMMU (0x5100000, 13 SMRs, 14 CBs, skip-init): nothing matches SID 1 after boot and unmatched
+  streams fault. An S2CR bypass reads back as type 2 (fault): the ADSP's first buffer read then reset the
+  SoC silently (1008-1013; RUN without data was fine for 4.8 s, the amplifier off changed nothing,
+  hyp_assign to LPASS VMID 6 returned -2 and is not what Linux does). Fix (1014): identity context bank
+  CB4 (CBAR 0x1f000, SCTLR 0xe0 M=0), SMR0 SID 1 -> S2CR translate CB4, and buffer addresses carry
+  SID 1 in the high word (boot-arg adsp_sid=1, as Linux msm_audio_ion). CB FSR shows no fault.
+- FIRST SOUND (2026-11-24, image adsp=1 adsp_amp=1 adsp_sid=1, CI 45380606248): 34 writes of 100 ms of a
+  1 kHz sine (peak 2000, about -24 dBFS) played; the laptop microphone recorded a pure 1 kHz tone (+80 dB
+  over the neighbouring bins, clipping the mic) for the 3.5 s the buffers last. The TAS2557 gain is
+  probably high: lower it before louder tests.
+- Next: continuous streaming (ring buffer + write-done pacing), /dev/topaz-audio for the iOS HAL plug-in
+  (userland/audio/audio_plugin.c), volume, adsp_sid=1 as the default.
 
 ## Not yet known
 
