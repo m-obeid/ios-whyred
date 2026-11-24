@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 705845e..38cd30d 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -426,4 +426,96 @@ sysctl_whyred_vibrate SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_whyred_vibrate, "I", "whyred: run the vibration motor for N ms (0 stops it)");
++
++/*
++ * /dev/redwood-haptic: the HAL plug-in's Actuator output (mono 16-bit, 48 kHz, one write per IO cycle)
++ * as motor time. The ERM motor has one speed, so a write whose peak reaches HAP_DEV_FLOOR keeps it
++ * running for the write's length plus HAP_DEV_TAIL ms, at least HAP_DEV_MIN ms (a tap). The motor is
++ * asked for HAP_DEV_AHEAD ms more, so a long waveform renews it every few writes, not on each one.
++ * Quiet writes let it stop on its own. Created by TopazAudio's thread (devfs is up by then).
++ */
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++
++#define HAP_DEV_FLOOR   1000    /* of 32768, about -30 dBFS */
++#define HAP_DEV_MIN     30
++#define HAP_DEV_TAIL    20
++#define HAP_DEV_AHEAD   40
++
++static uint64_t hap_dev_until;  /* mach absolute time the motor was last asked to run until */
++static unsigned hap_dev_said;
++void whyred_haptic_dev_init(void);
++
++static int
++hapdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++hapdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++hapdev_write(__unused dev_t dev, struct uio *uio, __unused int flag)
++{
++	int16_t buf[512];
++	uint32_t frames = 0;
++	int peak = 0;
++
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf)) & ~1;
++		int err = uiomove((char *)buf, (int)n, uio);
++		if (err != 0) {
++			return err;
++		}
++		for (int i = 0; i < n / 2; i++) {
++			int v = buf[i] < 0 ? -buf[i] : buf[i];
++			peak = v > peak ? v : peak;
++		}
++		frames += (uint32_t)(n / 2);
++	}
++	if (peak < HAP_DEV_FLOOR) {
++		return 0;
++	}
++	uint32_t ms = frames / 48 + HAP_DEV_TAIL;
++	ms = ms < HAP_DEV_MIN ? HAP_DEV_MIN : ms;
++	uint64_t now = mach_absolute_time(), need, ahead;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &need);
++	nanoseconds_to_absolutetime((uint64_t)(ms + HAP_DEV_AHEAD) * NSEC_PER_MSEC, &ahead);
++	if (now + need > hap_dev_until) {
++		hap_dev_until = now + ahead;
++		(void)whyred_vibrate((int)(ms + HAP_DEV_AHEAD));
++		if (hap_dev_said < 8) {
++			hap_dev_said++;
++			printf("WHYRED HAPTIC: actuator write %u frames, peak %d: motor %u ms\n", frames, peak,
++			    ms + HAP_DEV_AHEAD);
++		}
++	}
++	return 0;
++}
++
++static const struct cdevsw hapdev_cdevsw = {
++	.d_open = hapdev_open, .d_close = hapdev_close, .d_read = eno_rdwrt, .d_write = hapdev_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc,
++	.d_type = 0,
++};
++
++void
++whyred_haptic_dev_init(void)
++{
++	static bool done;
++	if (done) {
++		return;
++	}
++	done = true;
++	int major = cdevsw_add(-1, &hapdev_cdevsw);
++	void *node = major < 0 ? NULL :
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
++	printf("WHYRED HAPTIC: /dev/redwood-haptic: %s\n", node != NULL ? "ready" : "failed");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 1ded2cb..b2e6624 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -3246,6 +3246,8 @@ audio_dev_init(void)
+ 
+ /* ---------------------------------------------------------------- thread */
+ 
++extern "C" void whyred_haptic_dev_init(void);
++
+ static void
+ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -3298,6 +3300,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		gpr_poll();                             /* (returns at once: GCHAN is not up) */
+ 		if (apr_state == 1 && !afe_tried) {
+ 			afe_tried = true;
++			whyred_haptic_dev_init();       /* the plug-in's Actuator output (bsd/dev/whyred_spmi.c) */
+ 			afe_up = afe_bringup();
+ 			LOG("t=%u.%03u *** AFE speaker port %s ***", T, afe_up ? "RUNNING" : "failed");
+ 			if (tas_probe()) {
