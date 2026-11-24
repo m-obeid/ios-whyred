@@ -877,3 +877,8 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Verified by the user on whyred/out/xnu-ios-1019.img (CI 45462569242, default boot-args): first iOS sound
   heard (power connected, "clean and normal"), ringtone previews and repeated charger sounds play, long-press
   haptics felt.
+- Settings shows "Sounds & Haptics" (PreferencesUI SOUNDS_AND_HAPTICS) behind MobileGestalt key
+  gqDnklGQnpv5ilgh5uHckw (plain name unknown), 0 here. Set to true in the same CacheExtra (2026-11-24).
+- Volume buttons with nothing playing change the ringer volume (SpringBoard "activeVolumeCategoryName:
+  Ringtone", Ringer HUD with a bell); the log shows setRingerSilent: false every time. Before audio worked
+  there were no categories and only the plain volume bar appeared.
