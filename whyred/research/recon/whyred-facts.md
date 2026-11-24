@@ -826,8 +826,18 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   1 kHz sine (peak 2000, about -24 dBFS) played; the laptop microphone recorded a pure 1 kHz tone (+80 dB
   over the neighbouring bins, clipping the mic) for the 3.5 s the buffers last. The TAS2557 gain is
   probably high: lower it before louder tests.
-- Next: continuous streaming (ring buffer + write-done pacing), /dev/topaz-audio for the iOS HAL plug-in
-  (userland/audio/audio_plugin.c), volume, adsp_sid=1 as the default.
+- Continuous stream (1016, 1017; image whyred/out/xnu-ios-1017.img + adsp=1, CI 45386865744):
+  /dev/topaz-audio and /dev/redwood-audio (the HAL plug-in's) feed a 1 s ring mapped once; 20 ms chunks,
+  4 in flight, the next on each write-done; RUN on frames, PAUSE + TAS2557 shutdown 0.5 s after the last;
+  volume = sample scaling from the plug-in's ioctl; SID bits on by default; idle audio thread waits 20 ms
+  (was 2 ms polling). 1017 zeroes each chunk the ADSP is done with: without it the ADSP was handed the
+  ring's content of a second ago whenever the writer fell behind (tones ran long, gaps vanished).
+- Test: whyred/userland/tools/pcmplay.c (raw 48 kHz 16-bit stereo, paced on the clock) with a file of
+  500 / 1000 / 2000 Hz, 0.6 s each + 0.3 s silence. Laptop mic: the three tones in order, total length
+  as the file, nothing replayed after the end; each run 129600 frames in, 0 dropped, 1 underrun (the start).
+  Gaps not confirmed (a later recording was drowned in room noise).
+- Next: the HAL plug-in (userland/audio/audio_plugin.c) on the phone, VirtualAudio.plugin back from
+  /Library/Audio/Plug-Ins/HAL.disabled, adsp=1 in the default boot-args, TAS2557 gain check.
 
 ## Not yet known
 
