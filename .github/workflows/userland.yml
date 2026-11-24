@@ -1,0 +1,42 @@
+name: userland
+
+# iOS userland pieces that need Apple's iOS SDK (the Linux build of whyred/userland has none):
+# RedwoodAudio.driver, the HAL plug-in that gives mediaserverd the speaker (userland/audio).
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: runner label
+        default: macos-15-intel
+  push:
+    branches: [whyred]
+    paths:
+      - "userland/audio/**"
+      - ".github/workflows/userland.yml"
+
+jobs:
+  audio:
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: RedwoodAudio.driver
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          mkdir -p out/RedwoodAudio.driver
+          # iPhone X userland is arm64 (A11, no arm64e)
+          xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -Wall \
+            -bundle -o out/RedwoodAudio.driver/RedwoodAudio \
+            -I userland/audio userland/audio/audio_plugin.c -framework CoreFoundation
+          plutil -convert binary1 -o out/RedwoodAudio.driver/Info.plist userland/audio/audio_plugin.plist
+          codesign -f -s - out/RedwoodAudio.driver/RedwoodAudio
+          file out/RedwoodAudio.driver/RedwoodAudio
+          (cd out && shasum -a 256 RedwoodAudio.driver/RedwoodAudio RedwoodAudio.driver/Info.plist > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redwood-audio-driver
+          path: |
+            out/RedwoodAudio.driver
+            out/SHA256SUMS
