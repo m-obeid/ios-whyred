@@ -1,0 +1,179 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 403947f..7a7646c 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1236,6 +1236,8 @@ struct apr_hdr {
+ } __attribute__((packed));
+ 
+ static uint32_t apr_state = 0xFFFFFFFFu, apr_asks, apr_rxn, apr_token = 0x100;
++static volatile uint32_t apr_call_token, apr_call_op, apr_call_p0, apr_call_p1;
++static volatile bool apr_call_done;
+ static unsigned apr_last_ask, apr_ready_ms;
+ 
+ static void
+@@ -1261,6 +1263,13 @@ apr_rx(const uint8_t *data, uint32_t len)
+ 		LOG("t=%u.%03u APR rx svc %u.%u -> %u.%u opcode %#x token %#x, %u bytes, payload %#x %#x", T,
+ 		    h.src_domain, h.src_svc, h.dest_domain, h.dest_svc, h.opcode, h.token, len, p0, p1);
+ 	}
++	if (apr_call_token != 0 && h.token == apr_call_token) {
++		apr_call_op = h.opcode;
++		apr_call_p0 = p0;
++		apr_call_p1 = p1;
++		apr_call_done = true;
++		return;
++	}
+ 	if (h.opcode == AVCS_CMDRSP_ADSP_EVENT_GET_STATE) {
+ 		if (p0 != apr_state) {
+ 			LOG("t=%u.%03u APR: ADSP state %u", T, p0);
+@@ -1312,6 +1321,130 @@ apr_poll(void)
+ 	}
+ }
+ 
++/*
++ * One APR command to service svc, pumping GLINK until the reply with its token. The result: the status
++ * of APR_BASIC_RSP_RESULT (0 = done), 0 for any other reply, -1 when nothing came.
++ */
++static int
++apr_call(uint8_t svc, uint32_t opcode, const void *payload, uint32_t len, unsigned timeout_ms)
++{
++	apr_call_done = false;
++	apr_call_token = apr_token;             /* (apr_send uses this token next) */
++	if (!apr_send(svc, opcode, payload, len)) {
++		apr_call_token = 0;
++		LOG("APR %#x: send failed", opcode);
++		return -1;
++	}
++	for (unsigned t = ms(); !apr_call_done && ms() - t < timeout_ms;) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++	}
++	apr_call_token = 0;
++	if (!apr_call_done) {
++		LOG("APR %#x: no reply", opcode);
++		return -1;
++	}
++	if (apr_call_op == APR_BASIC_RSP_RESULT) {
++		return (int)apr_call_p1;        /* payload: opcode, status */
++	}
++	return 0;
++}
++
++/* ---------------------------------------------------------------- AFE: the speaker's MI2S port (whyred) */
++
++/*
++ * The TAS2557 (I2C 0xc1b6000 @0x4c) takes its samples from the Primary MI2S port (Linux sdm660-internal.c
++ * PRI_MI2S_RX -> "tas2557 ASI1"; DT msm-dai-q6-mi2s-prim rx-lines 1 = SD0), pins GPIO 12 SCK, 13 WS,
++ * 14 SD0, 15 SD1 (DT pri_mi2s_*_active: functions pri_mi2s / pri_mi2s_ws, 8 mA, no pull). The ADSP owns
++ * the LPASS clocks: AFE_SVC_CMD_SET_PARAM with AFE_PARAM_ID_CLOCK_SET for the bit clock, then the port's
++ * I2S configuration and AFE_PORT_CMD_DEVICE_START (techpack/audio dsp/q6afe.c, v1 parameter packets).
++ */
++#define APR_SVC_AFE                     4
++#define AFE_PORT_PRI_MI2S_RX            0x1000
++#define AFE_SVC_CMD_SET_PARAM           0x000100F3u
++#define AFE_PORT_CMD_SET_PARAM_V2       0x000100EFu
++#define AFE_PORT_CMD_DEVICE_START       0x000100E5u
++#define AFE_MODULE_CLOCK_SET            0x0001028Fu
++#define AFE_PARAM_ID_CLOCK_SET          0x00010290u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE  0x0001020Cu
++#define AFE_PARAM_ID_I2S_CONFIG         0x0001020Du
++#define LPASS_CLK_ID_PRI_MI2S_IBIT      0x100
++#define TLMM_NORTH_PA                   0x03900000u
++#define SPK_RATE                        48000u
++#define SPK_BITS                        16u
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++static bool afe_up;
++
++static void
++mi2s_pins(void)
++{
++	static const struct { uint32_t gpio, cfg; } pins[] = {
++		{ 12, 0xC8 },           /* SCK: func 2, 8 mA (drv 3 << 6), no pull */
++		{ 13, 0xCC },           /* WS: func 3 */
++		{ 14, 0xCC },           /* SD0: func 3 */
++		{ 15, 0xCC },           /* SD1: func 3 */
++	};
++	for (unsigned i = 0; i < 4; i++) {
++		vm_offset_t r = ml_io_map(TLMM_NORTH_PA + 0x1000u * pins[i].gpio, 0x1000);
++		if (r == 0) {
++			LOG("AFE: cannot map GPIO %u", pins[i].gpio);
++			continue;
++		}
++		uint32_t was = *(volatile uint32_t *)r;
++		*(volatile uint32_t *)r = pins[i].cfg;
++		mb();
++		LOG("AFE: GPIO %u cfg %#x -> %#x", pins[i].gpio, was, *(volatile uint32_t *)r);
++	}
++}
++
++static bool
++afe_bringup(void)
++{
++	uint32_t p[16];
++	int r;
++
++	mi2s_pins();
++	/* clock: afe_svc_cmd_set_param_v1 = payload_size, mem hdr (3 words: in band), param header, afe_clk_set */
++	bzero(p, sizeof(p));
++	p[0] = 12 + 24;
++	p[4] = AFE_MODULE_CLOCK_SET;
++	p[5] = AFE_PARAM_ID_CLOCK_SET;
++	p[6] = 24;                              /* param_size (u16), reserved (u16) */
++	p[7] = 1;                               /* clk_set_minor_version */
++	p[8] = LPASS_CLK_ID_PRI_MI2S_IBIT;
++	p[9] = SPK_RATE * SPK_BITS * 2;         /* 1.536 MHz */
++	p[10] = 1 | (0u << 16);                 /* clk_attri COUPLE_NO, clk_root default */
++	p[11] = 1;                              /* enable */
++	r = apr_call(APR_SVC_AFE, AFE_SVC_CMD_SET_PARAM, p, 12 * 4, 1000);
++	LOG("t=%u.%03u AFE: PRI MI2S bit clock %u Hz: status %d", T, p[9], r);
++	if (r != 0) {
++		return false;
++	}
++	/* port config: port_id, payload_size, mem hdr, param header, afe_param_id_i2s_cfg (20 bytes) */
++	bzero(p, sizeof(p));
++	p[0] = AFE_PORT_PRI_MI2S_RX | ((12u + 20u) << 16);
++	p[4] = AFE_MODULE_AUDIO_DEV_INTERFACE;
++	p[5] = AFE_PARAM_ID_I2S_CONFIG;
++	p[6] = 20;
++	p[7] = 1;                               /* i2s_cfg_minor_version */
++	p[8] = SPK_BITS | (1u << 16);           /* bit_width, channel_mode SD0 */
++	p[9] = 1 | (1u << 16);                  /* mono_stereo STEREO, ws_src INTERNAL */
++	p[10] = SPK_RATE;
++	p[11] = 0;                              /* data_format linear PCM, reserved */
++	r = apr_call(APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, p, 12 * 4, 1000);
++	LOG("t=%u.%03u AFE: PRI MI2S RX i2s config %u Hz %u bit SD0 stereo: status %d", T, SPK_RATE, SPK_BITS, r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	p[0] = AFE_PORT_PRI_MI2S_RX;
++	r = apr_call(APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, p, 4, 1000);
++	LOG("t=%u.%03u AFE: PRI MI2S RX start: status %d", T, r);
++	return r == 0;
++}
++
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
+ 
+ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+@@ -1982,7 +2115,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t st;
+ 	unsigned last_status = 0;
+-	bool codec_tried = false;
++	bool codec_tried = false, afe_tried = false;
+ 
+ 	if (!topaz_soc_map()) {
+ 		LOG("no SoC mappings (see TopazModem)");
+@@ -2027,6 +2160,11 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		qrtr_poll();
+ 		apr_poll();
+ 		gpr_poll();                             /* (returns at once: GCHAN is not up) */
++		if (apr_state == 1 && !afe_tried) {
++			afe_tried = true;
++			afe_up = afe_bringup();
++			LOG("t=%u.%03u *** AFE speaker port %s ***", T, afe_up ? "RUNNING" : "failed");
++		}
+ 		stream_poll();
+ 		if (spf_state == 1 && !codec_tried) {
+ 			uint32_t tone = 0;
