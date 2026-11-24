@@ -852,3 +852,28 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
+
+## Haptics and repeated sounds (patches 1018, 1019, 2026-11-24)
+
+- With the plug-in's Actuator device present, mediaserverd's haptics server starts ("Initializing Haptic 2.0
+  Engine", HapticSynth 2-chan 48 kHz, SynthOutput IOFrameSize 512). Before audio it bailed out.
+- MobileGestalt DeviceSupportsHaptics (obfuscated cBy4BcYs5YWtFHbBpt4C6A) was 0. It is read by CoreHaptics,
+  UIKitCore, ToneLibrary, libAudioToolboxUtility. Set to true in CacheExtra of
+  /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist
+  (owner mobile:nobody; original kept on the phone as /var/root/MobileGestalt.plist.pre-haptic). Takes effect
+  after a reboot. Phone-side change only: a fresh root needs it again.
+- System-sound vibes (SSServerImp) still fail: "Could not start vibe ... error -16490, vibrator is not
+  initialized". They use libVibeSynthEngine's Legacy Vibe Engine, which wants per-product calibration
+  (kVirtualAudioPortPropertyCalibrationData, vibeengineconfig). Not on this root. whyred_ui's system-sound
+  interposer still covers them.
+- 1018: /dev/redwood-haptic (bsd/dev/whyred_spmi.c, created by TopazAudio's thread at APR ready). The plug-in's
+  Actuator writes (mono 16-bit) whose peak reaches 1000/32768 run the ERM motor. 1018 used 70 ms at 3000 mV per
+  tap: the user said too intense for icon long-presses.
+- 1019: tap = write length (min 20 ms) + 15 ms, VMAX 1200-3000 mV by the peak. User: "much better".
+- 1019 also fixes silence after the first sound: PAUSE leaves up to 4 buffers with the ADSP and they return first
+  after RUN. 1016/1017 reset the write-done count at each start, so it blanked each new chunk before it played
+  (the kernel got every frame, the speaker played zeros). Now counters run across pauses and each write-done
+  blanks the chunk at its own address (payload word 0).
+- Verified by the user on whyred/out/xnu-ios-1019.img (CI 45462569242, default boot-args): first iOS sound
+  heard (power connected, "clean and normal"), ringtone previews and repeated charger sounds play, long-press
+  haptics felt.
