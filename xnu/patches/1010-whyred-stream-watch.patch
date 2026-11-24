@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 44a075c..927e25a 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2359,7 +2359,31 @@ spk_tone(unsigned seconds)
+ 
+ 	LOG("t=%u.%03u stream: first write", T);
+ 	IOSleep(1500);
+-	uint32_t sent = 0, start = apr_writes_done;
++	/* one write, then five seconds of watching (the phone reset right after the first write) */
++	uint32_t start = apr_writes_done;
++	bzero(p, sizeof(p));
++	p[0] = (uint32_t)pa;
++	p[1] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
++	p[2] = handle;
++	p[3] = TONE_BUF_BYTES;
++	p[4] = 0;
++	(void)apr_send_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_WRITE_V2, p, 32);
++	for (unsigned k = 0; k < 10; k++) {
++		for (unsigned t = ms(); ms() - t < 500;) {
++			if (!glink_poll()) {
++				IOSleep(2);
++			}
++		}
++		LOG("t=%u.%03u stream: watch %u: slave-kernel %08x, writes done %u, errors %u", T, k, *adsp_state,
++		    apr_writes_done - start, apr_write_errs);
++		if (*adsp_state & 1) {
++			LOG("t=%u.%03u stream: ADSP FATAL after the first write", T);
++			crash_reason();
++			IOSleep(2000);
++			return false;
++		}
++	}
++	uint32_t sent = 1;
+ 	unsigned t0w = ms();
+ 	while (ms() - t0w < seconds * 1000u) {
+ 		if (sent - (apr_writes_done - start) < 3) {     /* keep three buffers queued */
+@@ -3101,7 +3125,12 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			afe_up = afe_bringup();
+ 			LOG("t=%u.%03u *** AFE speaker port %s ***", T, afe_up ? "RUNNING" : "failed");
+ 			if (tas_probe()) {
+-				bool cfg_ok = tas_configure();
++				uint32_t amp = 1;
++				(void)PE_parse_boot_argn("adsp_amp", &amp, sizeof(amp));
++				bool cfg_ok = amp == 0 || tas_configure();
++				if (amp == 0) {
++					LOG("TAS2557: left off (adsp_amp=0)");
++				}
+ 				LOG("t=%u.%03u *** TAS2557 answers; configuration %s ***", T, cfg_ok ? "loaded" : "FAILED");
+ 				if (cfg_ok) {
+ 					LOG("t=%u.%03u *** tone %s ***", T, spk_tone(3) ? "played" : "FAILED");
