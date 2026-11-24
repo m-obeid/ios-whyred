@@ -1,0 +1,484 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 5bffd07..f539a57 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1267,10 +1267,14 @@ apr_rx(const uint8_t *data, uint32_t len)
+ 		LOG("t=%u.%03u APR rx svc %u.%u -> %u.%u opcode %#x token %#x, %u bytes, payload %#x %#x", T,
+ 		    h.src_domain, h.src_svc, h.dest_domain, h.dest_svc, h.opcode, h.token, len, p0, p1);
+ 	}
+-	if (h.opcode == 0x00010D99u) {          /* ASM_DATA_EVENT_WRITE_DONE_V2 */
++	if (h.opcode == 0x00010D99u) {          /* ASM_DATA_EVENT_WRITE_DONE_V2: addr lsw, addr msw, handle, status */
++		uint32_t status = 0;
++		if (len >= hlen + 16) {
++			memcpy(&status, data + hlen + 12, 4);
++		}
+ 		apr_writes_done++;
+-		if (p1 != 0 && apr_write_errs++ < 4) {
+-			LOG("t=%u.%03u ASM: write done with status %#x", T, p1);
++		if (status != 0 && apr_write_errs++ < 4) {
++			LOG("t=%u.%03u ASM: write done with status %#x", T, status);
+ 		}
+ 		return;
+ 	}
+@@ -2187,7 +2191,7 @@ tas_configure(void)
+  * Linux msm_audio_ion puts SID 1 << 32 on every address it gives the ADSP; with the SMR above in bypass
+  * the address is physical, so by default nothing is added (boot-arg adsp_sid=1 adds it, as Linux).
+  */
+-static uint32_t audio_sid_msw;
++static uint32_t audio_sid_msw = 1;
+ #define AUDIO_SID_BITS_MSW              audio_sid_msw
+ 
+ extern "C" void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
+@@ -2279,44 +2283,97 @@ lpass_smmu_sid1(void)
+ 	return ((*(volatile uint32_t *)(s + 0xC00 + 4 * slot) >> 16) & 3) == 0;
+ }
+ 
++/* ---------------------------------------------------------------- APR stream for /dev/topaz-audio (whyred) */
++
++/*
++ * The speaker stream iOS plays into (userland/audio/audio_plugin.c writes 48 kHz 16-bit stereo frames
++ * to /dev/redwood-audio = /dev/topaz-audio). Legacy ASM pushes buffers: a 1 s ring is mapped once
++ * (SID 1 through the identity bank above), and while playing the audio thread hands it to the ADSP in
++ * 20 ms chunks (ASM_DATA_CMD_WRITE_V2), four in flight, the next one on each write-done. write() puts
++ * frames 40 ms ahead of what was handed over and zeroes the ring behind the data, so nothing old
++ * replays. The session runs when frames come and pauses 0.5 s after the last one; the TAS2557 is
++ * powered with it (Linux tas2557 startup / shutdown data), so the idle phone pays for neither.
++ * Volume: iOS's (eighths of a dB under the loudest, or muted) scales the samples as they are copied.
++ * Verified first with a 1 kHz tone (2026-11-24): 34 buffers of 100 ms played, the laptop mic heard it.
++ */
++#define AS_RING_BYTES                   (48000u * 4)
++#define AS_MAP_BYTES                    ((AS_RING_BYTES + 0xfff) & ~0xfffu)
++#define AS_CHUNK                        (48u * 4 * 20)
++#define AS_INFLIGHT                     4
++#define AS_LEAD                         (48u * 4 * 40)
++#define AS_QUIET_MS                     500
++#define ASM_SESSION_CMD_PAUSE           0x00010BD3u
++
++static uint8_t *as_ring;
++static uint64_t as_pa;
++static uint32_t as_handle, as_sent, as_done_base;
++static bool as_ready;
++static volatile bool as_playing;
++static volatile uint32_t as_sent_off, as_write_off;
++static volatile uint64_t as_last_write;
++static volatile uint32_t as_gain_q15 = 32767;
++static uint64_t as_frames_in, as_underruns, as_dropped;
++static IOLock *as_lock;
++static const uint16_t as_db_q15[97] = { 32767,29204,26028,23197,20675,18426,16422,14636,13045,11626,10362,9235,8231,7336,6538,5827,5193,4628,4125,3677,3277,2920,2603,2320,2067,1843,1642,1464,1304,1163,1036,923,823,734,654,583,519,463,413,368,328,292,260,232,207,184,164,146,130,116,104,92,82,73,65,58,52,46,41,37,33,29,26,23,21,18,16,15,13,12,10,9,8,7,7,6,5,5,4,4,3,3,3,2,2,2,2,1,1,1,1,1,1,1,1,1,1 };
++
++/* tas2557 startup (on) or shutdown (off) data, as Linux p_tas2557_startup_data / _shutdown_data */
++static int
++tas_power(bool on)
++{
++	int r = 0;
++	if (on) {
++		r |= tas_wr(0, 1, 77, 0x15);
++		r |= tas_wr(0, 1, 61, 0x01);
++		r |= tas_wr(0, 1, 62, 0x01);
++		r |= tas_wr(0, 0, 5, 0xa0);
++		r |= tas_wr(0, 0, 5, 0xa3);
++		r |= tas_wr(0, 0, 4, 0xf8);
++		IODelay(2000);
++		r |= tas_wr(0, 0, 44, 0x2b);
++		r |= tas_wr(0, 0, 7, 0x00);
++		r |= tas_wr(100, 0, 7, 0x00);
++	} else {
++		r |= tas_wr(0, 0, 44, 0x00);
++		r |= tas_wr(100, 0, 7, 0x01);
++		IOSleep(10);
++		r |= tas_wr(0, 0, 7, 0x03);
++		r |= tas_wr(0, 0, 4, 0x60);
++		IODelay(2000);
++		r |= tas_wr(0, 0, 5, 0x00);
++		r |= tas_wr(0, 0, 4, 0x00);
++		r |= tas_wr(0, 1, 61, 0x00);
++		r |= tas_wr(0, 1, 62, 0x00);
++		r |= tas_wr(0, 1, 77, 0x00);
++	}
++	return r;
++}
++
++/* the session: memory map, ASM open + format, ADM COPP, routing (run later, with data) */
+ static bool
+-spk_tone(unsigned seconds)
++as_open(void)
+ {
+-	uint64_t pa = 0;
+-	int16_t *buf = NULL;
+-	uint32_t p[24], handle = 0, copp = 0;
++	uint32_t p[16];
+ 	int r;
+ 
+ 	(void)PE_parse_boot_argn("adsp_sid", &audio_sid_msw, sizeof(audio_sid_msw));
+-	LOG("stream: SID bits in the address high word: %u", audio_sid_msw);
+-	if (!lpass_smmu_sid1()) {
++	as_lock = IOLockAlloc();
++	if (as_lock == NULL || !lpass_smmu_sid1()) {
+ 		return false;
+ 	}
+-	buf = (int16_t *)topaz_pool_alloc(TONE_MAP_BYTES, &pa);
+-	if (buf == NULL) {
+-		LOG("stream: no buffer");
++	as_ring = (uint8_t *)topaz_pool_alloc(AS_MAP_BYTES, &as_pa);
++	if (as_ring == NULL) {
++		LOG("stream: no ring");
+ 		return false;
+ 	}
+-	/* 1 kHz (48 samples a period at 48 kHz), peak 2000 = about -24 dBFS: quiet on purpose */
+-	static const int16_t quarter[13] = { 0, 261, 518, 765, 1000, 1218, 1414, 1587, 1732, 1848, 1932, 1983, 2000 };
+-	for (unsigned i = 0; i < TONE_BUF_BYTES / 4; i++) {
+-		unsigned j = i % 48, q = j / 12, k = j % 12;
+-		int16_t v = (q & 1) ? quarter[12 - k] : quarter[k];
+-		if (q >= 2) {
+-			v = (int16_t)-v;
+-		}
+-		buf[2 * i] = buf[2 * i + 1] = v;
+-	}
++	bzero(as_ring, AS_MAP_BYTES);
+ 	mb();
+-	LOG("stream: buffer %u bytes at pa %#llx", TONE_BUF_BYTES, pa);
+-	IOSleep(1500);
+ 
+ 	bzero(p, sizeof(p));
+ 	p[0] = 3 | (1u << 16);                  /* mem_pool_id SHMEM8_4K, one region */
+-	p[1] = 0;                               /* property: physical */
+-	p[2] = (uint32_t)pa;
+-	p[3] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
+-	p[4] = TONE_MAP_BYTES;
++	p[1] = 0;
++	p[2] = (uint32_t)as_pa;
++	p[3] = (uint32_t)(as_pa >> 32) | AUDIO_SID_BITS_MSW;
++	p[4] = AS_MAP_BYTES;
+ 	apr_call_done = false;
+ 	apr_call_token = apr_token;
+ 	if (!apr_send_port(APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, p, 20)) {
+@@ -2328,39 +2385,34 @@ spk_tone(unsigned seconds)
+ 		}
+ 	}
+ 	apr_call_token = 0;
+-	handle = apr_call_p0;
+-	LOG("t=%u.%03u stream: memory map: %s op %#x payload %#x %#x", T, apr_call_done ? "reply" : "NO REPLY", apr_call_op,
+-	    apr_call_p0, apr_call_p1);
+ 	if (!apr_call_done || apr_call_op != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS) {
++		LOG("stream: memory map failed (op %#x)", apr_call_op);
+ 		return false;
+ 	}
++	as_handle = apr_call_p0;
+ 
+ 	bzero(p, sizeof(p));
+-	p[0] = 0;                               /* mode_flags */
+-	p[1] = 0 | (16u << 16);                 /* sink: device matrix, 16 bit */
++	p[1] = 0 | (16u << 16);
+ 	p[2] = ASM_STREAM_POSTPROCOPO_ID_NONE;
+ 	p[3] = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
+ 	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, p, 16, 1000);
+-	LOG("t=%u.%03u stream: ASM open write: %d", T, r);
+-	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
++		LOG("stream: ASM open write: %d", r);
+ 		return false;
+ 	}
+ 	bzero(p, sizeof(p));
+-	p[0] = 20;                              /* fmt_blk_size */
+-	p[1] = 2 | (16u << 16);                 /* channels, bits */
++	p[0] = 20;
++	p[1] = 2 | (16u << 16);
+ 	p[2] = 48000;
+-	p[3] = 1;                               /* signed */
+-	p[4] = 1 | (2u << 8);                   /* channel map FL, FR */
++	p[3] = 1;
++	p[4] = 1 | (2u << 8);
+ 	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, p, 24, 1000);
+-	LOG("t=%u.%03u stream: media format: %d", T, r);
+-	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
++		LOG("stream: media format: %d", r);
+ 		return false;
+ 	}
+-
+ 	bzero(p, sizeof(p));
+-	p[0] = 0 | (1u << 16);                  /* flags, mode: RX path COPP */
++	p[0] = 0 | (1u << 16);
+ 	p[1] = AFE_PORT_PRI_MI2S_RX | (0xFFFFu << 16);
+ 	p[2] = NULL_COPP_TOPOLOGY;
+ 	p[3] = 2 | (16u << 16);
+@@ -2368,7 +2420,7 @@ spk_tone(unsigned seconds)
+ 	p[5] = 1 | (2u << 8);
+ 	apr_call_done = false;
+ 	apr_call_token = apr_token;
+-	if (!apr_send_port(APR_SVC_ADM, 0, ADM_CMD_DEVICE_OPEN_V5, p, 28)) {     /* adm_cmd_device_open_v5: 28 bytes */
++	if (!apr_send_port(APR_SVC_ADM, 0, ADM_CMD_DEVICE_OPEN_V5, p, 28)) {
+ 		return false;
+ 	}
+ 	for (unsigned t = ms(); !apr_call_done && ms() - t < 2000;) {
+@@ -2377,116 +2429,126 @@ spk_tone(unsigned seconds)
+ 		}
+ 	}
+ 	apr_call_token = 0;
+-	copp = apr_call_p1;
+-	LOG("t=%u.%03u stream: ADM open: %s op %#x status %#x copp %u", T, apr_call_done ? "reply" : "NO REPLY", apr_call_op,
+-	    apr_call_p0, copp);
+ 	if (!apr_call_done || apr_call_op != ADM_CMDRSP_DEVICE_OPEN_V5 || apr_call_p0 != 0) {
++		LOG("stream: ADM open failed (op %#x status %#x)", apr_call_op, apr_call_p0);
+ 		return false;
+ 	}
+-
++	uint32_t copp = apr_call_p1;
+ 	bzero(p, sizeof(p));
+-	p[0] = 0;                               /* matrix RX */
+-	p[1] = 1;                               /* one session */
+-	p[2] = TONE_SESSION | (1u << 16);       /* session, one COPP */
+-	p[3] = copp;                            /* COPP id (u16), padding */
++	p[1] = 1;
++	p[2] = TONE_SESSION | (1u << 16);
++	p[3] = copp;
+ 	r = apr_call(APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, p, 16, 1000);
+-	LOG("t=%u.%03u stream: routing: %d", T, r);
+-	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
++		LOG("stream: routing: %d", r);
+ 		return false;
+ 	}
+-	bzero(p, sizeof(p));
+-	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
+-	LOG("t=%u.%03u stream: run: %d", T, r);
+-	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+-	if (r != 0) {
+-		return false;
++	(void)tas_power(false);                 /* until frames come */
++	as_ready = true;
++	LOG("t=%u.%03u stream: ready (ring %u bytes at %#llx, handle %#x, COPP %u, SID bits %u)", T, AS_RING_BYTES, as_pa,
++	    as_handle, copp, audio_sid_msw);
++	return true;
++}
++
++/* frames from /dev/topaz-audio: never waits; returns how many were taken */
++static uint32_t
++as_write(const int16_t *frames, uint32_t count)
++{
++	IOLockLock(as_lock);
++	uint32_t bytes = MIN(count * 4, AS_RING_BYTES / 2);
++	uint32_t r = as_sent_off, w = as_write_off;
++	uint32_t ahead = (w + AS_RING_BYTES - r) % AS_RING_BYTES;
++	if (!as_playing || ahead > AS_RING_BYTES / 2) {          /* not started, or the ADSP passed us */
++		if (as_playing) {
++			as_underruns++;
++		}
++		w = (r + AS_LEAD) % AS_RING_BYTES;
++		ahead = AS_LEAD;
++	}
++	if (ahead + bytes > AS_RING_BYTES - 4096) {
++		uint32_t room = AS_RING_BYTES - 4096 > ahead ? (AS_RING_BYTES - 4096 - ahead) & ~3u : 0;
++		as_dropped += (bytes - room) / 4;
++		bytes = room;
++	}
++	int32_t g = (int32_t)as_gain_q15;
++	for (uint32_t i = 0; i < bytes / 2; i++) {
++		uint32_t at = (w + 2 * i) % AS_RING_BYTES;
++		*(int16_t *)(as_ring + at) = (int16_t)(((int32_t)frames[i] * g) >> 15);
+ 	}
++	uint32_t z = (w + bytes) % AS_RING_BYTES, zl = 2 * AS_LEAD, z1 = MIN(zl, AS_RING_BYTES - z);
++	bzero(as_ring + z, z1);
++	bzero(as_ring, zl - z1);
++	mb();
++	as_write_off = (w + bytes) % AS_RING_BYTES;
++	as_frames_in += bytes / 4;
++	as_last_write = mach_absolute_time();
++	IOLockUnlock(as_lock);
++	return count;
++}
+ 
+-	/* without any write first: does the running session alone (RUN) take the phone down? */
+-	{
+-		vm_offset_t g0 = ml_io_map(LPASS_SMMU_PA, 0x1000);
+-		for (unsigned k = 0; k < 16; k++) {
+-			for (unsigned t = ms(); ms() - t < 300;) {
+-				if (!glink_poll()) {
+-					IOSleep(2);
+-				}
+-			}
+-			LOG("t=%u.%03u stream: after run, no data, %u ms: slave-kernel %08x, sGFSR %#x", T, 300 * (k + 1), *adsp_state,
+-			    g0 ? trd(g0, 0x48) : 0);
+-			IOSleep(200);
+-			if (*adsp_state & 1) {
+-				LOG("t=%u.%03u stream: ADSP FATAL while running without data", T);
+-				crash_reason();
+-				IOSleep(2000);
+-				return false;
+-			}
+-		}
++static void
++as_start(void)
++{
++	uint32_t p[4] = { 0, 0, 0, 0 };
++	int amp = tas_power(true);
++	int r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
++	as_done_base = apr_writes_done;
++	as_sent = 0;
++	as_playing = true;
++	LOG("t=%u.%03u stream: playing (amp %d, run %d)", T, amp, r);
++}
++
++static void
++as_stop(void)
++{
++	uint32_t none = 0;
++	as_playing = false;
++	int r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_PAUSE, &none, 0, 1000);
++	int amp = tas_power(false);
++	IOLockLock(as_lock);
++	bzero(as_ring, AS_RING_BYTES);
++	IOLockUnlock(as_lock);
++	LOG("t=%u.%03u stream: paused (pause %d, amp %d; %llu frames in, %llu dropped, %llu underruns)", T, r, amp, as_frames_in,
++	    as_dropped, as_underruns);
++}
++
++/* the audio thread, between GLINK polls: start / stop, volume, and keep the ADSP fed */
++static void
++as_poll(uint32_t below, uint32_t muted, bool vol_changed)
++{
++	uint64_t now = mach_absolute_time(), quiet;
++
++	nanoseconds_to_absolutetime((uint64_t)AS_QUIET_MS * 1000000, &quiet);
++	if (vol_changed) {
++		uint32_t db = below / 8;
++		as_gain_q15 = muted ? 0 : (db >= 96 ? 0 : as_db_q15[db]);
+ 	}
+-	LOG("t=%u.%03u stream: first write", T);
+-	IOSleep(1500);
+-	/* one write, then five seconds of watching (the phone reset right after the first write) */
+-	uint32_t start = apr_writes_done;
+-	bzero(p, sizeof(p));
+-	p[0] = (uint32_t)pa;
+-	p[1] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
+-	p[2] = handle;
+-	p[3] = TONE_BUF_BYTES;
+-	p[4] = 0;
+-	(void)apr_send_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_WRITE_V2, p, 32);
+-	/*
+-	 * Watch every 10 ms: the ADSP's SMP2P state, write-done count and the LPASS SMMU global fault
+-	 * status (sGFSR 0x48, sGFSYNR0/1/2 0x50/0x54/0x58). Any change is logged with a pause so the line
+-	 * leaves over UDP before a reset.
+-	 */
+-	vm_offset_t gs = ml_io_map(LPASS_SMMU_PA, 0x1000);
+-	uint32_t last_st = *adsp_state, last_done = 0, last_gfsr = gs ? trd(gs, 0x48) : 0;
+-	LOG("t=%u.%03u stream: watch start: slave-kernel %08x, sGFSR %#x", T, last_st, last_gfsr);
+-	for (unsigned t = ms(); ms() - t < 5000;) {
+-		(void)glink_poll();
+-		uint32_t st = *adsp_state, done = apr_writes_done - start, gfsr = gs ? trd(gs, 0x48) : 0;
+-		if (st != last_st || done != last_done || gfsr != last_gfsr) {
+-			LOG("t=%u.%03u stream: watch: slave-kernel %08x, writes done %u, errors %u, sGFSR %#x syn %#x %#x %#x", T, st,
+-			    done, apr_write_errs, gfsr, gs ? trd(gs, 0x50) : 0, gs ? trd(gs, 0x54) : 0, gs ? trd(gs, 0x58) : 0);
+-			last_st = st;
+-			last_done = done;
+-			last_gfsr = gfsr;
+-			IOSleep(300);
+-		}
+-		if (st & 1) {
+-			LOG("t=%u.%03u stream: ADSP FATAL after the first write", T);
+-			crash_reason();
+-			IOSleep(2000);
+-			return false;
+-		}
+-		IOSleep(10);
++	if (!as_playing && as_last_write != 0 && now - as_last_write < quiet) {
++		as_start();
++	} else if (as_playing && now - as_last_write >= quiet) {
++		as_stop();
++		return;
+ 	}
+-	LOG("t=%u.%03u stream: 5 s after the first write: writes done %u", T, apr_writes_done - start);
+-	uint32_t sent = 1;
+-	unsigned t0w = ms();
+-	while (ms() - t0w < seconds * 1000u) {
+-		if (sent - (apr_writes_done - start) < 3) {     /* keep three buffers queued */
+-			bzero(p, sizeof(p));
+-			p[0] = (uint32_t)pa;
+-			p[1] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
+-			p[2] = handle;
+-			p[3] = TONE_BUF_BYTES;
+-			p[4] = sent;
+-			(void)apr_send_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_WRITE_V2, p, 32);
+-			sent++;
+-		}
+-		if (!glink_poll()) {
+-			IOSleep(2);
+-		}
++	if (!as_playing) {
++		return;
+ 	}
+-	LOG("t=%u.%03u stream: %u writes sent, %u done, %u with errors", T, sent, apr_writes_done - start, apr_write_errs);
+-	if (ls_cb != NULL) {
+-		LOG("t=%u.%03u stream: CB FSR %08x FAR %08x%08x FSYNR0 %08x FSYNR1 %08x SCTLR %08x", T,
+-		    *(volatile uint32_t *)(ls_cb + 0x58), *(volatile uint32_t *)(ls_cb + 0x64), *(volatile uint32_t *)(ls_cb + 0x60),
+-		    *(volatile uint32_t *)(ls_cb + 0x68), *(volatile uint32_t *)(ls_cb + 0x6c), *(volatile uint32_t *)(ls_cb + 0x0));
++	while (as_sent - (apr_writes_done - as_done_base) < AS_INFLIGHT) {
++		uint32_t p[8];
++		IOLockLock(as_lock);
++		uint32_t off = as_sent_off;
++		as_sent_off = (off + AS_CHUNK) % AS_RING_BYTES;
++		IOLockUnlock(as_lock);
++		p[0] = (uint32_t)(as_pa + off);
++		p[1] = (uint32_t)((as_pa + off) >> 32) | AUDIO_SID_BITS_MSW;
++		p[2] = as_handle;
++		p[3] = AS_CHUNK;
++		p[4] = as_sent;
++		p[5] = p[6] = p[7] = 0;
++		if (!apr_send_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_WRITE_V2, p, 32)) {
++			break;
++		}
++		as_sent++;
+ 	}
+-	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+-	return apr_writes_done != start && apr_write_errs < apr_writes_done - start;
+ }
+ 
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
+@@ -3012,6 +3074,12 @@ stream_poll(void)
+ {
+ 	uint64_t now = mach_absolute_time(), quiet;
+ 
++	if (as_ready) {
++		bool changed = vol_applied != vol_gen;
++		vol_applied = vol_gen;
++		as_poll(vol_below, vol_muted, changed);
++		return;
++	}
+ 	if (!stream_ready) {
+ 		return;
+ 	}
+@@ -3030,6 +3098,14 @@ stream_poll(void)
+ extern "C" uint32_t
+ topaz_audio_write(const int16_t *frames, uint32_t count)
+ {
++	if (as_ready && count != 0) {           /* whyred: the APR stream */
++		bool was = as_playing;
++		uint32_t n = as_write(frames, count);
++		if (!was) {
++			thread_wakeup((event_t)&stream_wake_flag);
++		}
++		return n;
++	}
+ 	if (!stream_ready || count == 0) {
+ 		return 0;
+ 	}
+@@ -3216,8 +3292,8 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 					LOG("TAS2557: left off (adsp_amp=0)");
+ 				}
+ 				LOG("t=%u.%03u *** TAS2557 answers; configuration %s ***", T, cfg_ok ? "loaded" : "FAILED");
+-				if (cfg_ok) {
+-					LOG("t=%u.%03u *** tone %s ***", T, spk_tone(3) ? "played" : "FAILED");
++				if (cfg_ok && as_open()) {
++					audio_dev_init();
+ 				}
+ 			} else {
+ 				LOG("t=%u.%03u *** TAS2557 does not answer ***", T);
+@@ -3251,7 +3327,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		if (busy) {
+ 			IODelay(200);
+-		} else if (stream_ready && !playing) {
++		} else if (!playing && !as_playing) {  /* idle (whyred: also while the ADSP sleeps): 50 wakeups a second, not 500 */
+ 			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
