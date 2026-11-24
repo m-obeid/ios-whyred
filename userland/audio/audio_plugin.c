@@ -64,6 +64,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <os/log.h>
 
 #include "redwood_audio.h"
 
@@ -257,6 +258,8 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/* whyred: mediaserverd's stderr goes nowhere and its sandbox keeps /dev/console shut; the unified log works */
+	os_log(OS_LOG_DEFAULT, "%{public}s", line);
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
