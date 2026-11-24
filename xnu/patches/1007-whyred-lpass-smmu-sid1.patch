@@ -1,0 +1,112 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index b55a3a8..d368bb6 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2182,43 +2182,64 @@ tas_configure(void)
+ #define TONE_SESSION                    1
+ #define TONE_PORT                       ((TONE_SESSION << 8) | 1)
+ #define TONE_BUF_BYTES                  (48 * 4 * 100)          /* 100 ms of 48 kHz 16-bit stereo */
++#define TONE_MAP_BYTES                  ((TONE_BUF_BYTES + 0xfff) & ~0xfffu)   /* the 4K pool maps whole pages */
++#define AUDIO_SID_BITS_MSW              1u      /* Linux msm_audio_ion: SID 1 << 32 on every address */
+ 
+ extern "C" void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
+ 
+-/* SMMUv2 global space: sCR0, IDR0 (number of SMRs), SMR/S2CR entries that match stream id 1 */
+-static void
+-lpass_smmu_log(void)
++/*
++ * SMMUv2 global space: sCR0, IDR0 (number of SMRs), SMR (0x800 + 4n) / S2CR (0xC00 + 4n). Nothing matches
++ * stream id 1 after boot and unmatched streams fault (sCR0.USFCFG), so the ADSP cannot reach apps
++ * buffers. Linux's audio ION attaches SID 1 to a context bank; here a free SMR takes SID 1 with an
++ * S2CR of type bypass: buffer addresses are physical (identity).
++ */
++static bool
++lpass_smmu_sid1(void)
+ {
+ 	vm_offset_t g = ml_io_map(LPASS_SMMU_PA, 0x1000);
+ 	if (g == 0) {
+ 		LOG("stream: LPASS SMMU not mapped");
+-		return;
++		return false;
+ 	}
+-	uint32_t scr0 = trd(g, 0x0), idr0 = trd(g, 0x20), n = idr0 & 0xff, hits = 0;
++	uint32_t scr0 = trd(g, 0x0), idr0 = trd(g, 0x20), n = idr0 & 0xff, free_smr = 0xffffffffu;
+ 	LOG("stream: LPASS SMMU sCR0 %#x (CLIENTPD %u, USFCFG %u) IDR0 %#x, %u SMRs", scr0, scr0 & 1, (scr0 >> 10) & 1, idr0, n);
+ 	for (uint32_t i = 0; i < n && i < 128; i++) {
+ 		uint32_t smr = trd(g, 0x800 + 4 * i), s2cr = trd(g, 0xC00 + 4 * i);
+ 		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+-		if ((smr & (1u << 31)) && ((1u & ~mask) == (id & ~mask))) {
+-			LOG("stream: SMR %u %#x (id %#x mask %#x) S2CR %#x (type %u, CB %u) matches SID 1", i, smr, id, mask, s2cr,
+-			    (s2cr >> 16) & 3, s2cr & 0xff);
+-			hits++;
++		if (!(smr & (1u << 31))) {
++			if (free_smr == 0xffffffffu) {
++				free_smr = i;
++			}
++			continue;
++		}
++		if ((1u & ~mask) == (id & ~mask)) {
++			LOG("stream: SMR %u %#x S2CR %#x already matches SID 1", i, smr, s2cr);
++			return true;
+ 		}
+ 	}
+-	if (hits == 0) {
+-		LOG("stream: no SMR matches SID 1 (unmatched streams %s)", ((scr0 >> 10) & 1) ? "fault" : "bypass");
++	if (free_smr == 0xffffffffu) {
++		LOG("stream: no free SMR");
++		return false;
+ 	}
++	twr(g, 0xC00 + 4 * free_smr, 1u << 16);         /* S2CR: type bypass */
++	twr(g, 0x800 + 4 * free_smr, (1u << 31) | 1u);  /* SMR: valid, id 1, mask 0 */
++	LOG("stream: SMR %u -> SID 1, S2CR bypass (now SMR %#x S2CR %#x)", free_smr, trd(g, 0x800 + 4 * free_smr),
++	    trd(g, 0xC00 + 4 * free_smr));
++	return true;
+ }
+ 
+ static bool
+ spk_tone(unsigned seconds)
+ {
+ 	uint64_t pa = 0;
+-	int16_t *buf = (int16_t *)topaz_pool_alloc(TONE_BUF_BYTES, &pa);
++	int16_t *buf = NULL;
+ 	uint32_t p[24], handle = 0, copp = 0;
+ 	int r;
+ 
+-	lpass_smmu_log();
++	if (!lpass_smmu_sid1()) {
++		return false;
++	}
++	buf = (int16_t *)topaz_pool_alloc(TONE_MAP_BYTES, &pa);
+ 	if (buf == NULL) {
+ 		LOG("stream: no buffer");
+ 		return false;
+@@ -2240,8 +2261,8 @@ spk_tone(unsigned seconds)
+ 	p[0] = 3 | (1u << 16);                  /* mem_pool_id SHMEM8_4K, one region */
+ 	p[1] = 0;                               /* property: physical */
+ 	p[2] = (uint32_t)pa;
+-	p[3] = (uint32_t)(pa >> 32);
+-	p[4] = TONE_BUF_BYTES;
++	p[3] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
++	p[4] = TONE_MAP_BYTES;
+ 	apr_call_done = false;
+ 	apr_call_token = apr_token;
+ 	if (!apr_send_port(APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, p, 20)) {
+@@ -2254,7 +2275,8 @@ spk_tone(unsigned seconds)
+ 	}
+ 	apr_call_token = 0;
+ 	handle = apr_call_p0;
+-	LOG("t=%u.%03u stream: memory map: %s op %#x handle %#x", T, apr_call_done ? "reply" : "NO REPLY", apr_call_op, handle);
++	LOG("t=%u.%03u stream: memory map: %s op %#x payload %#x %#x", T, apr_call_done ? "reply" : "NO REPLY", apr_call_op,
++	    apr_call_p0, apr_call_p1);
+ 	if (!apr_call_done || apr_call_op != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS) {
+ 		return false;
+ 	}
+@@ -2329,7 +2351,7 @@ spk_tone(unsigned seconds)
+ 		if (sent - (apr_writes_done - start) < 3) {     /* keep three buffers queued */
+ 			bzero(p, sizeof(p));
+ 			p[0] = (uint32_t)pa;
+-			p[1] = (uint32_t)(pa >> 32);
++			p[1] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
+ 			p[2] = handle;
+ 			p[3] = TONE_BUF_BYTES;
+ 			p[4] = sent;
