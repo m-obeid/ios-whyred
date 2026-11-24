@@ -1,0 +1,44 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 9bdb485..5bffd07 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2207,6 +2207,7 @@ extern "C" uint64_t topaz_scm_assign(uint64_t addr, uint64_t size, const uint32_
+ #define LS_CBAR                         0x0001f000u     /* S1_TRANS_S2_FAULT, S1 memattr WB */
+ #define LS_CBA2R                        0x00000001u     /* VA64 */
+ #define LS_SCTLR                        0x000000e0u     /* CFCFG|CFIE|CFRE, M = 0 */
++static volatile uint8_t *ls_cb;                         /* the bank, for its fault registers */
+ 
+ static bool
+ lpass_smmu_sid1(void)
+@@ -2229,6 +2230,8 @@ lpass_smmu_sid1(void)
+ 		if (valid && ((smr & 0x7fff) & ~((smr >> 16) & 0x7fff)) == (1u & ~((smr >> 16) & 0x7fff))) {
+ 			LOG("stream: SMR%u %08x S2CR %08x already matches SID 1", i, smr, s2cr);
+ 			if (((s2cr >> 16) & 3) == 0) {
++				uint32_t ps = (id1 & (1u << 31)) ? 0x10000 : 0x1000, np = 1u << (((id1 >> 28) & 7) + 1);
++				ls_cb = s + (uint64_t)np * ps + (uint64_t)(s2cr & 0x3f) * ps;
+ 				return true;            /* translating to a bank already */
+ 			}
+ 			slot = i;
+@@ -2251,6 +2254,7 @@ lpass_smmu_sid1(void)
+ 	}
+ 	volatile uint8_t *gr1 = s + psize, *cbp = s + (uint64_t)npage * psize + (uint64_t)cb * psize;
+ 	LOG("stream: CB%u at +%llx, SMR%u: programming", cb, (uint64_t)(cbp - s), slot);
++	ls_cb = cbp;
+ 	mb();
+ 	*(volatile uint32_t *)(cbp + 0x58) = 0xFFFFFFFFu;      /* FSR: clear */
+ 	*(volatile uint32_t *)(cbp + 0x20) = 0;                /* TTBR0 */
+@@ -2476,8 +2480,13 @@ spk_tone(unsigned seconds)
+ 		}
+ 	}
+ 	LOG("t=%u.%03u stream: %u writes sent, %u done, %u with errors", T, sent, apr_writes_done - start, apr_write_errs);
++	if (ls_cb != NULL) {
++		LOG("t=%u.%03u stream: CB FSR %08x FAR %08x%08x FSYNR0 %08x FSYNR1 %08x SCTLR %08x", T,
++		    *(volatile uint32_t *)(ls_cb + 0x58), *(volatile uint32_t *)(ls_cb + 0x64), *(volatile uint32_t *)(ls_cb + 0x60),
++		    *(volatile uint32_t *)(ls_cb + 0x68), *(volatile uint32_t *)(ls_cb + 0x6c), *(volatile uint32_t *)(ls_cb + 0x0));
++	}
+ 	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+-	return apr_writes_done != start;
++	return apr_writes_done != start && apr_write_errs < apr_writes_done - start;
+ }
+ 
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
