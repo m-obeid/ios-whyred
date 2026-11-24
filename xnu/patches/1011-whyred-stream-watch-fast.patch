@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 927e25a..b80224c 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2368,21 +2368,34 @@ spk_tone(unsigned seconds)
+ 	p[3] = TONE_BUF_BYTES;
+ 	p[4] = 0;
+ 	(void)apr_send_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_WRITE_V2, p, 32);
+-	for (unsigned k = 0; k < 10; k++) {
+-		for (unsigned t = ms(); ms() - t < 500;) {
+-			if (!glink_poll()) {
+-				IOSleep(2);
+-			}
+-		}
+-		LOG("t=%u.%03u stream: watch %u: slave-kernel %08x, writes done %u, errors %u", T, k, *adsp_state,
+-		    apr_writes_done - start, apr_write_errs);
+-		if (*adsp_state & 1) {
++	/*
++	 * Watch every 10 ms: the ADSP's SMP2P state, write-done count and the LPASS SMMU global fault
++	 * status (sGFSR 0x48, sGFSYNR0/1/2 0x50/0x54/0x58). Any change is logged with a pause so the line
++	 * leaves over UDP before a reset.
++	 */
++	vm_offset_t gs = ml_io_map(LPASS_SMMU_PA, 0x1000);
++	uint32_t last_st = *adsp_state, last_done = 0, last_gfsr = gs ? trd(gs, 0x48) : 0;
++	LOG("t=%u.%03u stream: watch start: slave-kernel %08x, sGFSR %#x", T, last_st, last_gfsr);
++	for (unsigned t = ms(); ms() - t < 5000;) {
++		(void)glink_poll();
++		uint32_t st = *adsp_state, done = apr_writes_done - start, gfsr = gs ? trd(gs, 0x48) : 0;
++		if (st != last_st || done != last_done || gfsr != last_gfsr) {
++			LOG("t=%u.%03u stream: watch: slave-kernel %08x, writes done %u, errors %u, sGFSR %#x syn %#x %#x %#x", T, st,
++			    done, apr_write_errs, gfsr, gs ? trd(gs, 0x50) : 0, gs ? trd(gs, 0x54) : 0, gs ? trd(gs, 0x58) : 0);
++			last_st = st;
++			last_done = done;
++			last_gfsr = gfsr;
++			IOSleep(300);
++		}
++		if (st & 1) {
+ 			LOG("t=%u.%03u stream: ADSP FATAL after the first write", T);
+ 			crash_reason();
+ 			IOSleep(2000);
+ 			return false;
+ 		}
++		IOSleep(10);
+ 	}
++	LOG("t=%u.%03u stream: 5 s after the first write: writes done %u", T, apr_writes_done - start);
+ 	uint32_t sent = 1;
+ 	unsigned t0w = ms();
+ 	while (ms() - t0w < seconds * 1000u) {
