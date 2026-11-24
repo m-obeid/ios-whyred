@@ -1,0 +1,423 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 0352222..66e0faf 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -26,6 +26,9 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
+ 
+ #define LOG(fmt, ...)       IOLog("TopazAudio: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -1730,6 +1733,395 @@ tas_probe(void)
+ 	return r3 == 0;
+ }
+ 
++/* ---------------------------------------------------------------- TAS2557 configuration (whyred) */
++
++/*
++ * The amplifier's own DSP program and tuning: TI's PPC firmware file tas2557_uCDSP.bin (Xiaomi's, a
++ * vendor file kept out of git; on the phone at TAS_FW_PATH). Format (as Linux tas2557-core.c reads it,
++ * big-endian): magic "5552", sizes/versions (driver version 0x400 here), DDC name (64) and description,
++ * device family 0, device 2; PLLs (name, description, block); programs (name, description, app mode,
++ * boost, data); configurations (name, description, devices, program, PLL, rate, PLL source + rate,
++ * data); data = name, description, blocks; block = type, checksum flags/values, commands of 4 bytes:
++ * book, page, register (<= 0x7f: write), 0x81 = sleep (book << 8 | page) ms, 0x85 = burst of
++ * (book << 8 | page) bytes at the next command's book/page/register.
++ * Bring-up as tas2557_set_program + tas2557_enable: reset, defaults, program blocks (type 1), PLL,
++ * configuration blocks (types 4, 3), startup, unmute. Program 0 "Tuning Mode" with configuration 0
++ * (48 kHz, BCLK 1.536 MHz: the AFE clock above).
++ */
++#define TAS_FW_PATH             "/usr/local/share/whyred/tas2557_uCDSP.bin"
++#define TAS_FW_MAX              (64 * 1024)
++#define TAS_PROGRAM             0
++#define TAS_CONFIG              0
++
++static uint8_t *tas_fw;
++static uint32_t tas_fw_len;
++static int tas_book = -1, tas_page = -1;
++
++/* the file, once the root file system is there (up to 90 s) */
++static bool
++tas_fw_read(void)
++{
++	for (int tries = 0; tries < 90; tries++) {
++		vfs_context_t ctx = vfs_context_create(NULL);
++		vnode_t vp = NULLVP;
++		int err = vnode_open(TAS_FW_PATH, FREAD, 0, 0, &vp, ctx);
++		if (err == 0) {
++			tas_fw = (uint8_t *)IOMalloc(TAS_FW_MAX);
++			uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++			if (tas_fw != NULL && uio != NULL) {
++				uio_addiov(uio, CAST_USER_ADDR_T(tas_fw), TAS_FW_MAX);
++				err = VNOP_READ(vp, uio, 0, ctx);
++				tas_fw_len = (uint32_t)(TAS_FW_MAX - uio_resid(uio));
++			}
++			if (uio != NULL) {
++				uio_free(uio);
++			}
++			vnode_close(vp, FREAD, ctx);
++			vfs_context_rele(ctx);
++			LOG("TAS2557: %s: %u bytes (read error %d, try %d)", TAS_FW_PATH, tas_fw_len, err, tries);
++			return err == 0 && tas_fw_len > 104 && tas_fw_len < TAS_FW_MAX;
++		}
++		vfs_context_rele(ctx);
++		IOSleep(1000);
++	}
++	LOG("TAS2557: %s not readable", TAS_FW_PATH);
++	return false;
++}
++
++static int
++tas_select(uint8_t book, uint8_t page)
++{
++	int r = 0;
++	if (book != tas_book) {
++		r |= tas_write(0x00, 0);
++		r |= tas_write(0x7f, book);
++		tas_book = book;
++		tas_page = 0;
++	}
++	if (page != tas_page) {
++		r |= tas_write(0x00, page);
++		tas_page = page;
++	}
++	if (r != 0) {
++		tas_book = tas_page = -1;
++	}
++	return r;
++}
++
++static int
++tas_wr(uint8_t book, uint8_t page, uint8_t reg, uint8_t val)
++{
++	int r = tas_select(book, page);
++	return r != 0 ? r : tas_write(reg, val);
++}
++
++static int
++tas_rd(uint8_t book, uint8_t page, uint8_t reg, uint8_t *val)
++{
++	int r = tas_select(book, page);
++	return r != 0 ? r : tas_read(reg, val);
++}
++
++/* n bytes from reg on (auto-increment), in pieces the QUP FIFO takes */
++static int
++tas_burst(uint8_t book, uint8_t page, uint8_t reg, const uint8_t *d, unsigned n)
++{
++	uint8_t w[48];
++	int r = tas_select(book, page);
++	while (r == 0 && n > 0) {
++		unsigned k = MIN(n, (unsigned)sizeof(w) - 1);
++		w[0] = reg;
++		memcpy(w + 1, d, k);
++		r = tq_xfer(TAS_ADDR, w, k + 1, NULL, 0);
++		reg = (uint8_t)(reg + k);
++		d += k;
++		n -= k;
++	}
++	return r;
++}
++
++static uint32_t
++be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++static uint16_t
++be16(const uint8_t *p)
++{
++	return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++struct tas_cursor {
++	const uint8_t *p, *end;
++	uint32_t driver;
++	bool bad;
++};
++
++static void
++tc_skip(struct tas_cursor *c, size_t n)
++{
++	if (c->bad || (size_t)(c->end - c->p) < n) {
++		c->bad = true;
++		return;
++	}
++	c->p += n;
++}
++
++static void
++tc_cstr(struct tas_cursor *c)
++{
++	while (!c->bad && c->p < c->end && *c->p != 0) {
++		c->p++;
++	}
++	tc_skip(c, 1);
++}
++
++/* one block: run its commands (or only step over it). Returns false on an I2C error. */
++static bool
++tas_block(struct tas_cursor *c, bool run, uint32_t *type_out)
++{
++	uint32_t type, n;
++	bool pchk = false;
++	uint8_t pval = 0;
++
++	if (c->bad || c->end - c->p < 8) {
++		c->bad = true;
++		return false;
++	}
++	type = be32(c->p);
++	tc_skip(c, 4);
++	if (c->driver >= 0x200) {
++		pchk = c->p[0] != 0;
++		pval = c->p[1];
++		tc_skip(c, 4);
++	}
++	n = be32(c->p);
++	tc_skip(c, 4);
++	const uint8_t *cmd = c->p;
++	tc_skip(c, (size_t)n * 4);
++	if (type_out != NULL) {
++		*type_out = type;
++	}
++	if (!run || c->bad) {
++		return !c->bad;
++	}
++	if (pchk && tas_wr(0, 0, 33, 1) != 0) {         /* CRC reset */
++		return false;
++	}
++	for (uint32_t i = 0; i < n;) {
++		const uint8_t *q = cmd + 4 * i;
++		uint8_t book = q[0], page = q[1], off = q[2], val = q[3];
++		i++;
++		if (off <= 0x7f) {
++			if (tas_wr(book, page, off, val) != 0) {
++				return false;
++			}
++		} else if (off == 0x81) {
++			IOSleep(((uint32_t)book << 8) | page);
++		} else if (off == 0x85) {
++			uint32_t len = ((uint32_t)book << 8) | page;
++			if (i >= n) {
++				return false;
++			}
++			const uint8_t *q2 = cmd + 4 * i;
++			if (tas_burst(q2[0], q2[1], q2[2], q2 + 3, len) != 0) {
++				return false;
++			}
++			i++;
++			if (len >= 2) {
++				i += ((len - 2) / 4) + 1;
++			}
++		}
++	}
++	if (pchk) {
++		uint8_t crc = 0;
++		if (tas_rd(0, 0, 32, &crc) != 0 || crc != pval) {
++			LOG("TAS2557: block type %u: program checksum %#x, expected %#x", type, crc, pval);
++			return false;
++		}
++	}
++	return true;
++}
++
++/* data (name, description, blocks): run the blocks of the given type */
++static bool
++tas_data(struct tas_cursor *c, bool run, uint32_t want, unsigned *ran)
++{
++	tc_skip(c, 64);
++	tc_cstr(c);
++	if (c->bad || c->end - c->p < 2) {
++		return false;
++	}
++	uint16_t nb = be16(c->p);
++	tc_skip(c, 2);
++	for (uint16_t b = 0; b < nb; b++) {
++		struct tas_cursor peek = *c;
++		uint32_t type = 0;
++		(void)tas_block(&peek, false, &type);
++		if (!tas_block(c, run && type == want, NULL)) {
++			return false;
++		}
++		if (run && type == want && ran != NULL) {
++			(*ran)++;
++		}
++	}
++	return !c->bad;
++}
++
++/* walk the file; run what stage asks for: 0 program blocks, 1 PLL, 2 configuration pre (4), 3 coeff (3) */
++static bool
++tas_fw_stage(int stage)
++{
++	struct tas_cursor c = { tas_fw, tas_fw + tas_fw_len, 0, false };
++	unsigned ran = 0;
++	uint8_t cfg_pll = 0xff;
++
++	if (memcmp(tas_fw, "5552", 4) != 0) {
++		LOG("TAS2557: firmware magic wrong");
++		return false;
++	}
++	c.driver = be32(tas_fw + 20);
++	tc_skip(&c, 28 + 64);
++	tc_cstr(&c);
++	tc_skip(&c, 8);                         /* device family, device */
++	/* configuration TAS_CONFIG's PLL index is needed in the PLL section: find it first */
++	if (stage == 1) {
++		struct tas_cursor k = c;
++		uint16_t np = be16(k.p);
++		tc_skip(&k, 2);
++		for (uint16_t i = 0; i < np; i++) {
++			tc_skip(&k, 64);
++			tc_cstr(&k);
++			(void)tas_block(&k, false, NULL);
++		}
++		uint16_t ng = be16(k.p);
++		tc_skip(&k, 2);
++		for (uint16_t i = 0; i < ng; i++) {
++			tc_skip(&k, 64);
++			tc_cstr(&k);
++			tc_skip(&k, 3);
++			(void)tas_data(&k, false, 0, NULL);
++		}
++		uint16_t nc = be16(k.p);
++		tc_skip(&k, 2);
++		for (uint16_t i = 0; i < nc && !k.bad; i++) {
++			tc_skip(&k, 64);
++			tc_cstr(&k);
++			if (k.driver >= 0x300) {
++				tc_skip(&k, 2);
++			}
++			if (i == TAS_CONFIG) {
++				cfg_pll = k.p[1];
++				break;
++			}
++			tc_skip(&k, 6);
++			if (k.driver >= 0x400) {
++				tc_skip(&k, 5);
++			}
++			(void)tas_data(&k, false, 0, NULL);
++		}
++	}
++	uint16_t npll = be16(c.p);
++	tc_skip(&c, 2);
++	for (uint16_t i = 0; i < npll; i++) {
++		tc_skip(&c, 64);
++		tc_cstr(&c);
++		if (!tas_block(&c, stage == 1 && i == cfg_pll, NULL)) {
++			return false;
++		}
++		if (stage == 1 && i == cfg_pll) {
++			ran++;
++		}
++	}
++	uint16_t nprog = be16(c.p);
++	tc_skip(&c, 2);
++	for (uint16_t i = 0; i < nprog; i++) {
++		tc_skip(&c, 64);
++		tc_cstr(&c);
++		tc_skip(&c, 3);                 /* app mode, boost */
++		if (!tas_data(&c, stage == 0 && i == TAS_PROGRAM, 1, &ran)) {
++			return false;
++		}
++	}
++	uint16_t ncfg = be16(c.p);
++	tc_skip(&c, 2);
++	for (uint16_t i = 0; i < ncfg; i++) {
++		tc_skip(&c, 64);
++		tc_cstr(&c);
++		if (c.driver >= 0x300) {
++			tc_skip(&c, 2);
++		}
++		tc_skip(&c, 6);                 /* program, PLL, rate */
++		if (c.driver >= 0x400) {
++			tc_skip(&c, 5);         /* PLL source, its rate */
++		}
++		bool mine = i == TAS_CONFIG;
++		if (!tas_data(&c, (stage == 2 || stage == 3) && mine, stage == 2 ? 4 : 3, &ran)) {
++			return false;
++		}
++	}
++	LOG("TAS2557: stage %d: %u block(s)%s", stage, ran, c.bad ? " (file ended early)" : "");
++	return !c.bad && ran > 0;
++}
++
++/* tas2557_set_program(0, 0) + tas2557_enable(true) */
++static bool
++tas_configure(void)
++{
++	static const uint8_t defaults[][4] = {   /* book, page, reg, value */
++		{ 0, 0, 21, 0x05 },             /* SAR ADC2: enable */
++		{ 0, 0, 45, 0x21 },             /* clock error control 2 */
++		{ 0, 0, 46, 0x21 },             /* clock error control 3 */
++		{ 0, 0, 37, 0x5a },             /* safe guard */
++	};
++	static const uint8_t startup[][4] = {
++		{ 0, 1, 77, 0x15 },             /* GPI: DIN, MCLK, CCI */
++		{ 0, 1, 61, 0x01 },             /* GPIO1: BCLK */
++		{ 0, 1, 62, 0x01 },             /* GPIO2: WCLK */
++		{ 0, 0, 5, 0xa0 },              /* class D, boost */
++		{ 0, 0, 5, 0xa3 },              /* + IV sense */
++		{ 0, 0, 4, 0xf8 },              /* PLL, DSP, clock dividers */
++	};
++	uint8_t v = 0;
++	int r = 0;
++
++	if (!tas_fw_read()) {
++		return false;
++	}
++	tas_book = tas_page = -1;
++	r |= tas_wr(0, 0, 1, 0x01);             /* software reset */
++	tas_book = tas_page = -1;
++	IOSleep(1);
++	for (unsigned i = 0; i < sizeof(defaults) / 4; i++) {
++		r |= tas_wr(defaults[i][0], defaults[i][1], defaults[i][2], defaults[i][3]);
++	}
++	r |= tas_rd(0, 1, 1, &v);               /* ASI1 DAC format: 16 bit ([4:3] = 0), DOUT tri-state (bit 0) */
++	r |= tas_wr(0, 1, 1, (uint8_t)((v & ~0x18u) | 0x01u));
++	LOG("t=%u.%03u TAS2557: reset and defaults: %d", T, r);
++	if (r != 0 || !tas_fw_stage(0) || !tas_fw_stage(1) || !tas_fw_stage(2) || !tas_fw_stage(3)) {
++		LOG("TAS2557: firmware load failed");
++		return false;
++	}
++	if (tas_rd(0, 0, 37, &v) != 0 || v != 0x5a) {
++		LOG("TAS2557: safe guard %#x, expected 0x5a", v);
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(startup) / 4; i++) {
++		r |= tas_wr(startup[i][0], startup[i][1], startup[i][2], startup[i][3]);
++	}
++	IODelay(2000);
++	r |= tas_wr(0, 0, 44, 0x2b);            /* clock error detection */
++	r |= tas_wr(0, 0, 7, 0x00);             /* unmute */
++	r |= tas_wr(100, 0, 7, 0x00);           /* soft unmute */
++	uint8_t pw1 = 0, pw2 = 0, spk = 0;
++	(void)tas_rd(0, 0, 4, &pw1);
++	(void)tas_rd(0, 0, 5, &pw2);
++	(void)tas_rd(0, 0, 6, &spk);
++	LOG("t=%u.%03u TAS2557: powered up and unmuted: %d (power %#x %#x, speaker control %#x)", T, r, pw1, pw2, spk);
++	return r == 0;
++}
++
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
+ 
+ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+@@ -2449,7 +2841,11 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			afe_tried = true;
+ 			afe_up = afe_bringup();
+ 			LOG("t=%u.%03u *** AFE speaker port %s ***", T, afe_up ? "RUNNING" : "failed");
+-			LOG("t=%u.%03u *** TAS2557 %s ***", T, tas_probe() ? "answers" : "does not answer");
++			if (tas_probe()) {
++				LOG("t=%u.%03u *** TAS2557 answers; configuration %s ***", T, tas_configure() ? "loaded" : "FAILED");
++			} else {
++				LOG("t=%u.%03u *** TAS2557 does not answer ***", T);
++			}
+ 		}
+ 		stream_poll();
+ 		if (spf_state == 1 && !codec_tried) {
