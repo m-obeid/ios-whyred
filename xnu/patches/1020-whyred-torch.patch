@@ -1,0 +1,156 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index bb7cbbd..9ef243a 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -137,7 +137,8 @@ ws_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+ 	return -1;
+ }
+ /*
+- * The only registers this may write, all on PM660 (SID 1):
++ * The only registers this may write. PM660L (SID 3): the flash LED block 0xd340-0xd34e (whyred_torch).
++ * PM660 (SID 1):
+  *   0x4446       LDO5 EN_CTL, the WCN3990 vdd-cx-mx supply (TopazModem.cpp, wifi=1). Linux turns it on
+  *                through RPM-SMD; ABL leaves it off.
+  *   0xc0xx       the haptics block (live DT qcom,haptic@c000, ERM): EN_CTL 0x46, CFG1 0x4c, SEL 0x4e,
+@@ -146,6 +147,16 @@ ws_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+ static bool
+ ws_write_allowed(unsigned sid, unsigned addr)
+ {
++	if (sid == 3) {
++		/* PM660L flash LED (live DT qcom,leds@d300): whyred_torch below. */
++		switch (addr) {
++		case 0xd340: case 0xd341: case 0xd343: case 0xd344: case 0xd346: case 0xd347:
++		case 0xd349: case 0xd34a: case 0xd34c: case 0xd34d: case 0xd34e:
++			return true;
++		default:
++			return false;
++		}
++	}
+ 	if (sid != 1) {
+ 		return false;
+ 	}
+@@ -532,4 +543,124 @@ whyred_haptic_dev_init(void)
+ 	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
+ 	printf("WHYRED HAPTIC: /dev/redwood-haptic: %s\n", node != NULL ? "ready" : "failed");
+ }
++
++/*
++ * Flashlight: the PM660L flash LED module (SID 3, base 0xd300), LED1 and LED2 in torch mode, the pair
++ * the Android "flashlight" node lights. Sequence of Linux leds-qpnp-flash-v2.c switch_set with SW
++ * strobe: IRES 12.5 mA steps, STROBE_CTRL bit 2 clear, TGR_CURRENT = mA / 12.5 - 1, SAFETY_TMR 0x13
++ * (timer off: torch), MOD_CTRL bit 7, EN_LED_CTRL bits 0-1. HDRM 0x84 = 325 mV, 100 mV window (DT).
++ *
++ * sysctl kern.whyred_torch (any user): 0 off, 1..100 percent; 100 = TORCH_MAX_MA per LED.
++ */
++#define TORCH_BASE      0xd300u
++#define TORCH_SAFETY    0x40u
++#define TORCH_CURRENT   0x43u
++#define TORCH_MOD_CTRL  0x46u
++#define TORCH_IRES      0x47u
++#define TORCH_STROBE    0x49u
++#define TORCH_EN        0x4cu
++#define TORCH_HDRM      0x4du
++#define TORCH_MIN_MA    25u
++#define TORCH_MAX_MA    150u    /* Android lights 100 mA per LED */
++
++static bool torch_ready, torch_broken;
++static int torch_level;
++
++static int
++torch_rmw(unsigned reg, uint8_t mask, uint8_t val)
++{
++	uint8_t v;
++	if (whyred_spmi_read(3, TORCH_BASE + reg, &v) != 0) {
++		return -1;
++	}
++	return whyred_spmi_write(3, TORCH_BASE + reg, (uint8_t)((v & ~mask) | (val & mask)));
++}
++
++/* Called with hap_lock held. */
++static int
++torch_setup(void)
++{
++	if (torch_ready || torch_broken) {
++		return torch_ready ? 0 : -1;
++	}
++	static const uint8_t regs[] = { 0x08, 0x09, 0x10, 0x40, 0x41, 0x43, 0x44, 0x46, 0x47, 0x49, 0x4a, 0x4c, 0x4d, 0x4e };
++	uint8_t v[sizeof(regs)] = { 0 };
++	for (unsigned i = 0; i < sizeof(regs); i++) {
++		if (whyred_spmi_init() != 0 || whyred_spmi_read(3, TORCH_BASE + regs[i], &v[i]) != 0) {
++			printf("WHYRED TORCH: read %#x failed\n", TORCH_BASE + regs[i]);
++			torch_broken = true;
++			return -1;
++		}
++	}
++	printf("WHYRED TORCH: found sts %#x %#x rt %#x tmr %#x %#x cur %#x %#x mod %#x ires %#x strobe %#x %#x en %#x hdrm %#x %#x\n",
++	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]);
++	if (whyred_spmi_write(3, TORCH_BASE + TORCH_HDRM, 0x84) || whyred_spmi_write(3, TORCH_BASE + TORCH_HDRM + 1, 0x84) ||
++	    torch_rmw(TORCH_IRES, 0x0f, 0x00) || torch_rmw(TORCH_STROBE, 0x04, 0) || torch_rmw(TORCH_STROBE + 1, 0x04, 0)) {
++		printf("WHYRED TORCH: configuration refused, flashlight off\n");
++		torch_broken = true;
++		return -1;
++	}
++	torch_ready = true;
++	return 0;
++}
++
++/* Called with hap_lock held. */
++static void
++torch_off(void)
++{
++	(void)torch_rmw(TORCH_EN, 0x03, 0);
++	(void)torch_rmw(TORCH_MOD_CTRL, 0x80, 0);
++	(void)whyred_spmi_write(3, TORCH_BASE + TORCH_CURRENT, 0);
++	(void)whyred_spmi_write(3, TORCH_BASE + TORCH_CURRENT + 1, 0);
++}
++
++/* Light the flashlight at pct percent (0 or less: off). 0 on success. */
++int whyred_torch(int pct);
++int
++whyred_torch(int pct)
++{
++	int r = 0;
++	lck_mtx_lock(&hap_lock);
++	if (pct <= 0) {
++		if (torch_ready) {
++			torch_off();
++		}
++		torch_level = 0;
++	} else if (torch_setup() != 0) {
++		r = -1;
++	} else {
++		pct = pct > 100 ? 100 : pct;
++		unsigned ma = TORCH_MIN_MA + (TORCH_MAX_MA - TORCH_MIN_MA) * (unsigned)pct / 100u;
++		uint8_t code = (uint8_t)((ma * 10u + 62u) / 125u - 1u);
++		if (whyred_spmi_write(3, TORCH_BASE + TORCH_CURRENT, code) ||
++		    whyred_spmi_write(3, TORCH_BASE + TORCH_CURRENT + 1, code) ||
++		    whyred_spmi_write(3, TORCH_BASE + TORCH_SAFETY, 0x13) ||
++		    whyred_spmi_write(3, TORCH_BASE + TORCH_SAFETY + 1, 0x13) ||
++		    torch_rmw(TORCH_MOD_CTRL, 0x80, 0x80) || torch_rmw(TORCH_EN, 0x03, 0x03)) {
++			torch_off();
++			r = -1;
++		} else {
++			uint8_t sts = 0;
++			(void)whyred_spmi_read(3, TORCH_BASE + 0x08, &sts);
++			printf("WHYRED TORCH: %d%%, %u mA per LED (code %u), status %#x\n", pct, ma, code, sts);
++		}
++		torch_level = r == 0 ? pct : 0;
++	}
++	lck_mtx_unlock(&hap_lock);
++	return r;
++}
++
++static int
++sysctl_whyred_torch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = torch_level, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	return whyred_torch(v) == 0 ? 0 : EIO;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_torch, "I", "whyred: flashlight 0 (off) to 100 percent");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
