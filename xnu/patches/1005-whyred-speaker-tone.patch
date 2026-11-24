@@ -1,0 +1,285 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 66e0faf..9060ceb 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1241,6 +1241,7 @@ struct apr_hdr {
+ static uint32_t apr_state = 0xFFFFFFFFu, apr_asks, apr_rxn, apr_token = 0x100;
+ static volatile uint32_t apr_call_token, apr_call_op, apr_call_p0, apr_call_p1;
+ static volatile bool apr_call_done;
++static volatile uint32_t apr_writes_done, apr_write_errs;
+ static unsigned apr_last_ask, apr_ready_ms;
+ 
+ static void
+@@ -1266,6 +1267,13 @@ apr_rx(const uint8_t *data, uint32_t len)
+ 		LOG("t=%u.%03u APR rx svc %u.%u -> %u.%u opcode %#x token %#x, %u bytes, payload %#x %#x", T,
+ 		    h.src_domain, h.src_svc, h.dest_domain, h.dest_svc, h.opcode, h.token, len, p0, p1);
+ 	}
++	if (h.opcode == 0x00010D99u) {          /* ASM_DATA_EVENT_WRITE_DONE_V2 */
++		apr_writes_done++;
++		if (p1 != 0 && apr_write_errs++ < 4) {
++			LOG("t=%u.%03u ASM: write done with status %#x", T, p1);
++		}
++		return;
++	}
+ 	if (apr_call_token != 0 && h.token == apr_call_token) {
+ 		apr_call_op = h.opcode;
+ 		apr_call_p0 = p0;
+@@ -1285,8 +1293,17 @@ apr_rx(const uint8_t *data, uint32_t len)
+ 	}
+ }
+ 
++static bool apr_send_port(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len);
++
+ static bool
+ apr_send(uint8_t svc, uint32_t opcode, const void *payload, uint32_t len)
++{
++	return apr_send_port(svc, 0, opcode, payload, len);
++}
++
++/* src and dest port: ASM addresses a stream as (session << 8) | stream */
++static bool
++apr_send_port(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len)
+ {
+ 	uint8_t buf[256];
+ 	struct apr_hdr h = {};
+@@ -1299,6 +1316,8 @@ apr_send(uint8_t svc, uint32_t opcode, const void *payload, uint32_t len)
+ 	h.src_domain = APR_DOMAIN_APPS;
+ 	h.dest_svc = svc;
+ 	h.dest_domain = APR_DOMAIN_ADSP;
++	h.src_port = port;
++	h.dest_port = port;
+ 	h.token = apr_token++;
+ 	h.opcode = opcode;
+ 	memcpy(buf, &h, sizeof(h));
+@@ -1328,12 +1347,21 @@ apr_poll(void)
+  * One APR command to service svc, pumping GLINK until the reply with its token. The result: the status
+  * of APR_BASIC_RSP_RESULT (0 = done), 0 for any other reply, -1 when nothing came.
+  */
++static int apr_call_port(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len,
++    unsigned timeout_ms);
++
+ static int
+ apr_call(uint8_t svc, uint32_t opcode, const void *payload, uint32_t len, unsigned timeout_ms)
++{
++	return apr_call_port(svc, 0, opcode, payload, len, timeout_ms);
++}
++
++static int
++apr_call_port(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len, unsigned timeout_ms)
+ {
+ 	apr_call_done = false;
+ 	apr_call_token = apr_token;             /* (apr_send uses this token next) */
+-	if (!apr_send(svc, opcode, payload, len)) {
++	if (!apr_send_port(svc, port, opcode, payload, len)) {
+ 		apr_call_token = 0;
+ 		LOG("APR %#x: send failed", opcode);
+ 		return -1;
+@@ -2122,6 +2150,195 @@ tas_configure(void)
+ 	return r == 0;
+ }
+ 
++/* ---------------------------------------------------------------- PCM to the speaker (whyred) */
++
++/*
++ * A stream through the ADSP to PRI_MI2S_RX (Linux techpack/audio dsp/q6asm.c, q6adm.c): the buffer is
++ * mapped for the ADSP (ASM_CMD_SHARED_MEM_MAP_REGIONS), an ASM session plays multichannel PCM (open
++ * write v3 + media format), an ADM COPP joins it to the AFE port (device open v5, null topology) and
++ * the RX matrix routes session to COPP; then RUN and data writes. Audio buffers reach the ADSP through
++ * the LPASS Q6 SMMU (0x5100000, DT msm-audio-ion iommus SID 1): its state for SID 1 is logged first.
++ */
++#define APR_SVC_ASM                     7
++#define APR_SVC_ADM                     8
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS  0x00010D92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS 0x00010D93u
++#define ASM_STREAM_CMD_OPEN_WRITE_V3    0x00010DB3u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 0x00010D98u
++#define ASM_SESSION_CMD_RUN_V2          0x00010DAAu
++#define ASM_DATA_CMD_WRITE_V2           0x00010DABu
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 0x00010DA5u
++#define ASM_STREAM_POSTPROCOPO_ID_NONE  0x00010C68u
++#define ADM_CMD_DEVICE_OPEN_V5          0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5       0x00010329u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5  0x00010325u
++#define NULL_COPP_TOPOLOGY              0x00010312u
++#define LPASS_SMMU_PA                   0x05100000u
++#define TONE_SESSION                    1
++#define TONE_PORT                       ((TONE_SESSION << 8) | 1)
++#define TONE_BUF_BYTES                  (48 * 4 * 100)          /* 100 ms of 48 kHz 16-bit stereo */
++
++extern "C" void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++
++/* SMMUv2 global space: sCR0, IDR0 (number of SMRs), SMR/S2CR entries that match stream id 1 */
++static void
++lpass_smmu_log(void)
++{
++	vm_offset_t g = ml_io_map(LPASS_SMMU_PA, 0x1000);
++	if (g == 0) {
++		LOG("stream: LPASS SMMU not mapped");
++		return;
++	}
++	uint32_t scr0 = trd(g, 0x0), idr0 = trd(g, 0x20), n = idr0 & 0xff, hits = 0;
++	LOG("stream: LPASS SMMU sCR0 %#x (CLIENTPD %u, USFCFG %u) IDR0 %#x, %u SMRs", scr0, scr0 & 1, (scr0 >> 10) & 1, idr0, n);
++	for (uint32_t i = 0; i < n && i < 128; i++) {
++		uint32_t smr = trd(g, 0x800 + 4 * i), s2cr = trd(g, 0xC00 + 4 * i);
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		if ((smr & (1u << 31)) && ((1u & ~mask) == (id & ~mask))) {
++			LOG("stream: SMR %u %#x (id %#x mask %#x) S2CR %#x (type %u, CB %u) matches SID 1", i, smr, id, mask, s2cr,
++			    (s2cr >> 16) & 3, s2cr & 0xff);
++			hits++;
++		}
++	}
++	if (hits == 0) {
++		LOG("stream: no SMR matches SID 1 (unmatched streams %s)", ((scr0 >> 10) & 1) ? "fault" : "bypass");
++	}
++}
++
++static bool
++spk_tone(unsigned seconds)
++{
++	uint64_t pa = 0;
++	int16_t *buf = (int16_t *)topaz_pool_alloc(TONE_BUF_BYTES, &pa);
++	uint32_t p[24], handle = 0, copp = 0;
++	int r;
++
++	lpass_smmu_log();
++	if (buf == NULL) {
++		LOG("stream: no buffer");
++		return false;
++	}
++	/* 1 kHz (48 samples a period at 48 kHz), peak 2000 = about -24 dBFS: quiet on purpose */
++	static const int16_t quarter[13] = { 0, 261, 518, 765, 1000, 1218, 1414, 1587, 1732, 1848, 1932, 1983, 2000 };
++	for (unsigned i = 0; i < TONE_BUF_BYTES / 4; i++) {
++		unsigned j = i % 48, q = j / 12, k = j % 12;
++		int16_t v = (q & 1) ? quarter[12 - k] : quarter[k];
++		if (q >= 2) {
++			v = (int16_t)-v;
++		}
++		buf[2 * i] = buf[2 * i + 1] = v;
++	}
++	mb();
++	LOG("stream: buffer %u bytes at pa %#llx", TONE_BUF_BYTES, pa);
++
++	bzero(p, sizeof(p));
++	p[0] = 3 | (1u << 16);                  /* mem_pool_id SHMEM8_4K, one region */
++	p[1] = 0;                               /* property: physical */
++	p[2] = (uint32_t)pa;
++	p[3] = (uint32_t)(pa >> 32);
++	p[4] = TONE_BUF_BYTES;
++	apr_call_done = false;
++	apr_call_token = apr_token;
++	if (!apr_send_port(APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, p, 20)) {
++		return false;
++	}
++	for (unsigned t = ms(); !apr_call_done && ms() - t < 1000;) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++	}
++	apr_call_token = 0;
++	handle = apr_call_p0;
++	LOG("t=%u.%03u stream: memory map: %s op %#x handle %#x", T, apr_call_done ? "reply" : "NO REPLY", apr_call_op, handle);
++	if (!apr_call_done || apr_call_op != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS) {
++		return false;
++	}
++
++	bzero(p, sizeof(p));
++	p[0] = 0;                               /* mode_flags */
++	p[1] = 0 | (16u << 16);                 /* sink: device matrix, 16 bit */
++	p[2] = ASM_STREAM_POSTPROCOPO_ID_NONE;
++	p[3] = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
++	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, p, 16, 1000);
++	LOG("t=%u.%03u stream: ASM open write: %d", T, r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	p[0] = 20;                              /* fmt_blk_size */
++	p[1] = 2 | (16u << 16);                 /* channels, bits */
++	p[2] = 48000;
++	p[3] = 1;                               /* signed */
++	p[4] = 1 | (2u << 8);                   /* channel map FL, FR */
++	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, p, 24, 1000);
++	LOG("t=%u.%03u stream: media format: %d", T, r);
++	if (r != 0) {
++		return false;
++	}
++
++	bzero(p, sizeof(p));
++	p[0] = 0 | (1u << 16);                  /* flags, mode: RX path COPP */
++	p[1] = AFE_PORT_PRI_MI2S_RX | (0xFFFFu << 16);
++	p[2] = NULL_COPP_TOPOLOGY;
++	p[3] = 2 | (16u << 16);
++	p[4] = 48000;
++	p[5] = 1 | (2u << 8);
++	apr_call_done = false;
++	apr_call_token = apr_token;
++	if (!apr_send_port(APR_SVC_ADM, 0, ADM_CMD_DEVICE_OPEN_V5, p, 32)) {
++		return false;
++	}
++	for (unsigned t = ms(); !apr_call_done && ms() - t < 2000;) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++	}
++	apr_call_token = 0;
++	copp = apr_call_p1;
++	LOG("t=%u.%03u stream: ADM open: %s op %#x status %#x copp %u", T, apr_call_done ? "reply" : "NO REPLY", apr_call_op,
++	    apr_call_p0, copp);
++	if (!apr_call_done || apr_call_op != ADM_CMDRSP_DEVICE_OPEN_V5 || apr_call_p0 != 0) {
++		return false;
++	}
++
++	bzero(p, sizeof(p));
++	p[0] = 0;                               /* matrix RX */
++	p[1] = 1;                               /* one session */
++	p[2] = TONE_SESSION | (1u << 16);       /* session, one COPP */
++	p[3] = copp;                            /* COPP id (u16), padding */
++	r = apr_call(APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, p, 16, 1000);
++	LOG("t=%u.%03u stream: routing: %d", T, r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
++	LOG("t=%u.%03u stream: run: %d", T, r);
++	if (r != 0) {
++		return false;
++	}
++
++	uint32_t sent = 0, start = apr_writes_done;
++	unsigned t0w = ms();
++	while (ms() - t0w < seconds * 1000u) {
++		if (sent - (apr_writes_done - start) < 3) {     /* keep three buffers queued */
++			bzero(p, sizeof(p));
++			p[0] = (uint32_t)pa;
++			p[1] = (uint32_t)(pa >> 32);
++			p[2] = handle;
++			p[3] = TONE_BUF_BYTES;
++			p[4] = sent;
++			(void)apr_send_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_WRITE_V2, p, 32);
++			sent++;
++		}
++		if (!glink_poll()) {
++			IOSleep(2);
++		}
++	}
++	LOG("t=%u.%03u stream: %u writes sent, %u done, %u with errors", T, sent, apr_writes_done - start, apr_write_errs);
++	return apr_writes_done != start;
++}
++
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
+ 
+ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+@@ -2842,7 +3059,11 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			afe_up = afe_bringup();
+ 			LOG("t=%u.%03u *** AFE speaker port %s ***", T, afe_up ? "RUNNING" : "failed");
+ 			if (tas_probe()) {
+-				LOG("t=%u.%03u *** TAS2557 answers; configuration %s ***", T, tas_configure() ? "loaded" : "FAILED");
++				bool cfg_ok = tas_configure();
++				LOG("t=%u.%03u *** TAS2557 answers; configuration %s ***", T, cfg_ok ? "loaded" : "FAILED");
++				if (cfg_ok) {
++					LOG("t=%u.%03u *** tone %s ***", T, spk_tone(3) ? "played" : "FAILED");
++				}
+ 			} else {
+ 				LOG("t=%u.%03u *** TAS2557 does not answer ***", T);
+ 			}
