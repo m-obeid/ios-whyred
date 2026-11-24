@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 9060ceb..b55a3a8 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1598,7 +1598,7 @@ tq_put(const uint8_t *b, unsigned n)
+ static int
+ tq_xfer(uint8_t addr, const uint8_t *w, unsigned wlen, uint8_t *r, unsigned rlen)
+ {
+-	uint8_t buf[40];
++	uint8_t buf[64];                        /* the QUP output FIFO (64 bytes): tag words + data */
+ 	int err = 3;
+ 
+ 	if (wlen + 4 > sizeof(buf) || wlen + 4 > tq_out_fifo || (rlen && rlen + 2 > tq_in_fifo)) {
+@@ -2127,10 +2127,15 @@ tas_configure(void)
+ 	r |= tas_rd(0, 1, 1, &v);               /* ASI1 DAC format: 16 bit ([4:3] = 0), DOUT tri-state (bit 0) */
+ 	r |= tas_wr(0, 1, 1, (uint8_t)((v & ~0x18u) | 0x01u));
+ 	LOG("t=%u.%03u TAS2557: reset and defaults: %d", T, r);
+-	if (r != 0 || !tas_fw_stage(0) || !tas_fw_stage(1) || !tas_fw_stage(2) || !tas_fw_stage(3)) {
+-		LOG("TAS2557: firmware load failed");
++	if (r != 0) {
+ 		return false;
+ 	}
++	for (int st = 0; st < 4; st++) {
++		if (!tas_fw_stage(st)) {
++			LOG("TAS2557: firmware stage %d (0 program, 1 PLL, 2 pre, 3 coefficients) failed", st);
++			return false;
++		}
++	}
+ 	if (tas_rd(0, 0, 37, &v) != 0 || v != 0x5a) {
+ 		LOG("TAS2557: safe guard %#x, expected 0x5a", v);
+ 		return false;
