@@ -990,6 +990,49 @@ INTERPOSE(my_play_opts, AudioServicesPlaySystemSoundWithOptions);
 INTERPOSE(my_play_vibe, AudioServicesPlaySystemSoundWithVibration);
 INTERPOSE(my_stop, AudioServicesStopSystemSound);
 
+/*
+ * Sounds for unattended tests (SpringBoard only): a system sound id written to /var/mobile/whyred_sound
+ * is played by SpringBoard (AudioServicesPlaySystemSound on the main queue), then the file is removed.
+ * A command-line process has no audio session, and its requests never reached mediaserverd's system
+ * sound server; SpringBoard's do.
+ */
+static unsigned int sound_id;
+
+static void
+sound_now(void *unused)
+{
+	(void)unused;
+	char b[24];
+	say("test sound ", hex(b, sound_id));
+	AudioServicesPlaySystemSound(sound_id);
+}
+
+static void *
+sounder(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		sleep(1);
+		char buf[16];
+		int fd = open("/var/mobile/whyred_sound", 0);
+		if (fd < 0) {
+			continue;
+		}
+		long n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		unlink("/var/mobile/whyred_sound");
+		unsigned int v = 0;
+		for (long i = 0; i < n && buf[i] >= '0' && buf[i] <= '9'; i++) {
+			v = v * 10 + (unsigned int)(buf[i] - '0');
+		}
+		if (v != 0) {
+			sound_id = v;
+			dispatch_async_f(&_dispatch_main_q, NULL, sound_now);
+		}
+	}
+	return NULL;
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
@@ -1034,6 +1077,8 @@ whyred_ui_init(void)
 	ci_hooks();
 	if (same_text(getprogname(), "SpringBoard")) {
 		telephony_hooks();
+		long st;
+		pthread_create(&st, NULL, sounder, NULL);
 	}
 	if (same_text(getprogname(), "SpringBoard") || same_text(getprogname(), "Preferences")) {
 		long bt;

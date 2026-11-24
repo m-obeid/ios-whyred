@@ -836,8 +836,18 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   500 / 1000 / 2000 Hz, 0.6 s each + 0.3 s silence. Laptop mic: the three tones in order, total length
   as the file, nothing replayed after the end; each run 129600 frames in, 0 dropped, 1 underrun (the start).
   Gaps not confirmed (a later recording was drowned in room noise).
-- Next: the HAL plug-in (userland/audio/audio_plugin.c) on the phone, VirtualAudio.plugin back from
-  /Library/Audio/Plug-Ins/HAL.disabled, adsp=1 in the default boot-args, TAS2557 gain check.
+- iOS audio (2026-11-24): HackiOS's HAL plug-in userland/audio/audio_plugin.c built by CI
+  (.github/workflows/userland.yml, iOS SDK on macos-15-intel, arm64, ad-hoc signed) as RedwoodAudio.driver
+  in /System/Library/Audio/Plug-Ins/HAL; VirtualAudio.plugin moved back from HAL.disabled to
+  /Library/Audio/Plug-Ins/HAL. mediaserverd activates "Speaker" and routes [Speaker~Speaker~]; no crash.
+  Its say() now also goes to os_log (stderr is lost, /dev/console sandboxed); to read it, the plug-in's
+  /var/db/uuidtext entry must be in the local logarchive.
+- Verified: SpringBoard plays system sound 1106 -> plug-in "playing ... stopped after 3.09 s (0 frames not
+  taken)" -> kernel stream 148480 frames (= 3.09 s) in 3.15 s wall: 48 kHz in real time. A command-line
+  AudioServicesPlaySystemSound never reaches mediaserverd (no audio session); whyred_ui plays an id
+  written to /var/mobile/whyred_sound from inside SpringBoard for tests.
+- adsp=1 is in the default boot-args now (whyred/out/xnu-ios-1017.img).
+- Not yet heard by a person: a listening check with real iOS sounds (keyboard clicks, Safari video).
 
 ## Not yet known
 
