@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 3f6aab7..44a075c 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2183,7 +2183,12 @@ tas_configure(void)
+ #define TONE_PORT                       ((TONE_SESSION << 8) | 1)
+ #define TONE_BUF_BYTES                  (48 * 4 * 100)          /* 100 ms of 48 kHz 16-bit stereo */
+ #define TONE_MAP_BYTES                  ((TONE_BUF_BYTES + 0xfff) & ~0xfffu)   /* the 4K pool maps whole pages */
+-#define AUDIO_SID_BITS_MSW              1u      /* Linux msm_audio_ion: SID 1 << 32 on every address */
++/*
++ * Linux msm_audio_ion puts SID 1 << 32 on every address it gives the ADSP; with the SMR above in bypass
++ * the address is physical, so by default nothing is added (boot-arg adsp_sid=1 adds it, as Linux).
++ */
++static uint32_t audio_sid_msw;
++#define AUDIO_SID_BITS_MSW              audio_sid_msw
+ 
+ extern "C" void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
+ 
+@@ -2236,6 +2241,8 @@ spk_tone(unsigned seconds)
+ 	uint32_t p[24], handle = 0, copp = 0;
+ 	int r;
+ 
++	(void)PE_parse_boot_argn("adsp_sid", &audio_sid_msw, sizeof(audio_sid_msw));
++	LOG("stream: SID bits in the address high word: %u", audio_sid_msw);
+ 	if (!lpass_smmu_sid1()) {
+ 		return false;
+ 	}
+@@ -2256,6 +2263,7 @@ spk_tone(unsigned seconds)
+ 	}
+ 	mb();
+ 	LOG("stream: buffer %u bytes at pa %#llx", TONE_BUF_BYTES, pa);
++	IOSleep(1500);
+ 
+ 	bzero(p, sizeof(p));
+ 	p[0] = 3 | (1u << 16);                  /* mem_pool_id SHMEM8_4K, one region */
+@@ -2288,6 +2296,7 @@ spk_tone(unsigned seconds)
+ 	p[3] = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
+ 	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, p, 16, 1000);
+ 	LOG("t=%u.%03u stream: ASM open write: %d", T, r);
++	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
+ 		return false;
+ 	}
+@@ -2299,6 +2308,7 @@ spk_tone(unsigned seconds)
+ 	p[4] = 1 | (2u << 8);                   /* channel map FL, FR */
+ 	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, p, 24, 1000);
+ 	LOG("t=%u.%03u stream: media format: %d", T, r);
++	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
+ 		return false;
+ 	}
+@@ -2335,16 +2345,20 @@ spk_tone(unsigned seconds)
+ 	p[3] = copp;                            /* COPP id (u16), padding */
+ 	r = apr_call(APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, p, 16, 1000);
+ 	LOG("t=%u.%03u stream: routing: %d", T, r);
++	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
+ 		return false;
+ 	}
+ 	bzero(p, sizeof(p));
+ 	r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
+ 	LOG("t=%u.%03u stream: run: %d", T, r);
++	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	if (r != 0) {
+ 		return false;
+ 	}
+ 
++	LOG("t=%u.%03u stream: first write", T);
++	IOSleep(1500);
+ 	uint32_t sent = 0, start = apr_writes_done;
+ 	unsigned t0w = ms();
+ 	while (ms() - t0w < seconds * 1000u) {
+@@ -2363,6 +2377,7 @@ spk_tone(unsigned seconds)
+ 		}
+ 	}
+ 	LOG("t=%u.%03u stream: %u writes sent, %u done, %u with errors", T, sent, apr_writes_done - start, apr_write_errs);
++	IOSleep(1500);                         /* (let the UDP log out before the next step) */
+ 	return apr_writes_done != start;
+ }
+ 
