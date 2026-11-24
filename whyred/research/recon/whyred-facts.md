@@ -792,8 +792,20 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - The iOS side exists in the repo: userland/audio/audio_plugin.c (HackiOS RedwoodAudio HAL plug-in:
   Speaker, Hawking, Actuator = Taptic output, Codec mic) writing to /dev/redwood-audio (and
   /dev/redwood-haptic); TopazAudio provides /dev/topaz-audio + the redwood alias (0935).
-- Next (milestone 2): AFE on the TAS2557's MI2S port with the LPASS clocks through the ADSP, TAS2557
-  setup over I2C, then PCM through an ASM stream.
+- Speaker path (Linux sdm660-internal.c, DT): PRI_MI2S_RX (AFE port 0x1000, msm-dai-q6-mi2s.0, rx-lines
+  1 = SD0, tx-lines 2 = SD1 for the amp's feedback) -> "tas2557 ASI1" (ti,i2s-bits 16). Pins GPIO 12 SCK
+  (pri_mi2s, func 2), 13 WS (pri_mi2s_ws, func 3), 14 SD0, 15 SD1 (func 3), 8 mA, no pull (NORTH tile).
+- 1002 (verified, CI 45295258705/45295642148): APR to AFE (svc 4), v1 parameter packets:
+  AFE_SVC_CMD_SET_PARAM 0x100f3 + AFE_MODULE_CLOCK_SET/AFE_PARAM_ID_CLOCK_SET (PRI_MI2S_IBIT 0x100,
+  1.536 MHz, attr COUPLE_NO) status 0; AFE_PORT_CMD_SET_PARAM_V2 0x100ef + I2S_CONFIG (16 bit, SD0,
+  stereo, WS internal, 48 kHz) status 0; AFE_PORT_CMD_DEVICE_START 0x100e5 status 0.
+- TAS2557 on BLSP2 QUP2 (0xc1b6000; GPIO 22/23 func 3, CENTER tile 0x03500000; GCC BLSP2 AHB vote 0x52004
+  bit 15, CBCR 0x25004; QUP2 I2C RCG 0x28020/0x28024, CBCR 0x28008). QUP hw 0x20070000, FIFO 64/64.
+  Reset GPIO 77 low 5 ms then high. 1003 (verified): book 0 / page 0, register 3 = 0xa0 (PG2.1): the
+  firmware is tas2557_uCDSP.bin (24 KB, in whyred-linux build/firmware; vendor file, not in git).
+  pm660l_l6 (its supply) was already on.
+- Next: the TAS2557 configuration (TI firmware format: programs, configurations, register blocks) and
+  PCM through ASM + ADM routing to PRI_MI2S_RX.
 
 ## Not yet known
 
