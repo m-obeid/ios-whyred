@@ -991,6 +991,138 @@ INTERPOSE(my_play_vibe, AudioServicesPlaySystemSoundWithVibration);
 INTERPOSE(my_stop, AudioServicesStopSystemSound);
 
 /*
+ * Flashlight (SpringBoard only). Control Center and the lock screen button go through
+ * SBUIFlashlightController to AVFlashlight, which asks mediaserverd's camera stack for the LED. This
+ * phone has no camera driver, so AVFlashlight is answered here: it exists, it is available, never
+ * overheated, and a level (0..1) goes to the PM660L flash LED through sysctl kern.whyred_torch
+ * (patch 1020). Level changes post KVO for "flashlightLevel", which SBUIFlashlightController observes.
+ * Its server setup and reconnect are skipped.
+ */
+static float fl_level;
+
+static void
+fl_drive(float level)
+{
+	int pct = level <= 0 ? 0 : (int)(level * 100.0f + 0.5f);
+	pct = level > 0 && pct < 1 ? 1 : pct;
+	(void)sysctlbyname("kern.whyred_torch", NULL, NULL, &pct, sizeof(pct));
+}
+
+static void
+fl_set(id self, float level)
+{
+	id key = nsstr("flashlightLevel");
+	((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("willChangeValueForKey:"), key);
+	fl_level = level;
+	fl_drive(level);
+	((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("didChangeValueForKey:"), key);
+	CFRelease(key);
+}
+
+static signed char fl_yes(id self, SEL cmd) { (void)self; (void)cmd; return 1; }
+static signed char fl_no(id self, SEL cmd) { (void)self; (void)cmd; return 0; }
+static void fl_nothing(id self, SEL cmd) { (void)self; (void)cmd; }
+static float fl_get(id self, SEL cmd) { (void)self; (void)cmd; return fl_level; }
+
+static signed char
+fl_set_level(id self, SEL cmd, float level, id *error)
+{
+	(void)cmd;
+	static int said;
+	if (said++ < 8) {
+		char b[24];
+		num(b, level * 100.0f);
+		say("flashlight: level (percent) ", b);
+	}
+	if (error != NULL) {
+		*error = NULL;
+	}
+	fl_set(self, level < 0 ? 0 : (level > 1 ? 1 : level));
+	return 1;
+}
+
+static signed char
+fl_power_on(id self, SEL cmd, id *error)
+{
+	(void)self;
+	(void)cmd;
+	if (error != NULL) {
+		*error = NULL;
+	}
+	return 1;
+}
+
+static void
+fl_power_off(id self, SEL cmd)
+{
+	(void)cmd;
+	fl_set(self, 0);
+}
+
+/* One method of cls (or its metaclass) by name and type, found without running +initialize. */
+static int
+fl_swap(Class cls, const char *name, const char *type, IMP imp)
+{
+	SEL sel = sel_registerName(name);
+	unsigned int count = 0;
+	Method *list = class_copyMethodList(cls, &count), m = NULL;
+	for (unsigned int i = 0; list != NULL && i < count; i++) {
+		if (method_getName(list[i]) == sel) {
+			m = list[i];
+		}
+	}
+	free(list);
+	if (m == NULL || !same_text(method_getTypeEncoding(m), type)) {
+		say("flashlight: not hooked ", name);
+		return 0;
+	}
+	method_setImplementation(m, imp);
+	return 1;
+}
+
+static int
+fl_hooks(void)
+{
+	Class c = objc_getClass("AVFlashlight");
+	if (c == NULL) {
+		return 0;
+	}
+	int n = fl_swap(object_getClass((id)c), "hasFlashlight", "B16@0:8", (IMP)fl_yes);
+	n += fl_swap(c, "_setupFlashlight", "v16@0:8", (IMP)fl_nothing);
+	n += fl_swap(c, "_reconnectToServer", "v16@0:8", (IMP)fl_nothing);
+	n += fl_swap(c, "_teardownFlashlight", "v16@0:8", (IMP)fl_nothing);
+	n += fl_swap(c, "isAvailable", "B16@0:8", (IMP)fl_yes);
+	n += fl_swap(c, "isOverheated", "B16@0:8", (IMP)fl_no);
+	n += fl_swap(c, "flashlightLevel", "f16@0:8", (IMP)fl_get);
+	n += fl_swap(c, "setFlashlightLevel:withError:", "B28@0:8f16^@20", (IMP)fl_set_level);
+	n += fl_swap(c, "turnPowerOnWithError:", "B24@0:8^@16", (IMP)fl_power_on);
+	n += fl_swap(c, "turnPowerOff", "v16@0:8", (IMP)fl_power_off);
+	say("flashlight: AVFlashlight hooked, methods ", n == 10 ? "10 of 10" : "some missing");
+	return 1;
+}
+
+/*
+ * SpringBoard loads AVFCapture only when the flashlight is first wanted, after this constructor. So a
+ * thread loads it now and hooks it before any UI asks. (Hooking from a dyld add-image callback made
+ * +[SpringBoardUI load] abort: "This process should not be linking or loading SpringBoardUI".)
+ */
+extern void *dlopen(const char *path, int mode);
+
+static void *
+fl_hook_thread(void *arg)
+{
+	(void)arg;
+	if (dlopen("/System/Library/PrivateFrameworks/AVFCapture.framework/AVFCapture", 1) == NULL) {
+		say("flashlight: ", "AVFCapture did not load");
+		return NULL;
+	}
+	if (!fl_hooks()) {
+		say("flashlight: ", "no AVFlashlight class");
+	}
+	return NULL;
+}
+
+/*
  * Sounds for unattended tests (SpringBoard only): a system sound id written to /var/mobile/whyred_sound
  * is played by SpringBoard (AudioServicesPlaySystemSound on the main queue), then the file is removed.
  * A command-line process has no audio session, and its requests never reached mediaserverd's system
@@ -1077,6 +1209,8 @@ whyred_ui_init(void)
 	ci_hooks();
 	if (same_text(getprogname(), "SpringBoard")) {
 		telephony_hooks();
+		long ft;
+		pthread_create(&ft, NULL, fl_hook_thread, NULL);
 		long st;
 		pthread_create(&st, NULL, sounder, NULL);
 	}
