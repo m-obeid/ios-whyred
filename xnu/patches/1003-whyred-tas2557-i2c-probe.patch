@@ -1,0 +1,304 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 7a7646c..0352222 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1445,6 +1445,291 @@ afe_bringup(void)
+ 	return r == 0;
+ }
+ 
++/* ---------------------------------------------------------------- TAS2557 on I2C 6 (whyred) */
++
++/*
++ * The speaker amplifier: TI TAS2557 at 0x4c on BLSP2 QUP2 (DT i2c@c1b6000, 400 kHz from 19.2 MHz;
++ * pins GPIO 22 SDA / 23 SCL, function blsp_i2c6 = 3, CENTER tile; supply pm660l_l6), reset GPIO 77
++ * (NORTH tile, high = running). Clocks from Linux gcc-sdm660.c: BLSP2 AHB vote 0x52004 bit 15, CBCR
++ * 0x25004; QUP2 I2C APPS RCG 0x28020/0x28024, CBCR 0x28008. The QUP v2 FIFO-mode engine is the one of
++ * bsd/dev/sweet_syna.c (touch, BLSP1 QUP1), here for this controller. Registers are book/page/reg:
++ * register 0 selects the page, register 127 (in page 0) the book (Linux tas2557-regmap.c).
++ */
++#define T_GCC_PA                0x00100000u
++#define T_GCC_BLSP2_AHB_VOTE    0x52004u
++#define T_GCC_BLSP2_AHB_CBCR    0x25004u
++#define T_GCC_QUP2_I2C_CBCR     0x28008u
++#define T_GCC_QUP2_I2C_CMD      0x28020u
++#define T_GCC_QUP2_I2C_CFG      0x28024u
++#define T_CBCR_OFF              (1u << 31)
++#define T_TLMM_CENTER           0x03500000u
++#define T_QUP_PA                0x0c1b6000u
++#define TAS_ADDR                0x4c
++#define TAS_RESET_GPIO          77
++#define TQ_CONFIG               0x000
++#define TQ_STATE                0x004
++#define TQ_IO_MODE              0x008
++#define TQ_SW_RESET             0x00c
++#define TQ_OPERATIONAL          0x018
++#define TQ_ERROR_FLAGS          0x01c
++#define TQ_HW_VERSION           0x030
++#define TQ_MX_OUTPUT_CNT        0x100
++#define TQ_OUT_FIFO             0x110
++#define TQ_MX_WRITE_CNT         0x150
++#define TQ_MX_INPUT_CNT         0x200
++#define TQ_MX_READ_CNT          0x208
++#define TQ_IN_FIFO              0x218
++#define TQ_I2C_CLK_CTL          0x400
++#define TQ_I2C_STATUS           0x404
++#define TQ_I2C_MASTER_GEN       0x408
++#define TQ_CFG_I2C              ((2u << 8) | 7u)
++#define TQ_CFG_NO_INPUT         (1u << 7)
++#define TQ_CNT_DURING_RUN       (1u << 31)
++#define TQ_ERR_MASK             0x38000fcu
++#define TQ_BUS_ACTIVE           (1u << 8)
++#define TQ_CLK_100K             0x0000035du
++#define TQ_TAG_START            0x81u
++#define TQ_TAG_WRITE            0x82u
++#define TQ_TAG_WRITE_STOP       0x83u
++#define TQ_TAG_READ_STOP        0x87u
++
++static vm_offset_t tgcc, tqup;
++static unsigned tq_in_fifo, tq_out_fifo;
++
++static inline uint32_t trd(vm_offset_t b, uint32_t o) { uint32_t v = *(volatile uint32_t *)(b + o); __asm__ volatile("dmb oshld" ::: "memory"); return v; }
++static inline void twr(vm_offset_t b, uint32_t o, uint32_t v) { __asm__ volatile("dmb oshst" ::: "memory"); *(volatile uint32_t *)(b + o) = v; __asm__ volatile("dsb osh" ::: "memory"); }
++
++static bool
++twait(vm_offset_t b, uint32_t o, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; i++) {
++		if ((trd(b, o) & mask) == want) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static bool
++tq_state(uint32_t st)
++{
++	if (!twait(tqup, TQ_STATE, 1u << 2, 1u << 2, 10000)) {
++		return false;
++	}
++	twr(tqup, TQ_STATE, st);
++	return twait(tqup, TQ_STATE, (1u << 2) | 3u, (1u << 2) | st, 10000);
++}
++
++static int
++tq_check(void)
++{
++	uint32_t st = trd(tqup, TQ_I2C_STATUS), err = trd(tqup, TQ_ERROR_FLAGS);
++	if ((st & TQ_ERR_MASK) || (err & 0x7cu)) {
++		twr(tqup, TQ_I2C_STATUS, 0xfffffcu);
++		twr(tqup, TQ_ERROR_FLAGS, err);
++		return (st & (1u << 3)) ? 2 : 1;        /* 2 = NACK */
++	}
++	return 0;
++}
++
++static bool
++tq_begin(void)
++{
++	twr(tqup, TQ_SW_RESET, 1);
++	if (!twait(tqup, TQ_STATE, (1u << 2) | 3u, (1u << 2) | 0u, 10000)) {
++		return false;
++	}
++	twr(tqup, TQ_CONFIG, TQ_CFG_I2C);
++	twr(tqup, TQ_I2C_MASTER_GEN, 1);
++	if (!twait(tqup, TQ_STATE, 1u << 4, 1u << 4, 10000)) {
++		return false;
++	}
++	twr(tqup, TQ_MX_OUTPUT_CNT, 0);
++	twr(tqup, TQ_MX_INPUT_CNT, 0);
++	twr(tqup, TQ_IO_MODE, 0xc000u);
++	return true;
++}
++
++static void
++tq_put(const uint8_t *b, unsigned n)
++{
++	for (unsigned i = 0; i < n; i += 4) {
++		uint32_t w = 0;
++		for (unsigned j = 0; j < 4 && i + j < n; j++) {
++			w |= (uint32_t)b[i + j] << (8 * j);
++		}
++		twr(tqup, TQ_OUT_FIFO, w);
++	}
++}
++
++/* write wlen bytes, then (if rlen) a repeated start and read rlen bytes. 0, 1 error, 2 NACK, 3 timeout */
++static int
++tq_xfer(uint8_t addr, const uint8_t *w, unsigned wlen, uint8_t *r, unsigned rlen)
++{
++	uint8_t buf[40];
++	int err = 3;
++
++	if (wlen + 4 > sizeof(buf) || wlen + 4 > tq_out_fifo || (rlen && rlen + 2 > tq_in_fifo)) {
++		return 1;
++	}
++	if (!tq_begin()) {
++		return 3;
++	}
++	buf[0] = TQ_TAG_START;
++	buf[1] = (uint8_t)(addr << 1);
++	buf[2] = rlen ? TQ_TAG_WRITE : TQ_TAG_WRITE_STOP;
++	buf[3] = (uint8_t)wlen;
++	memcpy(buf + 4, w, wlen);
++	twr(tqup, TQ_MX_WRITE_CNT, wlen + 4);
++	twr(tqup, TQ_CONFIG, TQ_CFG_I2C | TQ_CFG_NO_INPUT);
++	if (!tq_state(1)) {
++		goto out;
++	}
++	twr(tqup, TQ_I2C_CLK_CTL, TQ_CLK_100K);
++	if (!tq_state(3)) {
++		goto out;
++	}
++	tq_put(buf, wlen + 4);
++	if (!tq_state(1)) {
++		goto out;
++	}
++	for (unsigned i = 0; i < 20000; i++) {
++		if ((err = tq_check()) != 0) {
++			goto out;
++		}
++		if (trd(tqup, TQ_OPERATIONAL) & (1u << 10)) {
++			break;
++		}
++		IODelay(1);
++		err = 3;
++	}
++	if (err == 3) {
++		goto out;
++	}
++	twr(tqup, TQ_OPERATIONAL, 1u << 10);
++	if (rlen) {
++		if (!tq_state(3)) {
++			err = 3;
++			goto out;
++		}
++		uint8_t tags[4] = { TQ_TAG_START, (uint8_t)((addr << 1) | 1u), TQ_TAG_READ_STOP, (uint8_t)rlen };
++		twr(tqup, TQ_MX_WRITE_CNT, TQ_CNT_DURING_RUN | 4u);
++		twr(tqup, TQ_MX_READ_CNT, TQ_CNT_DURING_RUN | (rlen + 2));
++		twr(tqup, TQ_CONFIG, TQ_CFG_I2C);
++		tq_put(tags, 4);
++		if (!tq_state(1)) {
++			err = 3;
++			goto out;
++		}
++		unsigned got = 0, total = rlen + 2;
++		err = 3;
++		for (unsigned i = 0; i < 40000 && got < total; i++) {
++			int e = tq_check();
++			if (e) {
++				err = e;
++				goto out;
++			}
++			if (trd(tqup, TQ_OPERATIONAL) & (1u << 5)) {
++				uint32_t word = trd(tqup, TQ_IN_FIFO);
++				for (unsigned j = 0; j < 4 && got < total; j++, got++) {
++					if (got >= 2) {
++						r[got - 2] = (uint8_t)(word >> (8 * j));
++					}
++				}
++				continue;
++			}
++			IODelay(1);
++		}
++		if (got < total) {
++			goto out;
++		}
++		twr(tqup, TQ_OPERATIONAL, (1u << 11) | (1u << 10));
++	}
++	err = twait(tqup, TQ_I2C_STATUS, TQ_BUS_ACTIVE, 0, 20000) ? 0 : 3;
++out:
++	(void)tq_state(0);
++	return err;
++}
++
++static int
++tas_write(uint8_t reg, uint8_t val)
++{
++	uint8_t w[2] = { reg, val };
++	return tq_xfer(TAS_ADDR, w, 2, NULL, 0);
++}
++
++static int
++tas_read(uint8_t reg, uint8_t *val)
++{
++	return tq_xfer(TAS_ADDR, &reg, 1, val, 1);
++}
++
++static bool
++tas_bus_on(void)
++{
++	tgcc = ml_io_map(T_GCC_PA, 0x60000);
++	tqup = ml_io_map(T_QUP_PA, 0x1000);
++	vm_offset_t sda = ml_io_map(T_TLMM_CENTER + 0x1000u * 22, 0x1000);
++	vm_offset_t scl = ml_io_map(T_TLMM_CENTER + 0x1000u * 23, 0x1000);
++	if (!tgcc || !tqup || !sda || !scl) {
++		LOG("TAS2557: mappings failed");
++		return false;
++	}
++	LOG("TAS2557: before: ahb-vote %#x ahb-cbcr %#x qup2-cbcr %#x rcg %#x/%#x, gpio22 %#x gpio23 %#x",
++	    trd(tgcc, T_GCC_BLSP2_AHB_VOTE), trd(tgcc, T_GCC_BLSP2_AHB_CBCR), trd(tgcc, T_GCC_QUP2_I2C_CBCR),
++	    trd(tgcc, T_GCC_QUP2_I2C_CMD), trd(tgcc, T_GCC_QUP2_I2C_CFG), trd(sda, 0), trd(scl, 0));
++	twr(tgcc, T_GCC_BLSP2_AHB_VOTE, trd(tgcc, T_GCC_BLSP2_AHB_VOTE) | (1u << 15));
++	if (!twait(tgcc, T_GCC_BLSP2_AHB_CBCR, T_CBCR_OFF, 0, 5000)) {
++		LOG("TAS2557: BLSP2 AHB clock stays off (%#x)", trd(tgcc, T_GCC_BLSP2_AHB_CBCR));
++		return false;
++	}
++	twr(tgcc, T_GCC_QUP2_I2C_CFG, 0x1);    /* XO 19.2 MHz, divide by 1 */
++	twr(tgcc, T_GCC_QUP2_I2C_CMD, trd(tgcc, T_GCC_QUP2_I2C_CMD) | 1u);
++	if (!twait(tgcc, T_GCC_QUP2_I2C_CMD, 1u, 0, 5000)) {
++		LOG("TAS2557: QUP2 I2C RCG update stuck");
++		return false;
++	}
++	twr(tgcc, T_GCC_QUP2_I2C_CBCR, trd(tgcc, T_GCC_QUP2_I2C_CBCR) | 1u);
++	if (!twait(tgcc, T_GCC_QUP2_I2C_CBCR, T_CBCR_OFF, 0, 5000)) {
++		LOG("TAS2557: QUP2 I2C clock stays off (%#x)", trd(tgcc, T_GCC_QUP2_I2C_CBCR));
++		return false;
++	}
++	twr(sda, 0, 3u << 2);                   /* blsp_i2c6, 2 mA, no pull (DT i2c_6_active) */
++	twr(scl, 0, 3u << 2);
++	uint32_t io = trd(tqup, TQ_IO_MODE);
++	static const unsigned blk[4] = { 4, 16, 32, 4 };
++	tq_out_fifo = blk[io & 3u] * (2u << ((io >> 2) & 7u));
++	tq_in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
++	LOG("TAS2557: QUP hw %#x io_mode %#x (fifo out %u in %u)", trd(tqup, TQ_HW_VERSION), io, tq_out_fifo, tq_in_fifo);
++	return true;
++}
++
++/* Reset pulse on GPIO 77, then book 0 / page 0 and the revision register (0xa0 = PG2.1). */
++static bool
++tas_probe(void)
++{
++	vm_offset_t rst = ml_io_map(TLMM_NORTH_PA + 0x1000u * TAS_RESET_GPIO, 0x1000);
++	uint8_t pg = 0;
++	int r1, r2, r3;
++
++	if (!tas_bus_on() || rst == 0) {
++		return false;
++	}
++	LOG("TAS2557: reset gpio cfg %#x io %#x", trd(rst, 0), trd(rst, 4));
++	twr(rst, 0, 1u << 9);                   /* GPIO, output, 2 mA */
++	twr(rst, 4, 0);
++	IOSleep(5);
++	twr(rst, 4, 1u << 1);
++	IOSleep(5);
++	r1 = tas_write(0x00, 0);                /* page 0 */
++	r2 = tas_write(0x7f, 0);                /* book 0 */
++	r3 = tas_read(0x03, &pg);
++	LOG("t=%u.%03u TAS2557: page %d book %d read %d: revision/PGID %#x (%s)", T, r1, r2, r3, pg,
++	    pg == 0xa0 ? "PG2.1" : pg == 0x90 ? "PG2.0" : pg == 0x80 ? "PG1.0" : "unknown");
++	return r3 == 0;
++}
++
+ /* ---------------------------------------------------------------- GPR calls (wait for the reply) */
+ 
+ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+@@ -2164,6 +2449,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			afe_tried = true;
+ 			afe_up = afe_bringup();
+ 			LOG("t=%u.%03u *** AFE speaker port %s ***", T, afe_up ? "RUNNING" : "failed");
++			LOG("t=%u.%03u *** TAS2557 %s ***", T, tas_probe() ? "answers" : "does not answer");
+ 		}
+ 		stream_poll();
+ 		if (spf_state == 1 && !codec_tried) {
