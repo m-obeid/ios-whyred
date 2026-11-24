@@ -1,0 +1,54 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index f539a57..1ded2cb 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2291,7 +2291,8 @@ lpass_smmu_sid1(void)
+  * (SID 1 through the identity bank above), and while playing the audio thread hands it to the ADSP in
+  * 20 ms chunks (ASM_DATA_CMD_WRITE_V2), four in flight, the next one on each write-done. write() puts
+  * frames 40 ms ahead of what was handed over and zeroes the ring behind the data, so nothing old
+- * replays. The session runs when frames come and pauses 0.5 s after the last one; the TAS2557 is
++ * replays, and each chunk the ADSP is done with is zeroed (1017: without it, when the writer fell behind,
++ * the ADSP was handed the ring's content of a second ago). The session runs when frames come and pauses 0.5 s after the last one; the TAS2557 is
+  * powered with it (Linux tas2557 startup / shutdown data), so the idle phone pays for neither.
+  * Volume: iOS's (eighths of a dB under the loudest, or muted) scales the samples as they are copied.
+  * Verified first with a 1 kHz tone (2026-11-24): 34 buffers of 100 ms played, the laptop mic heard it.
+@@ -2306,7 +2307,7 @@ lpass_smmu_sid1(void)
+ 
+ static uint8_t *as_ring;
+ static uint64_t as_pa;
+-static uint32_t as_handle, as_sent, as_done_base;
++static uint32_t as_handle, as_sent, as_done_base, as_start_off, as_zeroed;
+ static bool as_ready;
+ static volatile bool as_playing;
+ static volatile uint32_t as_sent_off, as_write_off;
+@@ -2494,6 +2495,8 @@ as_start(void)
+ 	int r = apr_call_port(APR_SVC_ASM, TONE_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
+ 	as_done_base = apr_writes_done;
+ 	as_sent = 0;
++	as_zeroed = 0;
++	as_start_off = as_sent_off;
+ 	as_playing = true;
+ 	LOG("t=%u.%03u stream: playing (amp %d, run %d)", T, amp, r);
+ }
+@@ -2532,7 +2535,20 @@ as_poll(uint32_t below, uint32_t muted, bool vol_changed)
+ 	if (!as_playing) {
+ 		return;
+ 	}
+-	while (as_sent - (apr_writes_done - as_done_base) < AS_INFLIGHT) {
++	/*
++	 * Chunks the ADSP is done with become silence: when the writer falls behind (or stops), what the
++	 * ADSP is handed next is zeros, not the ring's content of a second ago.
++	 */
++	uint32_t done = apr_writes_done - as_done_base;
++	if (as_zeroed < done) {
++		IOLockLock(as_lock);
++		while (as_zeroed < done) {
++			bzero(as_ring + (as_start_off + as_zeroed * AS_CHUNK) % AS_RING_BYTES, AS_CHUNK);
++			as_zeroed++;
++		}
++		IOLockUnlock(as_lock);
++	}
++	while (as_sent - done < AS_INFLIGHT) {
+ 		uint32_t p[8];
+ 		IOLockLock(as_lock);
+ 		uint32_t off = as_sent_off;

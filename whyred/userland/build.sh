@@ -10,3 +10,6 @@ ls -l out/whyred_ui.dylib
 # vibe: test tool, AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) (run it with whyred_ui injected)
 clang -target arm64-apple-ios16.0 -O2 -c tools/vibe.c -o out/vibe.o
 ld64.lld -arch arm64 -platform_version ios 16.0 16.0 -adhoc_codesign out/vibe.o stubs/libSystem.tbd stubs/AudioToolbox.tbd -o out/vibe
+# pcmplay: raw 48 kHz 16-bit stereo to /dev/topaz-audio at the real-time pace
+clang -target arm64-apple-ios16.0 -O2 -c tools/pcmplay.c -o out/pcmplay.o
+ld64.lld -arch arm64 -platform_version ios 16.0 16.0 -adhoc_codesign out/pcmplay.o stubs/libSystem.tbd -o out/pcmplay
