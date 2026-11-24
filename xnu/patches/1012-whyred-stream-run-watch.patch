@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index b80224c..7a547a5 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2357,6 +2357,26 @@ spk_tone(unsigned seconds)
+ 		return false;
+ 	}
+ 
++	/* without any write first: does the running session alone (RUN) take the phone down? */
++	{
++		vm_offset_t g0 = ml_io_map(LPASS_SMMU_PA, 0x1000);
++		for (unsigned k = 0; k < 16; k++) {
++			for (unsigned t = ms(); ms() - t < 300;) {
++				if (!glink_poll()) {
++					IOSleep(2);
++				}
++			}
++			LOG("t=%u.%03u stream: after run, no data, %u ms: slave-kernel %08x, sGFSR %#x", T, 300 * (k + 1), *adsp_state,
++			    g0 ? trd(g0, 0x48) : 0);
++			IOSleep(200);
++			if (*adsp_state & 1) {
++				LOG("t=%u.%03u stream: ADSP FATAL while running without data", T);
++				crash_reason();
++				IOSleep(2000);
++				return false;
++			}
++		}
++	}
+ 	LOG("t=%u.%03u stream: first write", T);
+ 	IOSleep(1500);
+ 	/* one write, then five seconds of watching (the phone reset right after the first write) */
