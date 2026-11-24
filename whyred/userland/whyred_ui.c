@@ -1000,11 +1000,28 @@ INTERPOSE(my_stop, AudioServicesStopSystemSound);
  */
 static float fl_level;
 
+/*
+ * The LED keeps the current it had when switched on (measured: Control Center's four levels all
+ * looked the same), so a new level while lit switches it off first, as Android's camera HAL does.
+ * Repeats of the same level are dropped (the slider sends many).
+ */
+static int fl_pct;
+
 static void
 fl_drive(float level)
 {
-	int pct = level <= 0 ? 0 : (int)(level * 100.0f + 0.5f);
-	pct = level > 0 && pct < 1 ? 1 : pct;
+	/* Control Center sends 0.25, 0.5, 0.85, 1. Squared: 25, 50, 112, 150 mA per LED (the lowest
+	 * was 50 mA, too bright). */
+	int pct = level <= 0 ? 0 : (int)(level * level * 100.0f + 0.5f);
+	pct = level > 0 && (pct < 1 || level <= 0.3f) ? 1 : pct;
+	if (pct == fl_pct) {
+		return;
+	}
+	if (pct > 0 && fl_pct > 0) {
+		int off = 0;
+		(void)sysctlbyname("kern.whyred_torch", NULL, NULL, &off, sizeof(off));
+	}
+	fl_pct = pct;
 	(void)sysctlbyname("kern.whyred_torch", NULL, NULL, &pct, sizeof(pct));
 }
 
@@ -1046,6 +1063,7 @@ fl_power_on(id self, SEL cmd, id *error)
 {
 	(void)self;
 	(void)cmd;
+	say("flashlight: ", "turnPowerOnWithError:");
 	if (error != NULL) {
 		*error = NULL;
 	}
@@ -1057,6 +1075,21 @@ fl_power_off(id self, SEL cmd)
 {
 	(void)cmd;
 	fl_set(self, 0);
+}
+
+/*
+ * -[AVFlashlight init] returns nil when _setupFlashlight leaves no FigFlashlight (the camera server
+ * handle), so the controller saw no flashlight. NSObject's init is all the object needs here.
+ */
+static id
+fl_init(id self, SEL cmd)
+{
+	static id (*ns_init)(id, SEL);
+	if (ns_init == NULL) {
+		ns_init = (id (*)(id, SEL))method_getImplementation(class_getInstanceMethod(objc_getClass("NSObject"), cmd));
+	}
+	say("flashlight: ", "AVFlashlight init");
+	return ns_init(self, cmd);
 }
 
 /* One method of cls (or its metaclass) by name and type, found without running +initialize. */
@@ -1080,14 +1113,89 @@ fl_swap(Class cls, const char *name, const char *type, IMP imp)
 	return 1;
 }
 
+/* SBUIFlashlightController, logged to see which calls Control Center makes. */
+static void (*orig_sb_set)(id, SEL, unsigned long long);
+static void (*orig_sb_on)(id, SEL, id);
+static void (*orig_sb_flevel)(id, SEL, float);
+static signed char (*orig_sb_avail)(id, SEL);
+static int sb_said;
+
+static void
+sb_set(id self, SEL cmd, unsigned long long level)
+{
+	char b[24];
+	if (sb_said++ < 40) {
+		say("flashlight: controller setLevel: ", num(b, (double)level));
+	}
+	orig_sb_set(self, cmd, level);
+}
+
+static void
+sb_on(id self, SEL cmd, id reason)
+{
+	if (sb_said++ < 40) {
+		say("flashlight: controller turnFlashlightOnForReason:", "");
+	}
+	orig_sb_on(self, cmd, reason);
+}
+
+static void
+sb_flevel(id self, SEL cmd, float level)
+{
+	char b[24];
+	if (sb_said++ < 40) {
+		say("flashlight: controller _setFlashlightLevel: (percent) ", num(b, level * 100.0f));
+	}
+	orig_sb_flevel(self, cmd, level);
+}
+
+static signed char
+sb_avail(id self, SEL cmd)
+{
+	signed char r = orig_sb_avail(self, cmd);
+	if (sb_said++ < 40) {
+		say("flashlight: controller isAvailable ", r ? "YES" : "NO");
+	}
+	return r;
+}
+
+static void
+sb_hook(Class c, const char *name, const char *type, IMP imp, void **orig)
+{
+	SEL sel = sel_registerName(name);
+	unsigned int count = 0;
+	Method *list = class_copyMethodList(c, &count), m = NULL;
+	for (unsigned int i = 0; list != NULL && i < count; i++) {
+		if (method_getName(list[i]) == sel) {
+			m = list[i];
+		}
+	}
+	free(list);
+	if (m == NULL || !same_text(method_getTypeEncoding(m), type)) {
+		say("flashlight: controller not hooked ", name);
+		return;
+	}
+	*orig = (void *)method_setImplementation(m, imp);
+}
+
 static int
 fl_hooks(void)
 {
+	Class sb = objc_getClass("SBUIFlashlightController");
+	if (sb != NULL) {
+		sb_hook(sb, "setLevel:", "v24@0:8Q16", (IMP)sb_set, (void **)&orig_sb_set);
+		sb_hook(sb, "turnFlashlightOnForReason:", "v24@0:8@16", (IMP)sb_on, (void **)&orig_sb_on);
+		sb_hook(sb, "_setFlashlightLevel:", "v20@0:8f16", (IMP)sb_flevel, (void **)&orig_sb_flevel);
+		sb_hook(sb, "isAvailable", "B16@0:8", (IMP)sb_avail, (void **)&orig_sb_avail);
+	} else {
+		say("flashlight: ", "no SBUIFlashlightController");
+	}
 	Class c = objc_getClass("AVFlashlight");
 	if (c == NULL) {
 		return 0;
 	}
 	int n = fl_swap(object_getClass((id)c), "hasFlashlight", "B16@0:8", (IMP)fl_yes);
+	n += fl_swap(c, "init", "@16@0:8", (IMP)fl_init);
 	n += fl_swap(c, "_setupFlashlight", "v16@0:8", (IMP)fl_nothing);
 	n += fl_swap(c, "_reconnectToServer", "v16@0:8", (IMP)fl_nothing);
 	n += fl_swap(c, "_teardownFlashlight", "v16@0:8", (IMP)fl_nothing);
@@ -1097,7 +1205,7 @@ fl_hooks(void)
 	n += fl_swap(c, "setFlashlightLevel:withError:", "B28@0:8f16^@20", (IMP)fl_set_level);
 	n += fl_swap(c, "turnPowerOnWithError:", "B24@0:8^@16", (IMP)fl_power_on);
 	n += fl_swap(c, "turnPowerOff", "v16@0:8", (IMP)fl_power_off);
-	say("flashlight: AVFlashlight hooked, methods ", n == 10 ? "10 of 10" : "some missing");
+	say("flashlight: AVFlashlight hooked, methods ", n == 11 ? "11 of 11" : "some missing");
 	return 1;
 }
 

@@ -882,3 +882,21 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Volume buttons with nothing playing change the ringer volume (SpringBoard "activeVolumeCategoryName:
   Ringtone", Ringer HUD with a bell); the log shows setRingerSilent: false every time. Before audio worked
   there were no categories and only the plain volume bar appeared.
+
+## Flashlight (patch 1020, whyred_ui, 2026-11-25)
+
+- PM660L flash LED: USID 3, base 0xd300 (live DT qcom,leds@d300), PPID 0x3d3 = APID 49, apps-owned.
+  Android's "flashlight" node lights torch_0 + torch_1 (switch_0, mask 0x3) at 100 mA each.
+- Found after ABL: safety tmr 0x93 0x93, current 0, mod 0, ires 0, strobe 0x1 0x1, en 0, hdrm 0x84 0x84.
+- Patch 1020 kern.whyred_torch 0..100 (25..150 mA per LED, 12.5 mA steps): leds-qpnp-flash-v2 switch_set
+  order (TGR_CURRENT 0x43+id, SAFETY_TMR 0x13 = torch, MOD_CTRL 0x46 bit 7, EN_LED_CTRL 0x4c bits 0-1).
+  Verified lit, status 0 (one read of 0x1 at a level change).
+- The LED keeps the current it had at switch-on: changing TGR_CURRENT while lit does nothing visible.
+  A new level goes off then on (whyred_ui does it; no visible flicker).
+- iOS side (SpringBoard, whyred_ui.dylib): Control Center's module needs MobileGestalt camera-flash
+  (key jdLgKT+0BZmGrzd9J0cuPA set true in CacheExtra; backup /var/root/MobileGestalt.plist.pre-torch).
+  AVFlashlight is replaced: init = NSObject init (the real one returns nil with no FigFlashlight),
+  hasFlashlight/isAvailable YES, setFlashlightLevel:withError: -> sysctl with KVO "flashlightLevel".
+  AVFCapture is dlopened from a thread at start; hooking from a dyld add-image callback made
+  +[SpringBoardUI load] abort ("This process should not be linking or loading SpringBoardUI").
+- Control Center levels 0.25/0.5/0.85/1 map to 25/50/112/150 mA per LED (level squared).
