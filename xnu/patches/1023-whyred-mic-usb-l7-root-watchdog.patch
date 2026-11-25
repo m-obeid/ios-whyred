@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 05f377b..9251a2b 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -282,11 +282,38 @@ SYSCTL_PROC(_kern, OID_AUTO, whyred_rtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOC
+  * no longer saves 1970 dates; the launchd job started too late for that (2026-11-23).
+  */
+ void whyred_rtc_set_clock(void);
++extern struct vnode *rootvnode;
++extern int (*PE_halt_restart)(unsigned int type);
++extern void IOSleep(unsigned milliseconds);
++
++/* no root file system 120 s after boot (a bad image): reset, which boots Android's Linux, not a stranded phone */
++static void
++whyred_root_watchdog(void)
++{
++	static bool done;
++	if (done) {
++		return;
++	}
++	if (rootvnode != NULL) {
++		done = true;
++		return;
++	}
++	clock_sec_t s;
++	clock_usec_t us;
++	clock_get_system_microtime(&s, &us);
++	if (s >= 120 && PE_halt_restart != NULL) {
++		printf("WHYRED: root not mounted after %lu s, resetting\n", (unsigned long)s);
++		IOSleep(500);
++		(void)PE_halt_restart(1);       /* kPERestartCPU */
++	}
++}
++
+ void
+ whyred_rtc_set_clock(void)
+ {
+ 	static bool parsed;
+ 	static int64_t off = -1;
++	whyred_root_watchdog();
+ 	if (!parsed) {
+ 		parsed = true;
+ 		if (!PE_parse_boot_argn("whyred_rtcoff", &off, sizeof(off))) {
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index e15433e..0f49f6b 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -3452,7 +3452,11 @@ static void
+ mic_pins(void)
+ {
+ 	static const uint32_t off[] = { 0x8000, 0x8010, 0x8020, 0x8030, 0x8050, 0x8070 };      /* GPIO 18-21, 23, 25 */
+-	vm_offset_t b = ml_io_map(LPI_TLMM_PA + 0x8000u, 0x1000);
++	static vm_offset_t b;
++	static bool logged;
++	if (b == 0) {
++		b = ml_io_map(LPI_TLMM_PA + 0x8000u, 0x1000);
++	}
+ 	if (b == 0) {
+ 		LOG("mic: LPI TLMM not mapped");
+ 		return;
+@@ -3464,10 +3468,11 @@ mic_pins(void)
+ 		r[0] = v;
+ 		r[1] = out << 1;
+ 		mb();
+-		if (!mic_ready) {
++		if (!logged) {
+ 			LOG("mic: LPI pin %#x: %#x -> %#x, dir %#x", off[i], was, r[0], r[1]);
+ 		}
+ 	}
++	logged = true;
+ }
+ 
+ static int
+@@ -3634,16 +3639,15 @@ mic_start(void)
+ static void
+ mic_stop(void)
+ {
+-	static const uint32_t bias[] = { 0x6e657773, 0 };
+ 	uint32_t none = 0;
+ 
++	/* pm660l_l7 stays on: it is also the USB PHY's vdda33, and voting it off drops USB (1022) */
+ 	mic_on = false;
+ 	int r = apr_call_port(APR_SVC_ASM, MIC_PORT, ASM_SESSION_CMD_PAUSE, &none, 0, 1000);
+ 	(void)mic_ops(mic_off_ops, sizeof(mic_off_ops) / sizeof(mic_off_ops[0]), "off");
+ 	int c = afe_clock(LPASS_CLK_ID_INT_MCLK_0, 9600000, false);
+-	bool b = whyred_rpm_vote(RPM_LDOB, 7, bias, 1);
+-	LOG("t=%u.%03u mic: stopped (pause %d, clock %d, bias %s; %llu bytes, peak %d, %llu errors, %llu overruns)", T, r, c,
+-	    b ? "off" : "vote FAILED", mic_bytes, mic_peak, mic_errs, mic_overruns);
++	LOG("t=%u.%03u mic: stopped (pause %d, clock %d; %llu bytes, peak %d, %llu errors, %llu overruns)", T, r, c,
++	    mic_bytes, mic_peak, mic_errs, mic_overruns);
+ }
+ 
+ /* the audio thread: start / stop, take what the ADSP has filled, give the buffers back */
