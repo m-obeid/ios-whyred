@@ -1,0 +1,564 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 9ef243a..f1929ed 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -137,7 +137,8 @@ ws_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+ 	return -1;
+ }
+ /*
+- * The only registers this may write. PM660L (SID 3): the flash LED block 0xd340-0xd34e (whyred_torch).
++ * The only registers this may write. PM660L (SID 3): the flash LED block 0xd340-0xd34e (whyred_torch) and
++ * the analog audio codec 0xf000-0xf1ff (TopazAudio.cpp, the microphone).
+  * PM660 (SID 1):
+  *   0x4446       LDO5 EN_CTL, the WCN3990 vdd-cx-mx supply (TopazModem.cpp, wifi=1). Linux turns it on
+  *                through RPM-SMD; ABL leaves it off.
+@@ -148,6 +149,9 @@ static bool
+ ws_write_allowed(unsigned sid, unsigned addr)
+ {
+ 	if (sid == 3) {
++		if (addr >= 0xf000 && addr <= 0xf1ff) {
++			return true;            /* live DT anlg-cdc@f000 */
++		}
+ 		/* PM660L flash LED (live DT qcom,leds@d300): whyred_torch below. */
+ 		switch (addr) {
+ 		case 0xd340: case 0xd341: case 0xd343: case 0xd344: case 0xd346: case 0xd347:
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 1c1ceff..ddd583e 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1247,6 +1247,8 @@ static volatile uint32_t apr_writes_done, apr_write_errs;
+ static volatile uint32_t apr_done_lsw[APR_DONE_SLOTS];
+ static unsigned apr_last_ask, apr_ready_ms;
+ 
++static void mic_read_done(const uint8_t *d, uint32_t n);     /* the microphone, below */
++
+ static void
+ apr_rx(const uint8_t *data, uint32_t len)
+ {
+@@ -1282,6 +1284,10 @@ apr_rx(const uint8_t *data, uint32_t len)
+ 		}
+ 		return;
+ 	}
++	if (h.opcode == 0x00010D9Au) {          /* ASM_DATA_EVENT_READ_DONE_V2: the microphone */
++		mic_read_done(data + hlen, len - hlen);
++		return;
++	}
+ 	if (apr_call_token != 0 && h.token == apr_call_token) {
+ 		apr_call_op = h.opcode;
+ 		apr_call_p0 = p0;
+@@ -3254,6 +3260,467 @@ audio_dev_init(void)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- the microphone (whyred) */
++
++/*
++ * The main (bottom) microphone: ADC1 of the PM660L analog codec (SPMI SID 3, 0xf000-0xf1ff), PDM to the
++ * LPASS digital codec (MMIO 0x152c0000), decimator DEC1 -> TX1 -> internal MI2S 3 TX (AFE port 0x1035,
++ * DT int-mi2s3 tx-lines 3: mono on SD0) -> ASM read session. Linux (techpack/audio sdm660-internal.c,
++ * msm-analog-cdc.c, msm-digital-cdc.c) traced with regmap_reg_write on the phone (2026-11-25): mic_init,
++ * mic_on and mic_off are those writes in that order. Mic bias supply pm660l_l7 (RPM "ldob" 7, 3.088 V);
++ * PDM pins LPI TLMM GPIO 18-21, 23, 25 function 1. Clocks from the ADSP: INT3 MI2S bit clock 1.536 MHz
++ * and INT_MCLK_0 9.6 MHz (the digital codec core: its registers answer only while it runs).
++ * /dev/redwood-mic (the RedwoodAudio plug-in's "Codec" input): open = listen, read = what has come
++ * (48 kHz 16-bit mono, never waits), close = stop.
++ */
++#define AFE_PORT_INT3_MI2S_TX           0x1035
++#define LPASS_CLK_ID_INT3_MI2S_IBIT     0x112
++#define LPASS_CLK_ID_INT_MCLK_0         0x305
++#define ASM_STREAM_CMD_OPEN_READ_V3     0x00010DB4u
++#define ASM_STREAM_CMD_SET_ENCDEC_PARAM 0x00010C10u
++#define ASM_PARAM_ID_ENC_CFG_BLK_V2     0x00010DA3u
++#define ASM_DATA_CMD_READ_V2            0x00010DACu
++#define MIC_SESSION                     2
++#define MIC_PORT                        ((MIC_SESSION << 8) | 1)
++#define MIC_BUFS                        4
++#define MIC_BUF_BYTES                   1920u           /* 20 ms of 48 kHz 16-bit mono */
++#define MIC_BUF_STRIDE                  2048u
++#define MIC_MAP_BYTES                   (MIC_BUFS * MIC_BUF_STRIDE)
++#define MIC_RING_BYTES                  96000u          /* 1 s */
++#define DIG_CDC_PA                      0x152c0000u
++#define LPI_TLMM_PA                     0x15070000u
++#define RPM_LDOB                        0x626f646cu     /* "ldob" */
++
++extern "C" int whyred_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++extern "C" int whyred_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" bool whyred_rpm_vote(uint32_t type, uint32_t id, const uint32_t *kv, unsigned pairs);
++
++enum { MA, MD, MW };                    /* analog (SPMI SID 3), digital (MMIO), wait (us) */
++struct mic_op { uint8_t kind; uint16_t reg; uint32_t val; };
++
++static const struct mic_op mic_init[] = {
++	{ MA, 0xf0d0, 0xa5 }, { MA, 0xf0db, 0x01 }, { MA, 0xf1d0, 0xa5 }, { MA, 0xf1db, 0x01 },
++	{ MA, 0xf0d0, 0xa5 }, { MA, 0xf0db, 0x00 }, { MA, 0xf1d0, 0xa5 }, { MA, 0xf1db, 0x00 },
++	{ MA, 0xf191, 0x12 }, { MA, 0xf192, 0xff }, { MA, 0xf0d0, 0xa5 }, { MA, 0xf0da, 0x0f },
++	{ MA, 0xf1d0, 0xa5 }, { MA, 0xf1da, 0x0f }, { MA, 0xf165, 0x4c }, { MA, 0xf1c0, 0xa2 },
++	{ MA, 0xf183, 0xa8 }, { MA, 0xf185, 0xa4 }, { MA, 0xf1b3, 0x41 }, { MA, 0xf1b2, 0x69 },
++	{ MA, 0xf1b7, 0x01 }, { MA, 0xf1b4, 0xe1 }, { MA, 0xf1b0, 0x03 }, { MA, 0xf1a1, 0x10 },
++	{ MA, 0xf1c2, 0x18 }, { MA, 0xf194, 0xfa }, { MA, 0xf046, 0x80 }, { MW, 0, 5000 },
++	{ MA, 0xf141, 0xa0 },
++	{ MA, 0xf160, 0x33 },                   /* mixer "ADC1 Volume" 6 */
++};
++
++static const struct mic_op mic_on_ops[] = {
++	{ MD, 0x00c, 0x03 }, { MD, 0x010, 0x03 }, { MD, 0x01c, 0x00 },          /* digital codec probe */
++	{ MD, 0x1a0, 0x01 },                    /* mixer "DEC1 MUX" ADC1 */
++	{ MD, 0x00c, 0x23 }, { MD, 0x01c, 0x04 }, { MD, 0x028, 0x03 }, { MD, 0x024, 0x01 },
++	{ MA, 0xf048, 0x0c }, { MD, 0x010, 0x13 }, { MA, 0xf145, 0x02 }, { MA, 0xf140, 0x80 },
++	{ MA, 0xf049, 0x20 }, { MA, 0xf04a, 0x18 }, { MW, 0, 11000 },
++	{ MA, 0xf163, 0xac }, { MA, 0xf050, 0x00 }, { MA, 0xf160, 0xb3 }, { MW, 0, 12000 },
++	{ MA, 0xf163, 0x8c }, { MW, 0, 1500 },
++	{ MD, 0x288, 0x01 }, { MD, 0x28c, 0x20 }, { MA, 0xf166, 0x42 }, { MD, 0x018, 0x01 },
++	{ MD, 0x284, 0x00 }, { MW, 0, 35000 }, { MD, 0x288, 0x08 }, { MW, 0, 260000 },
++	{ MA, 0xf166, 0x51 }, { MD, 0x28c, 0x00 },
++};
++
++static const struct mic_op mic_off_ops[] = {
++	{ MA, 0xf160, 0x33 }, { MA, 0xf04a, 0x08 }, { MA, 0xf049, 0x00 }, { MA, 0xf050, 0x02 },
++	{ MA, 0xf140, 0x00 }, { MD, 0x288, 0x09 }, { MW, 0, 20000 }, { MD, 0x28c, 0x08 },
++	{ MD, 0x018, 0x00 }, { MD, 0x004, 0x01 }, { MD, 0x004, 0x00 }, { MD, 0x288, 0x00 },
++	{ MD, 0x010, 0x03 }, { MA, 0xf048, 0x00 }, { MD, 0x01c, 0x00 },
++	{ MD, 0x024, 0x00 }, { MD, 0x028, 0x00 }, { MD, 0x00c, 0x03 },
++};
++
++static volatile uint32_t *mic_dig;
++static uint8_t *mic_dsp;                /* MIC_BUFS buffers the ADSP fills */
++static uint64_t mic_dsp_pa;
++static uint32_t mic_handle;
++static bool mic_ready, mic_failed, mic_on, mic_busy[MIC_BUFS];
++static volatile bool mic_want;
++static uint8_t *mic_ring;
++static volatile uint64_t mic_wr, mic_rd;        /* bytes, counted from the start */
++static IOLock *mic_lock;
++static uint64_t mic_bytes, mic_errs, mic_overruns;
++static int mic_peak;
++
++/* read-done events, queued by apr_rx (the audio thread) for mic_poll (the same thread) */
++struct mic_done { uint32_t status, lsw, size, offset; };
++static struct mic_done mic_q[16];
++static uint32_t mic_qw, mic_qr;
++
++static void
++mic_read_done(const uint8_t *d, uint32_t n)
++{
++	uint32_t w[6] = {};
++	memcpy(w, d, MIN(n, (uint32_t)sizeof(w)));
++	if (mic_qw - mic_qr >= 16) {
++		return;
++	}
++	mic_q[mic_qw % 16] = { w[0], w[1], w[4], w[5] };
++	mic_qw++;
++}
++
++static bool
++mic_ops(const struct mic_op *op, unsigned n, const char *what)
++{
++	unsigned bad = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (op[i].kind == MW) {
++			if (op[i].val >= 10000) {
++				IOSleep(op[i].val / 1000);
++			} else {
++				IODelay(op[i].val);
++			}
++		} else if (op[i].kind == MA) {
++			bad += whyred_spmi_write(3, op[i].reg, (uint8_t)op[i].val) != 0;
++		} else {
++			mic_dig[op[i].reg / 4] = op[i].val;
++			mb();
++		}
++	}
++	if (bad != 0) {
++		LOG("mic: %s: %u SPMI writes failed", what, bad);
++	}
++	return bad == 0;
++}
++
++static int
++afe_clock(uint32_t id, uint32_t hz, bool on)
++{
++	uint32_t p[12] = {};
++	p[0] = 12 + 24;
++	p[4] = AFE_MODULE_CLOCK_SET;
++	p[5] = AFE_PARAM_ID_CLOCK_SET;
++	p[6] = 24;
++	p[7] = 1;
++	p[8] = id;
++	p[9] = hz;
++	p[10] = 1;                              /* COUPLE_NO, root default */
++	p[11] = on;
++	return apr_call(APR_SVC_AFE, AFE_SVC_CMD_SET_PARAM, p, sizeof(p), 1000);
++}
++
++/* LPI TLMM: VAL_CTL bits 0-1 pull, 2-5 function, 6-8 drive (mA / 2 - 1), 9 out value; DIR_CTL bit 1 out */
++static void
++mic_pins(void)
++{
++	static const uint32_t off[] = { 0x8000, 0x8010, 0x8020, 0x8030, 0x8050, 0x8070 };      /* GPIO 18-21, 23, 25 */
++	vm_offset_t b = ml_io_map(LPI_TLMM_PA + 0x8000u, 0x1000);
++	if (b == 0) {
++		LOG("mic: LPI TLMM not mapped");
++		return;
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		volatile uint32_t *r = (volatile uint32_t *)(b + off[i] - 0x8000u);
++		uint32_t was = r[0], out = off[i] != 0x8020;            /* GPIO 20: no output-high */
++		uint32_t v = (was & 3u) | (1u << 2) | (3u << 6) | (out << 9);
++		r[0] = v;
++		r[1] = out << 1;
++		mb();
++		if (!mic_ready) {
++			LOG("mic: LPI pin %#x: %#x -> %#x, dir %#x", off[i], was, r[0], r[1]);
++		}
++	}
++}
++
++static int
++mic_wait_call(uint32_t want_op, unsigned timeout_ms)
++{
++	for (unsigned t = ms(); !apr_call_done && ms() - t < timeout_ms;) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++	}
++	apr_call_token = 0;
++	if (!apr_call_done) {
++		return -1;
++	}
++	return apr_call_op == want_op ? 0 : (int)(apr_call_op == APR_BASIC_RSP_RESULT ? apr_call_p1 : 0x7fffffff);
++}
++
++/* once: the port, the ASM read session, the ADM TX COPP and the routing */
++static bool
++mic_setup(void)
++{
++	uint32_t p[16];
++	int r;
++
++	mic_dig = (volatile uint32_t *)ml_io_map(DIG_CDC_PA, 0x1000);
++	mic_dsp = (uint8_t *)topaz_pool_alloc(MIC_MAP_BYTES, &mic_dsp_pa);
++	mic_ring = (uint8_t *)IOMalloc(MIC_RING_BYTES);
++	mic_lock = IOLockAlloc();
++	if (mic_dig == NULL || mic_dsp == NULL || mic_ring == NULL || mic_lock == NULL) {
++		LOG("mic: no memory");
++		return false;
++	}
++	uint8_t rev = 0, rev2 = 0;
++	(void)whyred_spmi_read(3, 0xf000, &rev);
++	(void)whyred_spmi_read(3, 0xf100, &rev2);
++	LOG("mic: analog codec digital rev %#x, analog rev %#x", rev, rev2);
++	if (!mic_ops(mic_init, sizeof(mic_init) / sizeof(mic_init[0]), "init")) {
++		return false;
++	}
++	r = afe_clock(LPASS_CLK_ID_INT3_MI2S_IBIT, 48000 * 16 * 2, true);
++	LOG("mic: INT3 MI2S bit clock: %d", r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	p[0] = AFE_PORT_INT3_MI2S_TX | ((12u + 20u) << 16);
++	p[4] = AFE_MODULE_AUDIO_DEV_INTERFACE;
++	p[5] = AFE_PARAM_ID_I2S_CONFIG;
++	p[6] = 20;
++	p[7] = 1;
++	p[8] = 16 | (1u << 16);                 /* 16 bit, SD0 */
++	p[9] = 0 | (1u << 16);                  /* mono, WS internal */
++	p[10] = 48000;
++	p[11] = 0;
++	r = apr_call(APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, p, 12 * 4, 1000);
++	LOG("mic: INT3 MI2S TX i2s config: %d", r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	p[0] = AFE_PORT_INT3_MI2S_TX;
++	r = apr_call(APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, p, 4, 1000);
++	LOG("mic: INT3 MI2S TX start: %d", r);
++	if (r != 0) {
++		return false;
++	}
++
++	bzero(p, sizeof(p));
++	p[0] = 3 | (1u << 16);
++	p[2] = (uint32_t)mic_dsp_pa;
++	p[3] = (uint32_t)(mic_dsp_pa >> 32) | AUDIO_SID_BITS_MSW;
++	p[4] = MIC_MAP_BYTES;
++	apr_call_done = false;
++	apr_call_token = apr_token;
++	if (!apr_send_port(APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, p, 20) ||
++	    mic_wait_call(ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, 1000) != 0) {
++		LOG("mic: memory map failed (op %#x)", apr_call_op);
++		return false;
++	}
++	mic_handle = apr_call_p0;
++	bzero(p, sizeof(p));
++	p[0] = 0;                               /* mode: legacy session, no meta data */
++	p[1] = 0;                               /* source: the device matrix */
++	p[2] = ASM_STREAM_POSTPROCOPO_ID_NONE;
++	p[3] = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
++	p[4] = 16;
++	r = apr_call_port(APR_SVC_ASM, MIC_PORT, ASM_STREAM_CMD_OPEN_READ_V3, p, 20, 1000);
++	LOG("mic: ASM open read: %d", r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	p[0] = ASM_PARAM_ID_ENC_CFG_BLK_V2;
++	p[1] = 28;
++	p[2] = 0;                               /* frames per buffer: as many as fit */
++	p[3] = 20;
++	p[4] = 1 | (16u << 16);
++	p[5] = 48000;
++	p[6] = 1;                               /* signed */
++	p[7] = 3;                               /* channel map: FC */
++	r = apr_call_port(APR_SVC_ASM, MIC_PORT, ASM_STREAM_CMD_SET_ENCDEC_PARAM, p, 36, 1000);
++	LOG("mic: ASM PCM encoder config: %d", r);
++	if (r != 0) {
++		return false;
++	}
++	bzero(p, sizeof(p));
++	p[0] = 0 | (2u << 16);                  /* mode 2: live recording */
++	p[1] = AFE_PORT_INT3_MI2S_TX | (0xFFFFu << 16);
++	p[2] = NULL_COPP_TOPOLOGY;
++	p[3] = 1 | (16u << 16);
++	p[4] = 48000;
++	p[5] = 3;
++	apr_call_done = false;
++	apr_call_token = apr_token;
++	if (!apr_send_port(APR_SVC_ADM, 0, ADM_CMD_DEVICE_OPEN_V5, p, 28) ||
++	    mic_wait_call(ADM_CMDRSP_DEVICE_OPEN_V5, 2000) != 0 || apr_call_p0 != 0) {
++		LOG("mic: ADM open failed (op %#x status %#x)", apr_call_op, apr_call_p0);
++		return false;
++	}
++	uint32_t copp = apr_call_p1;
++	bzero(p, sizeof(p));
++	p[0] = 1;                               /* the TX matrix */
++	p[1] = 1;
++	p[2] = MIC_SESSION | (1u << 16);
++	p[3] = copp;
++	r = apr_call(APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, p, 16, 1000);
++	LOG("mic: routing (COPP %u): %d", copp, r);
++	return r == 0;
++}
++
++static void
++mic_start(void)
++{
++	static const uint32_t bias[] = { 0x00007675, 3088000, 0x6e657773, 1 };     /* "uv", "swen" */
++	uint32_t p[4] = {};
++
++	if (!mic_ready && !mic_failed) {
++		mic_ready = mic_setup();
++		mic_failed = !mic_ready;
++		LOG("t=%u.%03u *** microphone %s ***", T, mic_ready ? "ready" : "setup FAILED");
++	}
++	if (!mic_ready) {
++		return;
++	}
++	bool b = whyred_rpm_vote(RPM_LDOB, 7, bias, 2);
++	mic_pins();
++	int c = afe_clock(LPASS_CLK_ID_INT_MCLK_0, 9600000, true);
++	if (c != 0) {
++		LOG("mic: codec clock: %d", c);
++		return;
++	}
++	(void)mic_ops(mic_on_ops, sizeof(mic_on_ops) / sizeof(mic_on_ops[0]), "on");
++	int r = apr_call_port(APR_SVC_ASM, MIC_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
++	IOLockLock(mic_lock);
++	mic_rd = mic_wr;
++	IOLockUnlock(mic_lock);
++	mic_bytes = mic_errs = mic_overruns = 0;
++	mic_peak = 0;
++	mic_on = true;
++	LOG("t=%u.%03u mic: listening (bias %s, run %d)", T, b ? "on" : "vote FAILED", r);
++}
++
++static void
++mic_stop(void)
++{
++	static const uint32_t bias[] = { 0x6e657773, 0 };
++	uint32_t none = 0;
++
++	mic_on = false;
++	int r = apr_call_port(APR_SVC_ASM, MIC_PORT, ASM_SESSION_CMD_PAUSE, &none, 0, 1000);
++	(void)mic_ops(mic_off_ops, sizeof(mic_off_ops) / sizeof(mic_off_ops[0]), "off");
++	int c = afe_clock(LPASS_CLK_ID_INT_MCLK_0, 9600000, false);
++	bool b = whyred_rpm_vote(RPM_LDOB, 7, bias, 1);
++	LOG("t=%u.%03u mic: stopped (pause %d, clock %d, bias %s; %llu bytes, peak %d, %llu errors, %llu overruns)", T, r, c,
++	    b ? "off" : "vote FAILED", mic_bytes, mic_peak, mic_errs, mic_overruns);
++}
++
++/* the audio thread: start / stop, take what the ADSP has filled, give the buffers back */
++static void
++mic_poll(void)
++{
++	if (mic_want && !mic_on && !mic_failed) {
++		mic_start();
++	} else if (!mic_want && mic_on) {
++		mic_stop();
++	}
++	while (mic_qr != mic_qw) {
++		struct mic_done d = mic_q[mic_qr % 16];
++		mic_qr++;
++		uint32_t i = (d.lsw - (uint32_t)mic_dsp_pa) / MIC_BUF_STRIDE;
++		if (i >= MIC_BUFS) {
++			continue;
++		}
++		mic_busy[i] = false;
++		if (d.status != 0 || d.offset + d.size > MIC_BUF_STRIDE) {
++			if (mic_errs++ < 4) {
++				LOG("mic: read done status %#x size %u offset %u", d.status, d.size, d.offset);
++			}
++			continue;
++		}
++		if (!mic_on) {
++			continue;
++		}
++		const int16_t *s = (const int16_t *)(mic_dsp + i * MIC_BUF_STRIDE + d.offset);
++		uint32_t n = d.size & ~1u;
++		IOLockLock(mic_lock);
++		for (uint32_t k = 0; k < n / 2; k++) {
++			int v = s[k] < 0 ? -s[k] : s[k];
++			mic_peak = v > mic_peak ? v : mic_peak;
++		}
++		uint32_t at = (uint32_t)(mic_wr % MIC_RING_BYTES), n1 = MIN(n, MIC_RING_BYTES - at);
++		memcpy(mic_ring + at, s, n1);
++		memcpy(mic_ring, (const uint8_t *)s + n1, n - n1);
++		mic_wr += n;
++		if (mic_wr - mic_rd > MIC_RING_BYTES) {
++			mic_rd = mic_wr - MIC_RING_BYTES / 2;
++			mic_overruns++;
++		}
++		IOLockUnlock(mic_lock);
++		mic_bytes += n;
++		if (mic_bytes == n) {
++			LOG("t=%u.%03u mic: first %u bytes", T, n);
++		}
++	}
++	if (!mic_on) {
++		return;
++	}
++	for (uint32_t i = 0; i < MIC_BUFS; i++) {
++		if (mic_busy[i]) {
++			continue;
++		}
++		uint32_t p[5];
++		uint64_t pa = mic_dsp_pa + i * MIC_BUF_STRIDE;
++		p[0] = (uint32_t)pa;
++		p[1] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
++		p[2] = mic_handle;
++		p[3] = MIC_BUF_BYTES;
++		p[4] = i;
++		if (!apr_send_port(APR_SVC_ASM, MIC_PORT, ASM_DATA_CMD_READ_V2, p, 20)) {
++			break;
++		}
++		mic_busy[i] = true;
++	}
++}
++
++static int
++mic_dopen(dev_t, int, int, struct proc *)
++{
++	mic_want = true;
++	thread_wakeup((event_t)&stream_wake_flag);
++	return 0;
++}
++
++static int
++mic_dclose(dev_t, int, int, struct proc *)
++{
++	mic_want = false;
++	thread_wakeup((event_t)&stream_wake_flag);
++	return 0;
++}
++
++static int
++mic_dread(dev_t, struct uio *uio, int)
++{
++	uint8_t buf[2048];
++
++	while (uio_resid(uio) >= 2 && mic_lock != NULL) {
++		IOLockLock(mic_lock);
++		uint64_t have = mic_wr - mic_rd;
++		uint32_t n = (uint32_t)MIN(MIN(have, (uint64_t)uio_resid(uio)), (uint64_t)sizeof(buf)) & ~1u;
++		uint32_t at = (uint32_t)(mic_rd % MIC_RING_BYTES), n1 = MIN(n, MIC_RING_BYTES - at);
++		memcpy(buf, mic_ring + at, n1);
++		memcpy(buf + n1, mic_ring, n - n1);
++		mic_rd += n;
++		IOLockUnlock(mic_lock);
++		if (n == 0) {
++			break;
++		}
++		int err = uiomove((char *)buf, (int)n, uio);
++		if (err != 0) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++static const struct cdevsw mic_cdevsw = {
++	.d_open = mic_dopen, .d_close = mic_dclose, .d_read = mic_dread, .d_write = eno_rdwrt, .d_ioctl = eno_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++static void
++mic_dev_init(void)
++{
++	int major = cdevsw_add(-1, &mic_cdevsw);
++	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic");
++	LOG("/dev/redwood-mic: %s", node != NULL ? "ready" : "failed");
++}
++
+ /* ---------------------------------------------------------------- thread */
+ 
+ extern "C" void whyred_haptic_dev_init(void);
+@@ -3323,12 +3790,14 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 				LOG("t=%u.%03u *** TAS2557 answers; configuration %s ***", T, cfg_ok ? "loaded" : "FAILED");
+ 				if (cfg_ok && as_open()) {
+ 					audio_dev_init();
++					mic_dev_init();
+ 				}
+ 			} else {
+ 				LOG("t=%u.%03u *** TAS2557 does not answer ***", T);
+ 			}
+ 		}
+ 		stream_poll();
++		mic_poll();
+ 		if (spf_state == 1 && !codec_tried) {
+ 			uint32_t tone = 0;
+ 			codec_tried = true;
+@@ -3356,7 +3825,7 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		if (busy) {
+ 			IODelay(200);
+-		} else if (!playing && !as_playing) {  /* idle (whyred: also while the ADSP sleeps): 50 wakeups a second, not 500 */
++		} else if (!playing && !as_playing && !mic_on && !(mic_want && !mic_failed)) {  /* idle (whyred: also while the ADSP sleeps): 50 wakeups a second, not 500 */
+ 			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index ffc74d7..1c76648 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7708,6 +7708,19 @@ topaz_modem_init(void)
+ 	}
+ }
+ 
++/* For TopazAudio (the microphone's bias supply): one vote in the active and the sleep set. */
++extern "C" bool
++whyred_rpm_vote(uint32_t type, uint32_t id, const uint32_t *kv, unsigned pairs)
++{
++	if (!rpm_up && !rpm_open()) {
++		return false;
++	}
++	bool a = rpm_request(0, type, id, kv, pairs);
++	bool b = rpm_request(1, type, id, kv, pairs);
++	return a && b;
++}
++
+ #else
+ extern "C" void topaz_modem_init(void) {}
++extern "C" bool whyred_rpm_vote(uint32_t, uint32_t, const uint32_t *, unsigned) { return false; }
+ #endif

@@ -13,3 +13,6 @@ ld64.lld -arch arm64 -platform_version ios 16.0 16.0 -adhoc_codesign out/vibe.o 
 # pcmplay: raw 48 kHz 16-bit stereo to /dev/topaz-audio at the real-time pace
 clang -target arm64-apple-ios16.0 -O2 -c tools/pcmplay.c -o out/pcmplay.o
 ld64.lld -arch arm64 -platform_version ios 16.0 16.0 -adhoc_codesign out/pcmplay.o stubs/libSystem.tbd -o out/pcmplay
+# micrec: raw 48 kHz 16-bit mono from /dev/redwood-mic
+clang -target arm64-apple-ios16.0 -O2 -c tools/micrec.c -o out/micrec.o
+ld64.lld -arch arm64 -platform_version ios 16.0 16.0 -adhoc_codesign out/micrec.o stubs/libSystem.tbd -o out/micrec
