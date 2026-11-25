@@ -4,5 +4,5 @@ targets:         [ arm64-ios ]
 install-name:    '/usr/lib/libSystem.B.dylib'
 exports:
   - targets:     [ arm64-ios ]
-    symbols:     [ _getprogname, _open, _write, _close, _dladdr, _free, _pthread_create, _sleep, _read, _unlink, _dispatch_async_f, __dispatch_main_q, _sysctlbyname, _usleep, _printf, _puts, _gettimeofday, _atoi, _mach_timebase_info, _mach_absolute_time, _dlopen ]
+    symbols:     [ _getprogname, _open, _write, _close, _dladdr, _free, _pthread_create, _sleep, _read, _unlink, _dispatch_async_f, __dispatch_main_q, _sysctlbyname, _usleep, _printf, _puts, _gettimeofday, _atoi, _mach_timebase_info, _mach_absolute_time, _dlopen, _setuid, _setgid, _getuid, _csops, _getpid, _task_for_pid, _task_get_special_port, _task_set_special_port, _mach_task_self_, _execv, _getenv, _setenv ]
 ...

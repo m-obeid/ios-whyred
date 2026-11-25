@@ -4,5 +4,5 @@ targets:         [ arm64-ios ]
 install-name:    '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation'
 exports:
   - targets:     [ arm64-ios ]
-    symbols:     [ _CFStringCreateWithCString, _CFNumberCreate, _CFNumberGetValue, _CFRelease, _CFGetTypeID, _CFNumberGetTypeID ]
+    symbols: [ _CFStringGetCString, _CFStringCreateWithCString, _CFNumberCreate, _CFNumberGetValue, _CFRelease, _CFGetTypeID, _CFNumberGetTypeID ]
 ...
