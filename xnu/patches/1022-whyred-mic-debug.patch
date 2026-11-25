@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index f1929ed..05f377b 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -665,6 +665,42 @@ sysctl_whyred_torch SYSCTL_HANDLER_ARGS
+ 	return whyred_torch(v) == 0 ? 0 : EIO;
+ }
+ 
++/*
++ * kern.whyred_codec (root): one register access for bring-up of the microphone. Write a command:
++ *   bits 31-28 op: 1 PM660L SPMI read, 2 SPMI write (SID 3 0xf000-0xf1ff), 3 digital codec read,
++ *   4 digital codec write, 5 LPI TLMM read, 6 LPI TLMM write (both only while /dev/redwood-mic is open);
++ *   bits 27-8 register, bits 7-0 value. Read: the result of the last command (-1 = failed).
++ */
++int whyred_mic_mmio(int lpi, int write, unsigned off, uint32_t *val);
++static int codec_last = -1;
++
++static int
++sysctl_whyred_codec SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = codec_last, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	unsigned op = (unsigned)v >> 28, reg = ((unsigned)v >> 8) & 0xfffffu;
++	uint8_t b = (uint8_t)v;
++	uint32_t w = (uint8_t)v;
++	int r = -1;
++	switch (op) {
++	case 1: r = whyred_spmi_read(3, reg, &b) == 0 ? b : -1; break;
++	case 2: r = whyred_spmi_write(3, reg, b) == 0 && whyred_spmi_read(3, reg, &b) == 0 ? b : -1; break;
++	case 3: case 4: case 5: case 6:
++		r = whyred_mic_mmio(op >= 5, op == 4 || op == 6, reg, &w) == 0 ? (int)w : -1;
++		break;
++	default: break;
++	}
++	codec_last = r;
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_codec, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_codec, "I", "whyred: codec register access (see whyred_spmi.c)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_whyred_torch, "I", "whyred: flashlight 0 (off) to 100 percent");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index ddd583e..e15433e 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -3384,6 +3384,53 @@ mic_ops(const struct mic_op *op, unsigned n, const char *what)
+ 	return bad == 0;
+ }
+ 
++/* what the codecs hold now: the digital codec's TX path and clocks, the analog codec's ADC1 path */
++static void
++mic_dump(const char *when)
++{
++	static const uint16_t d[] = { 0x00c, 0x010, 0x018, 0x01c, 0x024, 0x028, 0x1a0, 0x284, 0x288, 0x28c };
++	static const uint16_t a[] = { 0xf004, 0xf005, 0xf046, 0xf048, 0xf049, 0xf04a, 0xf050, 0xf104, 0xf105, 0xf140,
++		                      0xf141, 0xf145, 0xf160, 0xf163, 0xf166 };
++	char line[256];
++	int n = 0;
++	for (unsigned i = 0; i < sizeof(d) / sizeof(d[0]) && n < 200; i++) {
++		n += snprintf(line + n, sizeof(line) - n, " %x=%x", d[i], mic_dig[d[i] / 4]);
++	}
++	LOG("mic: %s: digital%s", when, line);
++	n = 0;
++	for (unsigned i = 0; i < sizeof(a) / sizeof(a[0]) && n < 200; i++) {
++		uint8_t v = 0xee;
++		(void)whyred_spmi_read(3, a[i], &v);
++		n += snprintf(line + n, sizeof(line) - n, " %x=%x", a[i], v);
++	}
++	LOG("mic: %s: analog%s", when, line);
++}
++
++/* kern.whyred_codec (bsd/dev/whyred_spmi.c): the digital codec (lpi 0) or LPI TLMM (lpi 1), only while the mic runs */
++extern "C" int
++whyred_mic_mmio(int lpi, int write, unsigned off, uint32_t *val)
++{
++	if (!mic_on || mic_dig == NULL || (off & 3) != 0 || off >= (lpi ? 0xc000u : 0x1000u)) {
++		return -1;
++	}
++	volatile uint32_t *r;
++	if (lpi) {
++		vm_offset_t b = ml_io_map(LPI_TLMM_PA + (off & ~0xfffu), 0x1000);
++		if (b == 0) {
++			return -1;
++		}
++		r = (volatile uint32_t *)(b + (off & 0xfffu));
++	} else {
++		r = mic_dig + off / 4;
++	}
++	if (write) {
++		*r = *val;
++		mb();
++	}
++	*val = *r;
++	return 0;
++}
++
+ static int
+ afe_clock(uint32_t id, uint32_t hz, bool on)
+ {
+@@ -3540,7 +3587,7 @@ mic_setup(void)
+ 		LOG("mic: ADM open failed (op %#x status %#x)", apr_call_op, apr_call_p0);
+ 		return false;
+ 	}
+-	uint32_t copp = apr_call_p1;
++	uint32_t copp = apr_call_p1 & 0xffffu;  /* u16 copp_id, u16 reserved (not zeroed by the ADSP) */
+ 	bzero(p, sizeof(p));
+ 	p[0] = 1;                               /* the TX matrix */
+ 	p[1] = 1;
+@@ -3573,6 +3620,7 @@ mic_start(void)
+ 		return;
+ 	}
+ 	(void)mic_ops(mic_on_ops, sizeof(mic_on_ops) / sizeof(mic_on_ops[0]), "on");
++	mic_dump("on");
+ 	int r = apr_call_port(APR_SVC_ASM, MIC_PORT, ASM_SESSION_CMD_RUN_V2, p, 12, 1000);
+ 	IOLockLock(mic_lock);
+ 	mic_rd = mic_wr;
+@@ -3642,7 +3690,7 @@ mic_poll(void)
+ 		IOLockUnlock(mic_lock);
+ 		mic_bytes += n;
+ 		if (mic_bytes == n) {
+-			LOG("t=%u.%03u mic: first %u bytes", T, n);
++			LOG("t=%u.%03u mic: first %u bytes (offset %u, buffer %u)", T, n, d.offset, i);
+ 		}
+ 	}
+ 	if (!mic_on) {
+@@ -3854,4 +3902,5 @@ topaz_audio_init(void)
+ 
+ #else
+ extern "C" void topaz_audio_init(void) {}
++extern "C" int whyred_mic_mmio(int, int, unsigned, uint32_t *) { return -1; }
+ #endif
