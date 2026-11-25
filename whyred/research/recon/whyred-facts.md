@@ -900,3 +900,20 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   AVFCapture is dlopened from a thread at start; hooking from a dyld add-image callback made
   +[SpringBoardUI load] abort ("This process should not be linking or loading SpringBoardUI").
 - Control Center levels 0.25/0.5/0.85/1 map to 25/50/112/150 mA per LED (level squared).
+
+## Microphone (patches 1021-1023, 2026-11-25)
+
+- Path: PM660L analog codec (SPMI SID 3, 0xf000-0xf1ff) ADC1 -> PDM over LPI TLMM GPIO 18-21, 23, 25 (func1, 8 mA,
+  output-high except GPIO 20) -> LPASS digital codec (0x152c0000) DEC1 -> INT3 MI2S TX (AFE port 0x1035, SD0 mono,
+  16 bit, 48 kHz) -> ADM TX COPP (mode 2, matrix 1) -> ASM read session (OPEN_READ_V3).
+- DT int-mi2s3 tx-lines = 3 (QUAD01). Linux picks SD0 for 1-2 channels (vi_feed_mono defaults to SPKR_1).
+- Clocks through AFE CLOCK_SET: INT3 IBIT 0x112 at 1.536 MHz, INT_MCLK_0 0x305 at 9.6 MHz (codec core).
+- Register sequences come from Linux tracefs (events regmap/regmap_reg_write and spmi/spmi_write_begin, Linux has
+  no debugfs). Linux arecord records real signal (peak 354 in a quiet room).
+- pm660l_l7 (RPM ldob 7, 3.088 V) is the mic bias supply and also vdda33 of both QUSB2 PHYs. Voting it off drops
+  USB for the rest of the boot (1021, 1022). 1023 leaves it on.
+- 1022 result: every ADSP command returns 0 and data flows in real time (first data after 380 ms). Digital and
+  analog register readback matches the Linux trace. The samples are all zero. Cause not known yet. The next step
+  is the LPI pin readback (1023 logs it) and live pokes with sysctl kern.whyred_codec.
+- ADSP COPP ids come back as 0xb08f0009: mask with 0xffff.
+- 1023 root watchdog: no rootvnode 120 s after boot -> PSCI reset (boots Linux).
