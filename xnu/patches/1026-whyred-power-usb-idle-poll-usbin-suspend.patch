@@ -1,0 +1,207 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 09cbfd7..5db2566 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -14,6 +14,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -706,6 +707,7 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ 	ud.txq_count++;
+ 	ud_tx_kick_locked();
+ 	lck_mtx_unlock(ud.lock);
++	thread_wakeup((event_t)&ud.sleep_chan);         /* the poll thread may be in its slow idle sleep */
+ 	return 0;
+ }
+ 
+@@ -885,11 +887,13 @@ ud_event(uint32_t ev)
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t ticks = 0, busy = 0;
++	uint32_t busy = 0, quiet = 0;
++	uint64_t next_stat = 0, now;
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
+ 			busy = 200;             /* poll fast while traffic flows */
++			quiet = 0;
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+@@ -901,15 +905,22 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
+-		if ((++ticks % 30000) == 0) {
++		now = mach_absolute_time();
++		if (now >= next_stat) {
++			nanoseconds_to_absolutetime(30ull * NSEC_PER_SEC, &next_stat);
++			next_stat += now;
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames (%llu tx batches)\n", ud.rx_frames, ud.tx_frames,
+ 			    ud.tx_batches);
+ 		}
++		/* 1 ms for 2 s after the last event, then 10 ms: an idle link wakes the CPU 100 times a second, not 1000 */
+ 		if (busy > 0) {
+ 			busy--;
+ 			ud_sleep_us(250);
+-		} else {
++		} else if (quiet < 2000) {
++			quiet++;
+ 			ud_sleep_ms(1);
++		} else {
++			ud_sleep_ms(10);
+ 		}
+ 	}
+ }
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 9251a2b..acee251 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -10,6 +10,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <kern/locks.h>
+ #include <kern/thread_call.h>
+@@ -144,6 +145,9 @@ ws_read_locked(unsigned sid, unsigned addr, uint8_t *out)
+  *                through RPM-SMD; ABL leaves it off.
+  *   0xc0xx       the haptics block (live DT qcom,haptic@c000, ERM): EN_CTL 0x46, CFG1 0x4c, SEL 0x4e,
+  *                VMAX 0x51, ILIM 0x52, PLAY 0x70 (whyred_vibrate below).
++ * PM660 (SID 0):
++ *   0x1340       SMB2 USBIN_CMD_IL, bit 0 USBIN_SUSPEND (Linux smb-reg.h): the phone runs on its battery with
++ *                the cable in, so the gauge measures the phone (kern.whyred_usbin_suspend below).
+  */
+ static bool
+ ws_write_allowed(unsigned sid, unsigned addr)
+@@ -161,6 +165,9 @@ ws_write_allowed(unsigned sid, unsigned addr)
+ 			return false;
+ 		}
+ 	}
++	if (sid == 0) {
++		return addr == 0x1340;
++	}
+ 	if (sid != 1) {
+ 		return false;
+ 	}
+@@ -308,12 +315,80 @@ whyred_root_watchdog(void)
+ 	}
+ }
+ 
++/*
++ * kern.whyred_usbin_suspend (root): write N (1-900) to run on the battery for N seconds with the cable in,
++ * 0 to charge again at once; read: seconds left. Ends by itself (SweetBattery's 1 s timer), so a lost
++ * session never leaves the phone without charge. Cleared once at boot too.
++ */
++static uint64_t usbin_until;            /* mach_absolute_time(); 0 = charging normally */
++static bool usbin_cleared;
++
++static int
++usbin_suspend(bool on)
++{
++	uint8_t v;
++	if (whyred_spmi_init() != 0 || whyred_spmi_read(0, 0x1340, &v) != 0) {
++		return -1;
++	}
++	v = on ? (uint8_t)(v | 1u) : (uint8_t)(v & ~1u);
++	int r = whyred_spmi_write(0, 0x1340, v);
++	uint8_t back = 0xff;
++	(void)whyred_spmi_read(0, 0x1340, &back);
++	printf("WHYRED USBIN: suspend %d: %s, USBIN_CMD_IL %#x\n", on, r == 0 ? "ok" : "FAILED", back);
++	return r;
++}
++
++static void
++usbin_tick(void)
++{
++	if (!usbin_cleared) {
++		usbin_cleared = true;
++		(void)usbin_suspend(false);
++	}
++	if (usbin_until != 0 && mach_absolute_time() >= usbin_until) {
++		usbin_until = 0;
++		(void)usbin_suspend(false);
++	}
++}
++
++static int
++sysctl_whyred_usbin SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t now = mach_absolute_time(), left_ns = 0;
++	if (usbin_until > now) {
++		absolutetime_to_nanoseconds(usbin_until - now, &left_ns);
++	}
++	int v = (int)(left_ns / NSEC_PER_SEC), err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	if (v < 0 || v > 900) {
++		return EINVAL;
++	}
++	if (v == 0) {
++		usbin_until = 0;
++		return usbin_suspend(false) == 0 ? 0 : EIO;
++	}
++	uint64_t span;
++	nanoseconds_to_absolutetime((uint64_t)v * NSEC_PER_SEC, &span);
++	if (usbin_suspend(true) != 0) {
++		return EIO;
++	}
++	usbin_until = now + span;
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_usbin_suspend, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_usbin, "I", "whyred: seconds on the battery with the cable in");
++
+ void
+ whyred_rtc_set_clock(void)
+ {
+ 	static bool parsed;
+ 	static int64_t off = -1;
+ 	whyred_root_watchdog();
++	usbin_tick();
+ 	if (!parsed) {
+ 		parsed = true;
+ 		if (!PE_parse_boot_argn("whyred_rtcoff", &off, sizeof(off))) {
+@@ -695,8 +770,8 @@ sysctl_whyred_torch SYSCTL_HANDLER_ARGS
+ /*
+  * kern.whyred_codec (root): one register access for bring-up of the microphone. Write a command:
+  *   bits 31-28 op: 1 PM660L SPMI read, 2 SPMI write (SID 3 0xf000-0xf1ff), 3 digital codec read,
+- *   4 digital codec write, 5 LPI TLMM read, 6 LPI TLMM write (both only while /dev/redwood-mic is open);
+- *   bits 27-8 register, bits 7-0 value. Read: the result of the last command (-1 = failed).
++ *   4 digital codec write, 5 LPI TLMM read, 6 LPI TLMM write (both only while /dev/redwood-mic is open),
++ *   7 SPMI read of any SID (register bits 27-24 SID, 23-8 address); bits 27-8 register, bits 7-0 value. Read: the result of the last command (-1 = failed).
+  */
+ int whyred_mic_mmio(int lpi, int write, unsigned off, uint32_t *val);
+ static int codec_last = -1;
+@@ -716,6 +791,7 @@ sysctl_whyred_codec SYSCTL_HANDLER_ARGS
+ 	switch (op) {
+ 	case 1: r = whyred_spmi_read(3, reg, &b) == 0 ? b : -1; break;
+ 	case 2: r = whyred_spmi_write(3, reg, b) == 0 && whyred_spmi_read(3, reg, &b) == 0 ? b : -1; break;
++	case 7: r = whyred_spmi_init() == 0 && whyred_spmi_read(reg >> 16, reg & 0xffffu, &b) == 0 ? b : -1; break;
+ 	case 3: case 4: case 5: case 6:
+ 		r = whyred_mic_mmio(op >= 5, op == 4 || op == 6, reg, &w) == 0 ? (int)w : -1;
+ 		break;
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index be0db3d..3ca98b4 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -3899,7 +3899,9 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (busy) {
+ 			IODelay(200);
+ 		} else if (!playing && !as_playing && !mic_on && !(mic_want && !mic_failed)) {  /* idle (whyred: also while the ADSP sleeps): 50 wakeups a second, not 500 */
+-			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
++			/* once the stream is set up: 100 ms (writes and the microphone's open wake this thread at once) */
++			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, codec_tried && as_ready ? 100 : 20,
++			    1000 * NSEC_PER_USEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+ 			IOSleep(2);
