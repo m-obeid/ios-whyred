@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 0f49f6b..f62c2f5 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -3334,6 +3334,7 @@ static const struct mic_op mic_off_ops[] = {
+ static volatile uint32_t *mic_dig;
+ static uint8_t *mic_dsp;                /* MIC_BUFS buffers the ADSP fills */
+ static uint64_t mic_dsp_pa;
++static unsigned mic_checks;             /* read-done buffers checked for the fill pattern */
+ static uint32_t mic_handle;
+ static bool mic_ready, mic_failed, mic_on, mic_busy[MIC_BUFS];
+ static volatile bool mic_want;
+@@ -3678,6 +3679,23 @@ mic_poll(void)
+ 		}
+ 		const int16_t *s = (const int16_t *)(mic_dsp + i * MIC_BUF_STRIDE + d.offset);
+ 		uint32_t n = d.size & ~1u;
++		/* each buffer is filled with 0x5a5a before its READ: did the ADSP write over it? */
++		if (mic_checks < 6) {
++			uint32_t left = 0, zero = 0;
++			for (uint32_t k = 0; k < n / 2; k++) {
++				left += (uint16_t)s[k] == 0x5a5au;
++				zero += s[k] == 0;
++			}
++			mic_checks++;
++			LOG("mic: buffer %u size %u offset %u: %u of %u samples still 0x5a5a, %u zero, first %d %d %d %d%s", i,
++			    d.size, d.offset, left, n / 2, zero, n >= 8 ? s[0] : 0, n >= 8 ? s[1] : 0, n >= 8 ? s[2] : 0,
++			    n >= 8 ? s[3] : 0, ls_cb ? "" : " (no CB)");
++			if (ls_cb != NULL) {
++				LOG("mic: LPASS CB FSR %08x FAR %08x%08x FSYNR0 %08x SCTLR %08x", *(volatile uint32_t *)(ls_cb + 0x58),
++				    *(volatile uint32_t *)(ls_cb + 0x64), *(volatile uint32_t *)(ls_cb + 0x60),
++				    *(volatile uint32_t *)(ls_cb + 0x68), *(volatile uint32_t *)(ls_cb + 0x0));
++			}
++		}
+ 		IOLockLock(mic_lock);
+ 		for (uint32_t k = 0; k < n / 2; k++) {
+ 			int v = s[k] < 0 ? -s[k] : s[k];
+@@ -3706,6 +3724,8 @@ mic_poll(void)
+ 		}
+ 		uint32_t p[5];
+ 		uint64_t pa = mic_dsp_pa + i * MIC_BUF_STRIDE;
++		memset(mic_dsp + i * MIC_BUF_STRIDE, 0x5a, MIC_BUF_STRIDE);
++		mb();
+ 		p[0] = (uint32_t)pa;
+ 		p[1] = (uint32_t)(pa >> 32) | AUDIO_SID_BITS_MSW;
+ 		p[2] = mic_handle;
