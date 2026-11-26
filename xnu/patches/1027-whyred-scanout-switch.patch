@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index acee251..71e9b40 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -379,6 +379,23 @@ sysctl_whyred_usbin SYSCTL_HANDLER_ARGS
+ 	return 0;
+ }
+ 
++/* kern.whyred_scanout (root): the display's INTF_1 timing engine, 1 on, 0 off (SweetFramebuffer.cpp) */
++int sweet_fb_scanout(int on);
++
++static int
++sysctl_whyred_scanout SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_fb_scanout(-1), err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	return sweet_fb_scanout(v != 0) >= 0 ? 0 : ENODEV;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_scanout, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_scanout, "I", "whyred: display scanout (INTF_1 timing engine)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_usbin_suspend, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_whyred_usbin, "I", "whyred: seconds on the battery with the cable in");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0b6e1d6..879a25a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -98,6 +98,9 @@ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++class AppleCLCD;
++static AppleCLCD *sweet_fb_instance;
++extern "C" int sweet_fb_scanout(int on);       /* below; kern.whyred_scanout in bsd/dev/whyred_spmi.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -183,6 +186,8 @@ public:
+ 	volatile uint32_t *fCtl0;
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
++	bool          fTeOffAuto;     /* whyred boot-arg sweetfb_teoff=1: no scanout while the WLED is off */
++	bool          fTeOff;         /* INTF_1 timing engine stopped by us */
+ 	/* boot-arg sweetfb_lock=1: the vsync timer follows the panel (vsyncNext) */
+ 	bool          fVLock;
+ 	uint32_t      fVTotal;        /* lines a panel frame, blanking included */
+@@ -433,6 +438,9 @@ AppleCLCD::start(IOService *provider)
+ 	/* whyred qcom,mdss-intf-off <0x6b000 0x6b800 ...>: INTF_1 (DSI0) at 0xc96b800, the same +0x800 */
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x0c96b000, 0x1000);
+ 	if (fIntf1 != NULL) {
++		uint32_t teoff = 0;
++		sweet_fb_instance = this;
++		fTeOffAuto = fWled && PE_parse_boot_argn("sweetfb_teoff", &teoff, sizeof(teoff)) && teoff != 0;
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+ 		uint32_t htotal = r[0x008 / 4] >> 16;
+@@ -1024,6 +1032,10 @@ AppleCLCD::setPanelOn(bool on)
+ 		if (fWledOffCall != NULL) {
+ 			thread_call_cancel(fWledOffCall);
+ 		}
++		if (fTeOff) {
++			(void)sweet_fb_scanout(1);
++			IOSleep(35);            /* two panel frames before the light */
++		}
+ 		IOLockLock(fBlLock);
+ 		int r = fWledOff ? sweet_wled_enable(1) : 0;
+ 		fWledOff = false;
+@@ -1118,6 +1130,9 @@ AppleCLCD::wledOffWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	fb->fWledOff = true;
+ 	IOLockUnlock(fb->fBlLock);
+ 	IOLog("SWEET FB: WLED off after fade: %s\n", r == 0 ? "done" : "FAILED");
++	if (fb->fTeOffAuto && r == 0) {
++		(void)sweet_fb_scanout(0);
++	}
+ }
+ 
+ void
+@@ -1629,3 +1644,26 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	return ret;
+ }
+ #endif /* SWEET */
++
++/*
++ * whyred: the MDP's INTF_1 timing engine (INTF_TIMING_ENGINE_EN, INTF base + 0) scans the frame out to the
++ * video-mode panel 60 times a second, also while the WLED is off. 0 stops it (the DSI lanes idle), 1 starts
++ * it again with the same timing and layer. on < 0: only report. Returns the engine bit, -1 without INTF_1.
++ */
++extern "C" int
++sweet_fb_scanout(int on)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++	if (fb == NULL || fb->fIntf1 == NULL) {
++		return -1;
++	}
++	volatile uint32_t *r = fb->fIntf1 + 0x800 / 4;
++	if (on >= 0 && (r[0] & 1u) != (unsigned)(on != 0)) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		r[0] = on ? 1u : 0u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		fb->fTeOff = on == 0;
++		IOLog("SWEET FB: scanout %s (te_en %#x, frame %u)\n", on ? "on" : "off", r[0], r[0x0ac / 4]);
++	}
++	return (int)(r[0] & 1u);
++}
