@@ -1,0 +1,378 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,5 +109,6 @@
+ bsd/dev/sweet_thermal.c			standard
+ bsd/dev/sweet_wled.c			standard
+ bsd/dev/whyred_spmi.c			standard
++bsd/dev/whyred_gpu.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/redwood_sta.c		standard
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 0701d8d..020fe6b 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -284,9 +284,12 @@ therm_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++void whyred_gpu_init(void);     /* whyred_gpu.c, boot-arg whyredgpu=N */
++
+ void
+ sweet_thermal_init(void)
+ {
++	whyred_gpu_init();
+ 	int mode = 1;
+ 	(void)PE_parse_boot_argn("sweettherm", &mode, sizeof(mode));
+ 	if (mode == 0) {
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+new file mode 100644
+index 0000000..3afcdb4
+--- /dev/null
++++ b/bsd/dev/whyred_gpu.c
+@@ -0,0 +1,345 @@
++/*
++ * whyred: Adreno 509 (SDM636) bring-up, stage 1, steps 1-4. Boot-arg whyredgpu=N runs steps 1..N
++ * (0 or absent: nothing). whyredgpudelay=S waits S seconds after start (default 20) so the USB log
++ * is up. Plan and sources: whyred/research/gpu-stage1.md.
++ *
++ *   1  reads only: GCC GPU branches, speed bin, and the GPU clock controller (only when its AHB
++ *      clock is already on: an access with the AHB clock off hangs the bus)
++ *   2  RPM votes rwcx and rwmx (level 384, the level the modem proxy votes already hold),
++ *      GCC branches gpu_cfg_ahb, gpu_bimc_gfx and bimc_gfx on, then the step 1 reads
++ *   3  CX power domain on (GDSC 0x5066004, status in its hardware-control word 0x5066008),
++ *      gpucc CXO branch
++ *   4  gfx3d and rbbmtimer clocks from XO (19.2 MHz), GX power domain on as Linux gdsc_enable
++ *      (block reset, GMEM reset, unclamp, SW_COLLAPSE off, PWR_ON), gfx3d and rbbmtimer
++ *      branches, then the first reads inside the GPU block
++ *
++ * Each step logs before it touches hardware and after. A check that fails ends the run.
++ * Offsets: Linux kernel-lineage-21 gcc-sdm660.c, gpucc-sdm660.c, gdsc-regulator.c, a5xx_reg.h
++ * and the phone's live device tree.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <stdbool.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++bool whyred_rpm_vote(uint32_t type, uint32_t id, const uint32_t *kv, unsigned pairs);   /* TopazModem.cpp */
++void whyred_gpu_init(void);
++
++#define GCC_GPU_PA      0x00171000      /* GCC 0x100000 + 0x71000 */
++#define GCC_GPLL_PA     0x00152000
++#define GPUCC_PA        0x05065000      /* 0x2000: gpucc and the GPU GDSCs */
++#define GPU_PA          0x05000000      /* 256 KiB */
++#define QFPROM_PA       0x00784000
++
++/* GCC branch control words (CBCR): bit 0 enable, bit 31 clock off */
++#define GCC_GPU_CFG_AHB  0x004
++#define GCC_GPU_BIMC_GFX 0x010
++#define GCC_BIMC_GFX     0x06c
++#define GCC_GPU_GPLL0    0x00c          /* in the GCC_GPLL page: bit 4 gpll0, bit 3 gpll0 div */
++
++/* gpucc offsets from 0x5065000 */
++#define CC_PLL0_MODE     0x0000
++#define CC_PLL1_MODE     0x0040
++#define CC_CXO_CBCR      0x1020
++#define CC_RBCPR_CBCR    0x1054
++#define CC_GFX3D_CMD     0x1070
++#define CC_GFX3D_CFG     0x1074
++#define CC_GFX3D_CBCR    0x1098
++#define CC_RBBMT_CMD     0x10b0
++#define CC_RBBMT_CFG     0x10b4
++#define CC_RBBMT_CBCR    0x10d0
++#define CC_GX_DOMAIN     0x0130         /* bit 0 GMEM clamp IO, bit 4 GMEM reset */
++#define CC_CX_GDSCR      0x1004
++#define CC_CX_HWCTRL     0x1008
++#define CC_GX_BCR        0x1090
++#define CC_GX_GDSCR      0x1094
++
++#define GDSC_PWR_ON      (1u << 31)
++#define GDSC_SW_OVERRIDE (1u << 2)
++#define GDSC_HW_CONTROL  (1u << 1)
++#define GDSC_SW_COLLAPSE (1u << 0)
++#define CBCR_OFF         (1u << 31)
++
++/* GPU registers (a5xx_reg.h dword offsets) */
++#define A5_RBBM_CLOCK_CNTL   0x067
++#define A5_RBBM_ALWAYSON_LO  0x4d2
++#define A5_RBBM_INT_0_STATUS 0x4e1
++#define A5_RBBM_AHB_ERROR    0x4f4
++#define A5_RBBM_STATUS       0x4f5
++#define A5_RBBM_STATUS3      0x530
++#define A5_CP_HW_FAULT       0xb1a
++#define A5_VBIF_VERSION      0x3000
++#define A5_SECVID_TRUST_CNTL 0xf400
++
++#define RPM_RWCX 0x78637772             /* "rwcx" */
++#define RPM_RWMX 0x786d7772             /* "rwmx" */
++#define RPM_VLVL 0x6c766c76             /* "vlvl" */
++
++static volatile uint8_t *gcc, *gccp, *cc, *gpu, *qf;
++static int gpu_steps;
++
++static inline uint32_t
++rd(volatile uint8_t *b, uint32_t o)
++{
++	return *(volatile uint32_t *)(b + o);
++}
++
++static inline void
++wr(volatile uint8_t *b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++grd(uint32_t dw)
++{
++	return rd(gpu, dw * 4);
++}
++
++static void
++msleep(unsigned ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* the log line goes out before the access that might reset the SoC */
++static void
++say(const char *what)
++{
++	printf("WHYRED GPU: %s\n", what);
++	msleep(300);
++}
++
++/* enable a branch, wait up to 1 ms for "clock off" to clear */
++static bool
++branch_on(volatile uint8_t *b, uint32_t o, const char *name)
++{
++	wr(b, o, rd(b, o) | 1u);
++	uint32_t v = 0;
++	for (int i = 0; i < 1000; i++) {
++		v = rd(b, o);
++		if (!(v & CBCR_OFF)) {
++			break;
++		}
++		delay(1);
++	}
++	printf("WHYRED GPU: %s cbcr %#x %s\n", name, v, (v & CBCR_OFF) ? "STILL OFF" : "on");
++	return !(v & CBCR_OFF);
++}
++
++static bool
++ahb_on(void)
++{
++	return !(rd(gcc, GCC_GPU_CFG_AHB) & CBCR_OFF);
++}
++
++static void
++read_gcc(void)
++{
++	printf("WHYRED GPU: gcc gpu_cfg_ahb %#x gpu_bimc_gfx %#x bimc_gfx %#x gpu_gpll0 %#x\n",
++	    rd(gcc, GCC_GPU_CFG_AHB), rd(gcc, GCC_GPU_BIMC_GFX), rd(gcc, GCC_BIMC_GFX), rd(gccp, GCC_GPU_GPLL0));
++}
++
++static void
++read_gpucc(void)
++{
++	printf("WHYRED GPU: gpucc pll0 mode %#x l %#x, pll1 mode %#x l %#x\n",
++	    rd(cc, CC_PLL0_MODE), rd(cc, CC_PLL0_MODE + 4), rd(cc, CC_PLL1_MODE), rd(cc, CC_PLL1_MODE + 4));
++	printf("WHYRED GPU: gpucc gfx3d cmd %#x cfg %#x cbcr %#x, rbbmtimer cmd %#x cfg %#x cbcr %#x\n",
++	    rd(cc, CC_GFX3D_CMD), rd(cc, CC_GFX3D_CFG), rd(cc, CC_GFX3D_CBCR),
++	    rd(cc, CC_RBBMT_CMD), rd(cc, CC_RBBMT_CFG), rd(cc, CC_RBBMT_CBCR));
++	printf("WHYRED GPU: gpucc cxo cbcr %#x rbcpr cbcr %#x, cx gdscr %#x hwctrl %#x, gx gdscr %#x bcr %#x domain %#x\n",
++	    rd(cc, CC_CXO_CBCR), rd(cc, CC_RBCPR_CBCR), rd(cc, CC_CX_GDSCR), rd(cc, CC_CX_HWCTRL),
++	    rd(cc, CC_GX_GDSCR), rd(cc, CC_GX_BCR), rd(cc, CC_GX_DOMAIN));
++}
++
++/* RCG to XO, divider bypass, root enable, then the update bit */
++static bool
++rcg_xo(uint32_t cmd, const char *name)
++{
++	wr(cc, cmd + 4, 0);                     /* CFG: source 0 (XO), divider bypass */
++	wr(cc, cmd, rd(cc, cmd) | 2u);          /* ROOT_EN */
++	wr(cc, cmd, rd(cc, cmd) | 1u);          /* UPDATE */
++	uint32_t v = 0;
++	for (int i = 0; i < 1000; i++) {
++		v = rd(cc, cmd);
++		if (!(v & 1u)) {
++			break;
++		}
++		delay(1);
++	}
++	printf("WHYRED GPU: %s rcg cmd %#x cfg %#x %s\n", name, v, rd(cc, cmd + 4),
++	    (v & 1u) ? "UPDATE STUCK" : "ok");
++	return !(v & 1u);
++}
++
++static bool
++poll_on(uint32_t o, unsigned us)
++{
++	for (unsigned i = 0; i < us; i++) {
++		if (rd(cc, o) & GDSC_PWR_ON) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++step1(void)
++{
++	say("step 1: reading GCC GPU branches and the speed bin");
++	read_gcc();
++	uint32_t bin = (rd(qf, 0x1a0) & 0x1fe00000) >> 21;
++	printf("WHYRED GPU: speed bin %#x (qfprom 0x7841a0 = %#x)\n", bin, rd(qf, 0x1a0));
++	if (ahb_on()) {
++		say("step 1: gpu_cfg_ahb is on, reading gpucc");
++		read_gpucc();
++	} else {
++		printf("WHYRED GPU: gpu_cfg_ahb is off, gpucc not read\n");
++	}
++	return true;
++}
++
++static bool
++step2(void)
++{
++	static const uint32_t lvl[] = { RPM_VLVL, 384 };
++	say("step 2: RPM rwcx and rwmx at level 384");
++	bool cx = whyred_rpm_vote(RPM_RWCX, 0, lvl, 1);
++	bool mx = whyred_rpm_vote(RPM_RWMX, 0, lvl, 1);
++	printf("WHYRED GPU: rpm rwcx %s rwmx %s\n", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED");
++	if (!cx || !mx) {
++		return false;
++	}
++	say("step 2: GCC gpu_cfg_ahb, gpu_bimc_gfx, bimc_gfx on");
++	bool ok = branch_on(gcc, GCC_GPU_CFG_AHB, "gcc gpu_cfg_ahb") &&
++	    branch_on(gcc, GCC_GPU_BIMC_GFX, "gcc gpu_bimc_gfx") &&
++	    branch_on(gcc, GCC_BIMC_GFX, "gcc bimc_gfx");
++	if (!ok) {
++		return false;
++	}
++	say("step 2: reading gpucc");
++	read_gpucc();
++	return true;
++}
++
++static bool
++step3(void)
++{
++	uint32_t v = rd(cc, CC_CX_GDSCR);
++	if ((rd(cc, CC_CX_HWCTRL) & GDSC_PWR_ON) && !(v & GDSC_SW_COLLAPSE)) {
++		printf("WHYRED GPU: step 3: CX already on (gdscr %#x)\n", v);
++	} else {
++		say("step 3: CX GDSC on");
++		v &= ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | GDSC_SW_COLLAPSE);
++		wr(cc, CC_CX_GDSCR, v);
++		delay(1);
++		bool on = false;
++		for (int i = 0; i < 2000 && !on; i++) {
++			on = (rd(cc, CC_CX_HWCTRL) & GDSC_PWR_ON) != 0;
++			delay(1);
++		}
++		printf("WHYRED GPU: CX gdscr %#x hwctrl %#x %s\n", rd(cc, CC_CX_GDSCR), rd(cc, CC_CX_HWCTRL),
++		    on ? "on" : "TIMEOUT");
++		if (!on) {
++			return false;
++		}
++	}
++	say("step 3: gpucc CXO branch on");
++	return branch_on(cc, CC_CXO_CBCR, "gpucc cxo");
++}
++
++static bool
++step4(void)
++{
++	say("step 4: gfx3d and rbbmtimer RCGs to XO");
++	if (!rcg_xo(CC_GFX3D_CMD, "gfx3d") || !rcg_xo(CC_RBBMT_CMD, "rbbmtimer")) {
++		return false;
++	}
++	say("step 4: GX GDSC on (block reset, GMEM reset, unclamp, SW_COLLAPSE off)");
++	wr(cc, CC_GX_BCR, rd(cc, CC_GX_BCR) | 1u);
++	delay(2);
++	wr(cc, CC_GX_BCR, rd(cc, CC_GX_BCR) & ~1u);
++	wr(cc, CC_GX_DOMAIN, rd(cc, CC_GX_DOMAIN) | (1u << 4));
++	delay(2);
++	wr(cc, CC_GX_DOMAIN, rd(cc, CC_GX_DOMAIN) & ~(1u << 4));
++	wr(cc, CC_GX_DOMAIN, rd(cc, CC_GX_DOMAIN) & ~1u);
++	wr(cc, CC_GX_GDSCR, rd(cc, CC_GX_GDSCR) & ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | GDSC_SW_COLLAPSE));
++	delay(1);
++	bool on = poll_on(CC_GX_GDSCR, 2000);
++	printf("WHYRED GPU: GX gdscr %#x domain %#x bcr %#x %s\n", rd(cc, CC_GX_GDSCR), rd(cc, CC_GX_DOMAIN),
++	    rd(cc, CC_GX_BCR), on ? "on" : "TIMEOUT");
++	if (!on) {
++		return false;
++	}
++	say("step 4: gfx3d and rbbmtimer branches on");
++	if (!branch_on(cc, CC_GFX3D_CBCR, "gpucc gfx3d") || !branch_on(cc, CC_RBBMT_CBCR, "gpucc rbbmtimer")) {
++		return false;
++	}
++	say("step 4: first reads inside the GPU block");
++	printf("WHYRED GPU: vbif version %#x\n", grd(A5_VBIF_VERSION));
++	printf("WHYRED GPU: rbbm status %#x status3 %#x int0 %#x ahb_err %#x clock_cntl %#x cp_hw_fault %#x\n",
++	    grd(A5_RBBM_STATUS), grd(A5_RBBM_STATUS3), grd(A5_RBBM_INT_0_STATUS), grd(A5_RBBM_AHB_ERROR),
++	    grd(A5_RBBM_CLOCK_CNTL), grd(A5_CP_HW_FAULT));
++	printf("WHYRED GPU: secvid trust cntl %#x\n", grd(A5_SECVID_TRUST_CNTL));
++	uint32_t a = grd(A5_RBBM_ALWAYSON_LO);
++	msleep(10);
++	uint32_t b = grd(A5_RBBM_ALWAYSON_LO);
++	printf("WHYRED GPU: always-on counter %#x -> %#x in 10 ms (%d ticks, 192000 expected at 19.2 MHz)\n",
++	    a, b, (int)(b - a));
++	return true;
++}
++
++static void
++gpu_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	int wait = 20;
++	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
++	msleep((unsigned)wait * 1000u);
++	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
++	bool (*steps[])(void) = { step1, step2, step3, step4 };
++	int n = gpu_steps > 4 ? 4 : gpu_steps;
++	for (int i = 0; i < n; i++) {
++		if (!steps[i]()) {
++			printf("WHYRED GPU: step %d FAILED, stopping\n", i + 1);
++			return;
++		}
++		printf("WHYRED GPU: step %d done\n", i + 1);
++	}
++	printf("WHYRED GPU: all %d steps done\n", n);
++}
++
++void
++whyred_gpu_init(void)
++{
++	if (!PE_parse_boot_argn("whyredgpu", &gpu_steps, sizeof(gpu_steps)) || gpu_steps <= 0) {
++		return;
++	}
++	gcc = (volatile uint8_t *)ml_io_map(GCC_GPU_PA, 0x1000);
++	gccp = (volatile uint8_t *)ml_io_map(GCC_GPLL_PA, 0x1000);
++	cc = (volatile uint8_t *)ml_io_map(GPUCC_PA, 0x2000);
++	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, 0x40000);
++	qf = (volatile uint8_t *)ml_io_map(QFPROM_PA, 0x1000);
++	if (!gcc || !gccp || !cc || !gpu || !qf) {
++		printf("WHYRED GPU: MMIO mapping failed\n");
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(gpu_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
++#else
++void whyred_gpu_init(void);
++void whyred_gpu_init(void) {}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
