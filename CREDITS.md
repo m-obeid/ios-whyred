@@ -9,7 +9,9 @@ boots XNU and the iOS 16.5 user space on the POCO X5 Pro (redwood):
 - user space: <https://github.com/oosexgang/hackios-xnu-userland> — MIT License, Copyright (c) 2026 OOSEX GANG
 
 Until HackiOS published its source (2026-10-22) these parts were kept in a private tree; they are
-now here, with our changes for the Redmi Note 12 4G (topaz, SM6225 / Adreno 610).
+now here, with our changes for the Redmi Note 12 4G (topaz, SM6225 / Adreno 610) and, from patch 0960 on,
+the Redmi Note 5 Pro (whyred, SDM636). The whyred patches reuse the audio, Wi-Fi glue, sandbox and
+`kern.exec_inject` parts. The GPU parts are not in use on whyred yet.
 
 ### Kernel patches derived from HackiOS (APSL 2.0)
 

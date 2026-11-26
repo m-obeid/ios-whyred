@@ -1,5 +1,8 @@
 # topaz: back to stock / recovery runbook
 
+> History: the topaz recovery runbook. On whyred nothing is flashed to the boot partitions: a reboot returns
+> to the phone's Linux, and the iOS root is a file inside `userdata`. See [README.md](README.md).
+
 Redmi Note 12 4G (`topaz`, ROM codename `tapas`), SM6225. Everything below runs on **s8build**
 with the phone in **fastboot** (Power + Volume down). Bootloader is unlocked; there is no EDL.
 

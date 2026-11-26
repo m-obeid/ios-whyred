@@ -1,8 +1,9 @@
-# Working on ios-sweet
+# Working on ios-whyred
 
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
+- Read `README.md`, then `whyred/research/recon/whyred-facts.md` before starting. The facts file
+  holds the hardware facts, the bring-up log, CI run IDs, image names and the next steps.
+  `NOTES.md` is the older sweet log.
+- The user switches agents frequently. Update `whyred/research/recon/whyred-facts.md`
   after each milestone and before stopping. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
 - Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.

@@ -1,5 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+> History: the engineering log of the sweet port, inherited through topaz. The whyred log and handoff live in
+> [whyred/research/recon/whyred-facts.md](whyred/research/recon/whyred-facts.md).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

@@ -1,34 +1,34 @@
-# whyred shim, milestone 1
+# whyred shim
 
 A bare-metal program that ABL starts as if it were a Linux kernel. It writes nothing to flash.
-It reports the hardware on the splash screen, then reboots.
+With a payload it boots XNU. Without one it reports the hardware on the splash screen.
 
 ## Build
 
-    ./build.sh        # needs aarch64-linux-gnu-gcc, mkbootimg, cpio, gzip
+    ./build.sh PAYLOAD.bin    # boot XNU (whyred/mkboot.sh calls this)
+    ./build.sh                # diagnostics only
 
-Output: `out/shim-boot.img` (boot image v0, gzip Image + whyred DTB appended).
+Needs aarch64-linux-gnu-gcc, mkbootimg, cpio and gzip. Output: `out/shim-boot.img`, a boot
+image v0 (gzip Image + `dtb/whyred.dtb` appended), the layout of the stock whyred boot.img.
 
-## Run
+Options (environment variables, listed in `build.sh`):
 
-    fastboot getvar all 2>&1 | grep -E "unlocked|max-download|version-bootloader"
-    fastboot boot out/shim-boot.img
+| Variable | Effect |
+| --- | --- |
+| `GOLD_ROW=n` | Gold OSM row before XNU: 4 = 1804.8 MHz (default), 0 = leave Gold at 600 MHz |
+| `CPRH_OL=1` | CPRH open loop (fused ceiling voltages) instead of the closed loop |
+| `OSM=1` | Read-only Gold clock and voltage probe. `OSM_TARGET=n` also requests row n |
+| `EMMC=1` | Read-only eMMC probe |
+| `MSS=1` | Modem MBA boot probe |
+| `SCALE=n` | Console text scale (3 reads well through a webcam) |
 
-## What you should see
+## What it does on an XNU boot
 
-1. Dark grey screen: the shim started. A dark grey screen that never changes means reading
-   the display controller registers hung.
-2. White text on black with sections [cpu] [psci] [mdp] [dtb] [smp], then 2 or 3 coloured bars.
-3. After 90 s the phone resets. It should land in fastboot (restart reason 0x77665500).
-   If it boots Linux instead, the restart reason did not survive the reset.
-4. "!! EXCEPTION" with esr/elr/far means a crash. Photograph it. Hold power + vol- to recover.
+1. On Silver CPU0: wake Gold `0x100` with PSCI `CPU_ON`. Silver cores lack the 16K granule.
+2. On Gold: GIC setup for all Gold cores, OSM and CPRH bring-up (`osm.c`), then the jump into
+   XNU with the ADT and boot-args from the payload (`xnu.c`).
+3. Silver CPU0 calls `CPU_OFF` 1 s after the hand-off when `MIGRATE_INFO_TYPE` is 2, else parks
+   in `wfi`. Never `CPU_OFF` the last running Gold core: the Gold cluster powers down.
 
-Garbled or slanted text means the probe picked the wrong stride or pixel size.
-A black screen with no grey means ABL did not start the image or the splash address is wrong.
-
-## What to photograph
-
-- [cpu] boot core line: MIDR, EL, 16K flag, mmfr0.
-- [smp] lines for cpu 100-103: the 16K flag decides whether the topaz approach works.
-- [mdp] lines: the live pipe address, size, stride (st), format (f) and unpack pattern (u).
-- The colour of each bar, left to right (byte 0, 1, 2 of a pixel).
+An exception prints `!! EXCEPTION` with esr/elr/far and reboots after 60 s, which lands in Linux.
+Hold power + volume down for fastboot.
