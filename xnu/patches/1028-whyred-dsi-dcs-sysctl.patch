@@ -1,0 +1,189 @@
+diff --git a/bsd/dev/whyred_spmi.c b/bsd/dev/whyred_spmi.c
+index 71e9b40..e88011b 100644
+--- a/bsd/dev/whyred_spmi.c
++++ b/bsd/dev/whyred_spmi.c
+@@ -396,6 +396,30 @@ sysctl_whyred_scanout SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_scanout, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_whyred_scanout, "I", "whyred: display scanout (INTF_1 timing engine)");
+ 
++/*
++ * kern.whyred_dcs (root): write one DSI packet to the panel (SweetFramebuffer.cpp sweet_fb_dcs). Reading
++ * returns the last result: -1 no DSI, 0 not done, else read-back register 0x068 of a read (1 for a write).
++ */
++int sweet_fb_dcs(uint32_t v, uint32_t rd[6]);
++static int whyred_dcs_last = -1;
++
++static int
++sysctl_whyred_dcs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = whyred_dcs_last, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL) {
++		return err;
++	}
++	uint32_t rd[6] = { 0 };
++	int r = sweet_fb_dcs((uint32_t)v, rd);
++	whyred_dcs_last = r == 1 && ((uint32_t)v >> 25 & 1) ? (int)rd[2] : r;
++	return r >= 0 ? 0 : ENODEV;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, whyred_dcs, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_whyred_dcs, "I", "whyred: send one DSI packet to the panel");
++
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_usbin_suspend, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_whyred_usbin, "I", "whyred: seconds on the battery with the cable in");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 879a25a..57cd686 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -101,6 +101,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ class AppleCLCD;
+ static AppleCLCD *sweet_fb_instance;
+ extern "C" int sweet_fb_scanout(int on);       /* below; kern.whyred_scanout in bsd/dev/whyred_spmi.c */
++extern "C" int sweet_fb_dcs(uint32_t v, uint32_t rd[6]);   /* below; kern.whyred_dcs */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -247,13 +248,14 @@ public:
+ 	static void   wledOffWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
++	volatile uint8_t *fDsiCmd;    /* DSI0 for commands: fDsi, or mapped on whyred for kern.whyred_dcs */
+ 	IOLock       *fBlLock;
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+-	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
++	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len, int mode = -1);
+ 	void          setPanelOn(bool on);
+ 	void          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -382,6 +384,7 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t dsiOn = 0;
+ 	(void)PE_parse_boot_argn("sweetdsi", &dsiOn, sizeof(dsiOn));
+ 	fDsi = dsiOn ? (volatile uint8_t *)ml_io_map(0x0c994000, 0x1000) : NULL;
++	fDsiCmd = fDsi != NULL ? fDsi : (volatile uint8_t *)ml_io_map(0x0c994000, 0x1000);
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -946,9 +949,9 @@ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
+ }
+ 
+ bool
+-AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
++AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len, int mode)
+ {
+-	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
++	if (fDsiCmd == NULL || fDsiBuf == NULL || len > 60) {
+ 		return false;
+ 	}
+ 	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
+@@ -959,16 +962,16 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 		memcpy(p + 4, payload, len);
+ 	}
+ 	sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
+-	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
++	uint32_t ctrl = dsi_rd(fDsiCmd, 0x004), trig = dsi_rd(fDsiCmd, 0x084);
+ 	if ((trig & 7) != 4) {
+-		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
+-	}
+-	dsi_wr(fDsi, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
+-	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
+-	dsi_wr(fDsi, 0x15c, 0);                          /* no test pattern */
+-	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
+-	dsi_wr(fDsi, 0x04c, size);
+-	uint32_t dma = dsi_rd(fDsi, 0x03c);
++		dsi_wr(fDsiCmd, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
++	}
++	dsi_wr(fDsiCmd, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
++	dsi_wr(fDsiCmd, 0x110, dsi_rd(fDsiCmd, 0x110) | 1);   /* clear CMD_DMA_DONE */
++	dsi_wr(fDsiCmd, 0x15c, 0);                          /* no test pattern */
++	dsi_wr(fDsiCmd, 0x048, (uint32_t)fDsiBufPhys);
++	dsi_wr(fDsiCmd, 0x04c, size);
++	uint32_t dma = dsi_rd(fDsiCmd, 0x03c);
+ 	/*
+ 	 * Low-power mode (COMMAND_MODE_DMA_CTRL bit 26), as Linux sends commands
+ 	 * for panels with MIPI_DSI_MODE_LPM: in high speed the topaz panel took
+@@ -979,11 +982,12 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 		hs = 0;
+ 		(void)PE_parse_boot_argn("sweetdsi_hs", &hs, sizeof(hs));
+ 	}
+-	dsi_wr(fDsi, 0x03c, hs ? (dma & ~(1u << 26)) : (dma | (1u << 26)));
+-	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
++	bool useHs = mode >= 0 ? mode != 0 : hs != 0;
++	dsi_wr(fDsiCmd, 0x03c, useHs ? (dma & ~(1u << 26)) : (dma | (1u << 26)));
++	dsi_wr(fDsiCmd, 0x090, 1);                          /* SW trigger */
+ 	bool done = false;
+ 	for (int i = 0; i < 100 && !done; i++) {
+-		done = (dsi_rd(fDsi, 0x110) & 1) != 0;
++		done = (dsi_rd(fDsiCmd, 0x110) & 1) != 0;
+ 		if (!done) {
+ 			IODelay(200);
+ 		}
+@@ -992,15 +996,15 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 		static uint32_t told;
+ 		if (told++ < 6) {
+ 			IOLog("SWEET FB: DSI cmd %#x not done on cpu %d: ctrl %#x trig %#x dma %#x int %#x status %#x err %#x buf %#llx\n",
+-			    hdr[0], cpu_number(), dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x084), dsi_rd(fDsi, 0x03c),
+-			    dsi_rd(fDsi, 0x110), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x0c4), (unsigned long long)fDsiBufPhys);
++			    hdr[0], cpu_number(), dsi_rd(fDsiCmd, 0x004), dsi_rd(fDsiCmd, 0x084), dsi_rd(fDsiCmd, 0x03c),
++			    dsi_rd(fDsiCmd, 0x110), dsi_rd(fDsiCmd, 0x008), dsi_rd(fDsiCmd, 0x0c4), (unsigned long long)fDsiBufPhys);
+ 		}
+ 	}
+-	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
+-	dsi_wr(fDsi, 0x03c, dma);
+-	dsi_wr(fDsi, 0x004, ctrl);
+-	if (trig != dsi_rd(fDsi, 0x084)) {
+-		dsi_wr(fDsi, 0x084, trig);
++	dsi_wr(fDsiCmd, 0x110, dsi_rd(fDsiCmd, 0x110) | 1);
++	dsi_wr(fDsiCmd, 0x03c, dma);
++	dsi_wr(fDsiCmd, 0x004, ctrl);
++	if (trig != dsi_rd(fDsiCmd, 0x084)) {
++		dsi_wr(fDsiCmd, 0x084, trig);
+ 	}
+ 	return done;
+ }
+@@ -1667,3 +1671,40 @@ sweet_fb_scanout(int on)
+ 	}
+ 	return (int)(r[0] & 1u);
+ }
++
++/*
++ * whyred: one DSI packet to the panel for tests, v = data0 | data1 << 8 | data type << 16 | HS << 24 | read << 25.
++ * DCS short write 0x05 (no parameter) or 0x15 (one), DCS read 0x06. A read first sets the maximum return
++ * size to 1 (type 0x37), then sends the read with bus turnaround. rd[] gets the DSI read-back registers
++ * 0x060-0x074. Returns 1 when the command DMA finished, 0 when not, -1 without DSI.
++ */
++extern "C" int
++sweet_fb_dcs(uint32_t v, uint32_t rd[6])
++{
++	AppleCLCD *fb = sweet_fb_instance;
++	if (fb == NULL || fb->fDsiCmd == NULL || fb->fDsiBuf == NULL) {
++		return -1;
++	}
++	int hs = (v >> 24) & 1;
++	bool read = ((v >> 25) & 1) != 0;
++	uint8_t hdr[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)((v >> 16) & 0x3f), (uint8_t)(read ? 0xa0 : 0x80) };
++	bool done = true;
++	IOLockLock(fb->fBlLock);
++	if (read) {
++		const uint8_t max[4] = { 1, 0, 0x37, 0x80 };
++		done = fb->dsiSend(max, NULL, 0, hs);
++	}
++	done = done && fb->dsiSend(hdr, NULL, 0, hs);
++	if (read) {
++		IODelay(500);
++	}
++	for (int i = 0; i < 6; i++) {
++		rd[i] = dsi_rd(fb->fDsiCmd, 0x060 + 4 * i);
++	}
++	uint32_t ack = dsi_rd(fb->fDsiCmd, 0x0c4), status = dsi_rd(fb->fDsiCmd, 0x008);
++	IOLockUnlock(fb->fBlLock);
++	IOLog("SWEET FB: DCS %02x %02x type %02x %s%s: %s, rdbk %08x %08x %08x %08x %08x %08x ack %#x status %#x\n",
++	    hdr[0], hdr[1], hdr[2], hs ? "HS" : "LP", read ? " read" : "", done ? "done" : "NOT DONE",
++	    rd[0], rd[1], rd[2], rd[3], rd[4], rd[5], ack, status);
++	return done ? 1 : 0;
++}
