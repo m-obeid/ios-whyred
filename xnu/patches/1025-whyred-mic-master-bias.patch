@@ -1,0 +1,12 @@
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index f62c2f5..be0db3d 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -3311,6 +3311,7 @@ static const struct mic_op mic_init[] = {
+ };
+ 
+ static const struct mic_op mic_on_ops[] = {
++	{ MA, 0xf146, 0x30 },                   /* master bias: Linux sets it at MBHC init, before the traces (1024) */
+ 	{ MD, 0x00c, 0x03 }, { MD, 0x010, 0x03 }, { MD, 0x01c, 0x00 },          /* digital codec probe */
+ 	{ MD, 0x1a0, 0x01 },                    /* mixer "DEC1 MUX" ADC1 */
+ 	{ MD, 0x00c, 0x23 }, { MD, 0x01c, 0x04 }, { MD, 0x028, 0x03 }, { MD, 0x024, 0x01 },
