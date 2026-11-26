@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
-index a2118e3..82d356b 100644
+index a2118e3..16673ab 100644
 --- a/bsd/dev/whyred_gpu.c
 +++ b/bsd/dev/whyred_gpu.c
 @@ -12,6 +12,18 @@
@@ -92,7 +92,7 @@ index a2118e3..82d356b 100644
  static int gpu_steps;
  
  static inline uint32_t
-@@ -299,6 +362,366 @@ step4(void)
+@@ -299,6 +362,368 @@ step4(void)
  	return true;
  }
  
@@ -332,7 +332,9 @@ index a2118e3..82d356b 100644
 +		goto out;
 +	}
 +	uint32_t hsz = eh->phoff + (uint32_t)eh->phnum * sizeof(struct z_phdr);
-+	if (ph[hash].offset + ph[hash].filesz > mdt_size || hsz + ph[hash].filesz > 0x10000) {
++	/* the hash segment sits at its file offset in a full ELF, right behind the headers in a split .mdt */
++	uint32_t hoff = ph[hash].offset + ph[hash].filesz <= mdt_size ? ph[hash].offset : hsz;
++	if (hoff + ph[hash].filesz > mdt_size || hsz + ph[hash].filesz > 0x10000) {
 +		printf("WHYRED GPU: zap: hash segment outside the .mdt\n");
 +		goto out;
 +	}
@@ -341,7 +343,7 @@ index a2118e3..82d356b 100644
 +		*gmw(META_OFF + i) = *(const uint32_t *)(m + i);
 +	}
 +	for (uint32_t i = 0; i < ph[hash].filesz; i += 4) {
-+		*gmw(META_OFF + hsz + i) = *(const uint32_t *)(m + ph[hash].offset + i);
++		*gmw(META_OFF + hsz + i) = *(const uint32_t *)(m + hoff + i);
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	st = topaz_scm(0x42000201u, 2 | (2u << 6), 13, GMEM_PA + META_OFF, 0, &res);   /* PIL INIT_IMAGE, arg 2 RW */
@@ -459,7 +461,7 @@ index a2118e3..82d356b 100644
  static void
  gpu_thread(__unused void *arg, __unused wait_result_t wr_)
  {
-@@ -306,8 +729,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -306,8 +731,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
  	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
  	gpu_ms((unsigned)wait * 1000u);
  	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
@@ -470,7 +472,7 @@ index a2118e3..82d356b 100644
  	for (int i = 0; i < n; i++) {
  		if (!steps[i]()) {
  			printf("WHYRED GPU: step %d FAILED, stopping\n", i + 1);
-@@ -329,7 +752,9 @@ whyred_gpu_init(void)
+@@ -329,7 +754,9 @@ whyred_gpu_init(void)
  	cc = (volatile uint8_t *)ml_io_map(GPUCC_PA, 0x2000);
  	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, 0x40000);
  	qf = (volatile uint8_t *)ml_io_map(QFPROM_PA, 0x1000);
