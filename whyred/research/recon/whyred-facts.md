@@ -890,6 +890,12 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   (two levels, about 100-106 and 158-179), panel asleep + scanout off 133 avg (about 87-89 and 128-206), panel
   awake + scanout on 153 avg (147-165, steady). Panel sleep saves about 35 mA on average. Scanout off on a slept
   panel: inconclusive, needs longer runs. The two levels are probably Wi-Fi scans (guess).
+- 1029 does it on every lock: after "WLED off after fade" the panel gets 0x28 + 0x10 (HS), before "WLED on" it gets
+  0x11 + 0x29 (LP), each with a power mode read in the log ("panel sleep in: done, power mode 0x8", "sleep out ...
+  0x1c"). A lock that ends while the wake waits is serialised by fPanelLock. Boot-arg sweetfb_psleep=0 turns it off.
+  CI 45892798613, image whyred/out/xnu-ios-1029.img (default boot-args), now the default image. Verified: 19 locks,
+  18 unlocks in one hour, slow and fast, all reads 0x08 / 0x1c, no failed command, the user saw a clean picture
+  on every unlock.
 - Freeze seen the same session (before the DCS tests): iOS turned the display off ("WLED off after fade: done")
   in Voice Memos, the last frame stayed lit, touch and power reached SweetHID but the display never came back on.
   kill -9 backboardd recovered. First SPMI reads of the WLED ctrl (0xd846) returned 0, then 0x80: reads can be
