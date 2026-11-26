@@ -1,0 +1,90 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 57cd686..010f2ed 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -189,6 +189,10 @@ public:
+ 	uint32_t      fIntfFrames;
+ 	bool          fTeOffAuto;     /* whyred boot-arg sweetfb_teoff=1: no scanout while the WLED is off */
+ 	bool          fTeOff;         /* INTF_1 timing engine stopped by us */
++	bool          fPanelSleepAuto; /* whyred: DCS sleep in while the WLED is off (boot-arg sweetfb_psleep=0: no) */
++	bool          fPanelAsleep;   /* DCS 0x28 + 0x10 sent, no wake yet */
++	IOLock       *fPanelLock;     /* one sleep or wake sequence at a time */
++	void          panelSleep(bool in);
+ 	/* boot-arg sweetfb_lock=1: the vsync timer follows the panel (vsyncNext) */
+ 	bool          fVLock;
+ 	uint32_t      fVTotal;        /* lines a panel frame, blanking included */
+@@ -444,6 +448,10 @@ AppleCLCD::start(IOService *provider)
+ 		uint32_t teoff = 0;
+ 		sweet_fb_instance = this;
+ 		fTeOffAuto = fWled && PE_parse_boot_argn("sweetfb_teoff", &teoff, sizeof(teoff)) && teoff != 0;
++		uint32_t psleep = 1;
++		(void)PE_parse_boot_argn("sweetfb_psleep", &psleep, sizeof(psleep));
++		fPanelLock = IOLockAlloc();
++		fPanelSleepAuto = fWled && fDsiCmd != NULL && fDsiBuf != NULL && fPanelLock != NULL && psleep != 0;
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+ 		uint32_t htotal = r[0x008 / 4] >> 16;
+@@ -1040,6 +1048,9 @@ AppleCLCD::setPanelOn(bool on)
+ 			(void)sweet_fb_scanout(1);
+ 			IOSleep(35);            /* two panel frames before the light */
+ 		}
++		if (fPanelSleepAuto) {
++			panelSleep(false);     /* waits for a sleep sequence still running */
++		}
+ 		IOLockLock(fBlLock);
+ 		int r = fWledOff ? sweet_wled_enable(1) : 0;
+ 		fWledOff = false;
+@@ -1134,11 +1145,53 @@ AppleCLCD::wledOffWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	fb->fWledOff = true;
+ 	IOLockUnlock(fb->fBlLock);
+ 	IOLog("SWEET FB: WLED off after fade: %s\n", r == 0 ? "done" : "FAILED");
++	if (fb->fPanelSleepAuto && r == 0) {
++		fb->panelSleep(true);
++	}
+ 	if (fb->fTeOffAuto && r == 0) {
+ 		(void)sweet_fb_scanout(0);
+ 	}
+ }
+ 
++/*
++ * whyred TD4310: DCS sleep as the DT off-command (0x28, 20 ms, 0x10, 120 ms, high speed) and wake as Linux does
++ * (0x11, 120 ms, 0x29, low power). The video stream keeps running. Each step ends with a power mode read (0x0A):
++ * 0x08 asleep, 0x1c awake. Called with the WLED off, from thread calls (it sleeps).
++ */
++void
++AppleCLCD::panelSleep(bool in)
++{
++	const uint8_t a[4] = { (uint8_t)(in ? 0x28 : 0x11), 0, 0x05, 0x80 };
++	const uint8_t b[4] = { (uint8_t)(in ? 0x10 : 0x29), 0, 0x05, 0x80 };
++	const uint8_t max[4] = { 1, 0, 0x37, 0x80 }, rd[4] = { 0x0a, 0, 0x06, 0xa0 };
++	int hs = in ? 1 : 0;
++	IOLockLock(fPanelLock);
++	IOLockLock(fLock);
++	bool off = fPowerOff;
++	IOLockUnlock(fLock);
++	if (in == fPanelAsleep || (in && !off)) {
++		IOLockUnlock(fPanelLock);
++		return;                 /* nothing to do, or turned back on meanwhile */
++	}
++	IOLockLock(fBlLock);
++	bool done = dsiSend(a, NULL, 0, hs);
++	IOLockUnlock(fBlLock);
++	IOSleep(in ? 20 : 120);
++	IOLockLock(fBlLock);
++	done &= dsiSend(b, NULL, 0, hs);
++	IOLockUnlock(fBlLock);
++	IOSleep(in ? 120 : 20);
++	IOLockLock(fBlLock);
++	bool rdone = dsiSend(max, NULL, 0, 0) && dsiSend(rd, NULL, 0, 0);
++	IODelay(500);
++	uint32_t mode = dsi_rd(fDsiCmd, 0x06c);
++	IOLockUnlock(fBlLock);
++	fPanelAsleep = in;
++	IOLockUnlock(fPanelLock);
++	IOLog("SWEET FB: panel %s: %s, power mode %#x\n", in ? "sleep in" : "sleep out",
++	    done ? "done" : "NOT DONE", rdone && (mode >> 24) == 0x21 ? (mode >> 16) & 0xff : 0xffffffffu);
++}
++
+ void
+ AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
