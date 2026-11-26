@@ -919,7 +919,7 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   moves: the analog codec sent nothing.
 - Cause: PMIC_ANALOG_MASTER_BIAS_CTL (0xf146) read 0 on iOS and 0x30 on Linux. Linux writes it at MBHC init,
   before any trace. Setting it live gave noise (rms 4.5) and a laptop 1 kHz tone at amplitude 109. 1025 writes it
-  at mic start.
+  at mic start. Verified on 1025 (CI 45733899688, whyred/out/xnu-ios-1025.img): tone at 108, USB stays up.
 - whyred/tools/cdcdump: read-only Linux module (build against src/kernel-lineage-21 with build/kernel-out in the
   whyred-kernel-build image, cp -a the out dir) that dumps the digital codec, LPI pads and analog codec (regmap
   of the anlg-cdc platform device) while arecord runs. Other analog differences left: f147, f150-f159 (MBHC),
