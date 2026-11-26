@@ -876,6 +876,29 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - The 160 mA floor is not the CPUs or the polling: the panel and MDP, bus and DDR clocks without sleep
   votes, the radios. Next steps: panel sleep over DSI, RPM sleep-set votes, system suspend.
 
+## Panel sleep over DSI (patch 1028, 2026-11-26)
+
+- 1028 kern.whyred_dcs (root): one DSI packet, v = data0 | data1 << 8 | type << 16 | HS << 24 | read << 25. DSI0
+  (0xc994000) is mapped for commands on whyred without sweetdsi (backlight stays WLED). CI 45881392701, image
+  whyred/out/xnu-ios-1028.img. The DSI command DMA path works on the first try (it had never run on whyred).
+- DCS read 0x0A (get power mode, LP, max return size 1 first): the reply lands in read-back register 0x06c as
+  0x21XX0032 (type 0x21, one byte XX), older replies shift to 0x070/0x074. Values: 0x1c awake (sleep out, normal,
+  display on), 0x18 after 0x28, 0x08 after 0x28 + 0x10. 0x1c matches the DT ESD status value.
+- Seen by the user: 0x28 blacks the picture with the backlight on, 0x29 restores it; 0x28 + 0x10 (HS, as the DT
+  off-command) then 0x11, 120 ms, 0x29 (LP) brings the picture back clean.
+- Draw, screen off by lock, WLED off, 10 s samples on battery (ibatt.sh): panel asleep + scanout on 119 mA avg
+  (two levels, about 100-106 and 158-179), panel asleep + scanout off 133 avg (about 87-89 and 128-206), panel
+  awake + scanout on 153 avg (147-165, steady). Panel sleep saves about 35 mA on average. Scanout off on a slept
+  panel: inconclusive, needs longer runs. The two levels are probably Wi-Fi scans (guess).
+- Freeze seen the same session (before the DCS tests): iOS turned the display off ("WLED off after fade: done")
+  in Voice Memos, the last frame stayed lit, touch and power reached SweetHID but the display never came back on.
+  kill -9 backboardd recovered. First SPMI reads of the WLED ctrl (0xd846) returned 0, then 0x80: reads can be
+  stale. Cause unknown.
+- Photos Hidden / Recently Deleted: coreauthd "ACMContextCreate failed: -5" (no SEP / AppleCredentialManager), so
+  no passcode sheet appears. Workaround on the phone: ContentPrivacyEnabled = false in
+  com.apple.mobileslideshow.plist (original /var/root/mobileslideshow.plist.orig). Write the plist and restart
+  cfprefsd in one step; never SIGSTOP cfprefsd (every preference read then hangs, ssh included).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
