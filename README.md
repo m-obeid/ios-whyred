@@ -13,6 +13,15 @@ The whyred work starts at patch 0960 and lives in `whyred/`.
 
 > Experimental bring-up, not a usable phone OS. Many parts are missing or stubbed, and Apple's security model is mostly off. Nothing is flashed to the boot partitions: the kernel starts from RAM with `fastboot boot`, and a normal reboot returns to the Linux installed on the phone.
 
+## The phone runs Linux
+
+This phone's main OS is Linux, not Android: Void Linux on Halium (kernel 4.19 from LineageOS's whyred sources, Android vendor partitions for the drivers). iOS boots next to Linux and never replaces it:
+
+- **Home base.** Power on, a reboot, a panic or a watchdog reset all land in Linux, reachable over SSH. `whyred/tools/to-fastboot.sh` reboots Linux into fastboot with no buttons, so a full test cycle (Linux, fastboot, iOS, back to Linux) runs from the PC without touching the phone.
+- **Storage.** The iOS root is a file, `/userdata/iosroot.img`, on Linux's ext4 `userdata`. Linux copies new roots in (`push-root.sh`) and reports where the file sits on the eMMC. XNU reads and writes those sectors directly.
+- **Reference.** Linux drives the same hardware, so the port copies it. Hardware facts come from its live device tree, `/proc/iomem` and dmesg. Read-only kernel modules built against the phone's exact kernel (`whyred/tools/osmdump`, `cdcdump`) dump the CPU clock, voltage and audio codec registers. tracefs records the register writes for the speaker and mic. Linux also gave the reference numbers: CPU speed, Wi-Fi association frames, idle power.
+- **Firmware.** The modem, ADSP and Wi-Fi firmware stay in the stock partitions. XNU reads them from the eMMC at boot, the way Linux does.
+
 ## What works (2026-11-26)
 
 | Area | State |
