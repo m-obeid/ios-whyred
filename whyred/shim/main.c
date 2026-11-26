@@ -567,9 +567,19 @@ void shim_main(uint64_t dtb)
 		handoff_start = ps;
 		dsb();
 		int64_t r = (int64_t)smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
-		if (r == 0)
-			for (;;)	/* Silver parks with DAIF masked. Never CPU_OFF: see whyred-facts.md */
+		if (r == 0) {
+			/*
+			 * Silver 0 is the last Silver core on (1-3 never start): CPU_OFF powers the Silver cluster
+			 * down. Linux offlines CPU0 on this TZ (psci: CPU0 killed, 2026-11-26). Only when no Trusted
+			 * OS lives on one core (MIGRATE_INFO_TYPE 2), 1 s after Gold started. The Gold cluster rule
+			 * (never CPU_OFF its last core) is separate. If CPU_OFF returns, park as before.
+			 */
+			delay_ms(1000);
+			if ((int64_t)smc(PSCI_MIGRATE_INFO_TYPE, 0, 0, 0) == 2)
+				(void)smc(PSCI_CPU_OFF, 0, 0, 0);
+			for (;;)	/* Silver parks with DAIF masked */
 				__asm__ volatile("wfi");
+		}
 		handoff_start = 0;
 		puts_("!! CPU_ON 0x100 failed: ");
 		dec(r);

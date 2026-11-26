@@ -849,6 +849,33 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - adsp=1 is in the default boot-args now (whyred/out/xnu-ios-1017.img).
 - Not yet heard by a person: a listening check with real iOS sounds (keyboard clicks, Safari video).
 
+## Screen-off power (patches 1026, 1027, shim Silver off, 2026-11-26)
+
+- Measure: kern.whyred_usbin_suspend=N (1026) runs the phone on its battery for N s with the cable in
+  (SMB2 USBIN_CMD_IL 0x1340 bit 0, allowlisted; clears itself and at boot). /var/root/ibatt.sh N samples
+  SweetBattery's InstantAmperage every 10 s (ioreg; + = discharging here). Byte reads of IBATT 0x41a2/a3
+  through kern.whyred_codec op 7 tear (low and high byte from different samples): use the ioreg value.
+  Readings while charging (the old "-60 mA") are the charger's net, not the phone.
+- Screen off, idle, Wi-Fi unassociated (scans 2 x 5 s every 65 s): 160 mA median, steady (1026 and 1027,
+  300 s each). About 25 h on 4000 mAh. iostat: CPUs 97 % idle.
+- lskdd respawned about once a second (runs 9866 in 3 h, exit 92, ThrottleInterval 0): launchctl disable +
+  bootout system/com.apple.lskdd (on the phone). Live-process CPU 5.3 -> 2.9 CPU-s per minute, launchd
+  1.06 -> 0.10. No other job above 8 runs. bluetoothd was already disabled (2026-11-11).
+- 1026: USB poll 10 ms after 2 s without events (was 1 ms), woken by output; audio idle poll 100 ms after
+  setup (was 20 ms). SSH and the log stream work. No change visible in the 160 mA.
+- 1027: kern.whyred_scanout stops INTF_1's timing engine. With the WLED off: 205 mA with scanout off vs
+  160 on. The panel without a video stream (still in normal mode, not slept) draws more. Restart works
+  (frames resume). Boot-arg sweetfb_teoff=1 does this automatically: leave it off. Next for the display:
+  DCS 0x28 + 0x10 (sleep in) over DSI before stopping scanout, then DSI and MDP clocks off. The DSI
+  command path is untested on whyred (sweetdsi=1): needs a person to watch the panel.
+- Linux on this phone, awake (no suspend), screen blanked, cores at 1.6/1.8 GHz: 229 mA. Linux offlines
+  CPU0 on this TZ: "psci: CPU0 killed", and back online.
+- Shim: Silver 0 (the only Silver core on) now calls CPU_OFF 1 s after Gold 0x100 starts, when
+  MIGRATE_INFO_TYPE is 2; parks in wfi if it returns. Image whyred/out/xnu-ios-1027s.img boots normally.
+  Draw unchanged (160 mA median); whether CPU_OFF ran is not visible from XNU.
+- The 160 mA floor is not the CPUs or the polling: the panel and MDP, bus and DDR clocks without sleep
+  votes, the radios. Next steps: panel sleep over DSI, RPM sleep-set votes, system suspend.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
