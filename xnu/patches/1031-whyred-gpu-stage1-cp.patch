@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
-index a2118e3..16673ab 100644
+index a2118e3..8757a88 100644
 --- a/bsd/dev/whyred_gpu.c
 +++ b/bsd/dev/whyred_gpu.c
 @@ -12,6 +12,18 @@
@@ -92,7 +92,7 @@ index a2118e3..16673ab 100644
  static int gpu_steps;
  
  static inline uint32_t
-@@ -299,6 +362,368 @@ step4(void)
+@@ -299,6 +362,369 @@ step4(void)
  	return true;
  }
  
@@ -175,7 +175,8 @@ index a2118e3..16673ab 100644
 +		printf("WHYRED GPU: smmu SMR%u %#x S2CR %#x\n", i, rd(smmu, 0x800 + 4 * i), rd(smmu, 0xc00 + 4 * i));
 +	}
 +	volatile uint8_t *gr1 = smmu + smmu_psize, *cb0 = smmu + smmu_npage * smmu_psize;
-+	for (uint32_t i = 0; i < smmu_ncb && i < 8; i++) {
++	/* banks 2 and up belong to TrustZone (the secure context, SID 2): a read of CB2 stalled the bus */
++	for (uint32_t i = 0; i < smmu_ncb && i < 2; i++) {
 +		volatile uint8_t *cb = cb0 + i * smmu_psize;
 +		printf("WHYRED GPU: smmu CB%u CBAR %#x CBA2R %#x SCTLR %#x TTBR0 %#x:%#x FSR %#x\n", i, rd(gr1, 4 * i),
 +		    rd(gr1, 0x800 + 4 * i), rd(cb, 0x0), rd(cb, 0x24), rd(cb, 0x20), rd(cb, 0x58));
@@ -461,7 +462,7 @@ index a2118e3..16673ab 100644
  static void
  gpu_thread(__unused void *arg, __unused wait_result_t wr_)
  {
-@@ -306,8 +731,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -306,8 +732,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
  	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
  	gpu_ms((unsigned)wait * 1000u);
  	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
@@ -472,7 +473,7 @@ index a2118e3..16673ab 100644
  	for (int i = 0; i < n; i++) {
  		if (!steps[i]()) {
  			printf("WHYRED GPU: step %d FAILED, stopping\n", i + 1);
-@@ -329,7 +754,9 @@ whyred_gpu_init(void)
+@@ -329,7 +755,9 @@ whyred_gpu_init(void)
  	cc = (volatile uint8_t *)ml_io_map(GPUCC_PA, 0x2000);
  	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, 0x40000);
  	qf = (volatile uint8_t *)ml_io_map(QFPROM_PA, 0x1000);
