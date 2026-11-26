@@ -1,0 +1,483 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index a2118e3..82d356b 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -12,6 +12,18 @@
+  *   4  gfx3d and rbbmtimer clocks from XO (19.2 MHz), GX power domain on as Linux gdsc_enable
+  *      (block reset, GMEM reset, unclamp, SW_COLLAPSE off, PWR_ON), gfx3d and rbbmtimer
+  *      branches, then the first reads inside the GPU block
++ *   5  reads only: the GPU SMMU (0x5040000): ID registers, SMRs, S2CRs, context bank 0
++ *   6  identity context bank for stream 0 (stage 1 off), so GPU address = physical address
++ *   7  a5xx_start subset: VBIF (a540 list), CP queue thresholds (A509),
++ *      secure TSB off
++ *   8  microcode a530_pfp.fw / a530_pm4.fw from /usr/share/firmware/whyred on the root (minus the
++ *      first word) into GPU memory, instruction bases, ring (32 KiB) and RPTR shadow
++ *   9  zap shader a512_zap.mdt/.b02 through TrustZone (PAS 13: init image, mem setup, auth and reset)
++ *  10  CP start (ME_CNTL 0), CP_ME_INIT, CP_SET_SECURE_MODE 0 (or SECVID_TRUST_CNTL 0 without a zap)
++ *  11  job test: an indirect buffer with CP_MEM_WRITE, then CACHE_FLUSH_TS into the fence page
++ *
++ * GPU memory is the free RAM below the XNU base (0xa0800000, 4 MiB here), mapped uncached, so CPU
++ * writes and GPU writes need no cache maintenance.
+  *
+  * Each step logs before it touches hardware and after. A check that fails ends the run.
+  * Offsets: Linux kernel-lineage-21 gcc-sdm660.c, gpucc-sdm660.c, gdsc-regulator.c, a5xx_reg.h
+@@ -21,6 +33,7 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <stdbool.h>
+@@ -77,11 +90,61 @@ void whyred_gpu_init(void);
+ #define A5_VBIF_VERSION      0x3000
+ #define A5_SECVID_TRUST_CNTL 0xf400
+ 
++#define A5_CP_RB_BASE        0x800
++#define A5_CP_RB_BASE_HI     0x801
++#define A5_CP_RB_CNTL        0x802
++#define A5_CP_RB_RPTR_ADDR   0x804
++#define A5_CP_RB_RPTR_ADDR_HI 0x805
++#define A5_CP_RB_RPTR        0x806
++#define A5_CP_RB_WPTR        0x807
++#define A5_CP_ROQ_THRESH_1   0x81f
++#define A5_CP_ROQ_THRESH_2   0x820
++#define A5_CP_MEQ_THRESH     0x825
++#define A5_CP_MERCIU_SIZE    0x826
++#define A5_CP_ME_CNTL        0x832
++#define A5_CP_PFP_INSTR_LO   0x835
++#define A5_CP_PFP_INSTR_HI   0x836
++#define A5_CP_PM4_INSTR_LO   0x838
++#define A5_CP_PM4_INSTR_HI   0x839
++#define A5_CP_INT_STATUS     0xb18
++#define A5_VBIF_RR_QOS_ARB   0x3049
++#define A5_VBIF_GATE_WRREQ   0x302a
++#define A5_SECVID_TSB_CNTL   0xf803
++
++#define PKT_ME_INIT          0x48
++#define PKT_SET_SECURE_MODE  0x66
++#define PKT_MEM_WRITE        0x3d
++#define PKT_EVENT_WRITE      0x46
++#define PKT_IB_PFE           0x3f
++#define PKT_WAIT_FOR_IDLE    0x26
++#define EV_CACHE_FLUSH_TS    4
++
++/* GPU memory layout in the free RAM below the XNU base */
++#define GMEM_PA      0xa0800000u
++#define GMEM_SIZE    0x400000u
++#define ZAP_OFF      0x000000u          /* 1 MiB, the zap segment */
++#define META_OFF     0x100000u          /* zap metadata */
++#define PFP_OFF      0x200000u
++#define PM4_OFF      0x210000u
++#define RING_OFF     0x300000u          /* 32 KiB */
++#define FENCE_OFF    0x310000u          /* rptr shadow at +0, fence at +0x40, test word at +0x80 */
++#define IB_OFF       0x311000u
++#define RING_DW      8192u
++
++#define SMMU_PA      0x05040000
++
+ #define RPM_RWCX 0x78637772             /* "rwcx" */
+ #define RPM_RWMX 0x786d7772             /* "rwmx" */
+ #define RPM_VLVL 0x6c766c76             /* "vlvl" */
+ 
+-static volatile uint8_t *gcc, *gccp, *cc, *gpu, *qf;
++static volatile uint8_t *gcc, *gccp, *cc, *gpu, *qf, *smmu, *gm;
++static uint32_t ring_w;                 /* next ring dword */
++static bool zap_ok;
++static uint32_t pfp_ver, pm4_ver;
++int topaz_fw_read(const char *path, void **data, size_t *size);
++void topaz_fw_free(void *data, size_t size);
++int topaz_root_mounted(void);
++uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
+ static int gpu_steps;
+ 
+ static inline uint32_t
+@@ -299,6 +362,366 @@ step4(void)
+ 	return true;
+ }
+ 
++static inline void
++gwr(uint32_t dw, uint32_t v)
++{
++	wr(gpu, dw * 4, v);
++}
++
++static inline volatile uint32_t *
++gmw(uint32_t off)
++{
++	return (volatile uint32_t *)(gm + off);
++}
++
++static int
++parity(uint32_t v)
++{
++	v ^= v >> 16;
++	v ^= v >> 8;
++	v ^= v >> 4;
++	v &= 0xf;
++	return (~0x6996 >> v) & 1;
++}
++
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return (7u << 28) | (cnt & 0x3fff) | ((uint32_t)parity(cnt) << 15) | ((op & 0x7f) << 16) |
++	       ((uint32_t)parity(op) << 23);
++}
++
++static void
++ring_put(uint32_t v)
++{
++	*gmw(RING_OFF + 4 * (ring_w % RING_DW)) = v;
++	ring_w++;
++}
++
++/* ring the doorbell, wait for RPTR to catch up and the GPU to go idle */
++static bool
++ring_kick(const char *what, unsigned ms)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr(A5_CP_RB_WPTR, ring_w % RING_DW);
++	uint32_t rptr = 0, st = 0;
++	for (unsigned i = 0; i < ms * 10; i++) {
++		rptr = grd(A5_CP_RB_RPTR);
++		st = grd(A5_RBBM_STATUS);
++		if (rptr == ring_w % RING_DW && (st & ~1u) == 0) {
++			printf("WHYRED GPU: %s: idle, rptr %u, rbbm status %#x\n", what, rptr, st);
++			return true;
++		}
++		delay(100);
++	}
++	printf("WHYRED GPU: %s: NOT IDLE after %u ms: rptr %u wptr %u status %#x status3 %#x int0 %#x cp_int %#x hw_fault %#x ahb_err %#x\n",
++	    what, ms, rptr, ring_w % RING_DW, st, grd(A5_RBBM_STATUS3), grd(A5_RBBM_INT_0_STATUS), grd(A5_CP_INT_STATUS),
++	    grd(A5_CP_HW_FAULT), grd(A5_RBBM_AHB_ERROR));
++	return false;
++}
++
++static uint32_t smmu_npage, smmu_psize, smmu_nsmr, smmu_ncb;
++
++static bool
++step5(void)
++{
++	say("step 5: reading the GPU SMMU");
++	uint32_t cr0 = rd(smmu, 0x0), id0 = rd(smmu, 0x20), id1 = rd(smmu, 0x24), id2 = rd(smmu, 0x28);
++	smmu_nsmr = id0 & 0xff;
++	smmu_ncb = id1 & 0xff;
++	smmu_psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	smmu_npage = 1u << (((id1 >> 28) & 7) + 1);
++	printf("WHYRED GPU: smmu sCR0 %#x ID0 %#x ID1 %#x ID2 %#x: %u SMRs, %u CBs, page %#x x%u\n", cr0, id0, id1, id2,
++	    smmu_nsmr, smmu_ncb, smmu_psize, smmu_npage);
++	if ((uint64_t)smmu_npage * smmu_psize * 2 > 0x10000) {
++		printf("WHYRED GPU: smmu layout larger than the 64 KiB mapping\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < smmu_nsmr && i < 32; i++) {
++		printf("WHYRED GPU: smmu SMR%u %#x S2CR %#x\n", i, rd(smmu, 0x800 + 4 * i), rd(smmu, 0xc00 + 4 * i));
++	}
++	volatile uint8_t *gr1 = smmu + smmu_psize, *cb0 = smmu + smmu_npage * smmu_psize;
++	for (uint32_t i = 0; i < smmu_ncb && i < 8; i++) {
++		volatile uint8_t *cb = cb0 + i * smmu_psize;
++		printf("WHYRED GPU: smmu CB%u CBAR %#x CBA2R %#x SCTLR %#x TTBR0 %#x:%#x FSR %#x\n", i, rd(gr1, 4 * i),
++		    rd(gr1, 0x800 + 4 * i), rd(cb, 0x0), rd(cb, 0x24), rd(cb, 0x20), rd(cb, 0x58));
++	}
++	return true;
++}
++
++static bool
++step6(void)
++{
++	/* the SMR that already takes stream 0, else a free one */
++	uint32_t slot = ~0u;
++	for (uint32_t i = 0; i < smmu_nsmr && i < 128; i++) {
++		uint32_t smr = rd(smmu, 0x800 + 4 * i);
++		uint32_t mask = (smr >> 16) & 0x7fff;
++		if ((smr >> 31) && ((smr & 0x7fff) & ~mask) == 0) {
++			slot = i;
++			break;
++		}
++		if (!(smr >> 31) && slot == ~0u) {
++			slot = i;
++		}
++	}
++	uint32_t cb = 0;                        /* Linux kgsl's user context, gpu-offset 0x48000 */
++	if (slot == ~0u) {
++		printf("WHYRED GPU: step 6: no SMR for stream 0\n");
++		return false;
++	}
++	volatile uint8_t *gr1 = smmu + smmu_psize, *cbp = smmu + smmu_npage * smmu_psize + cb * smmu_psize;
++	printf("WHYRED GPU: step 6: identity CB%u at +%#x, SMR%u\n", cb, (uint32_t)(cbp - smmu), slot);
++	gpu_ms(300);
++	wr(cbp, 0x58, 0xffffffffu);             /* FSR */
++	wr(cbp, 0x20, 0);
++	wr(cbp, 0x24, 0);
++	wr(cbp, 0x30, 0);
++	wr(cbp, 0x10, 0);
++	wr(cbp, 0x38, 0);
++	wr(cbp, 0x3c, 0);
++	wr(gr1, 0x800 + 4 * cb, 1u);            /* CBA2R: VA64 */
++	wr(gr1, 4 * cb, 0x0001f000u);           /* CBAR: S1 translate, S2 fault, memattr WB */
++	wr(cbp, 0x0, 0xe0u);                    /* SCTLR: M = 0 (stage 1 off), fault config */
++	wr(smmu, 0xc00 + 4 * slot, cb);         /* S2CR: translate to this bank */
++	wr(smmu, 0x800 + 4 * slot, 1u << 31);   /* SMR: valid, id 0, mask 0 */
++	uint32_t s2cr = rd(smmu, 0xc00 + 4 * slot);
++	printf("WHYRED GPU: CB%u SCTLR %#x CBAR %#x, SMR%u %#x S2CR %#x (type %u cb %u)\n", cb, rd(cbp, 0), rd(gr1, 4 * cb),
++	    slot, rd(smmu, 0x800 + 4 * slot), s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++	return ((s2cr >> 16) & 3) == 0;
++}
++
++static bool
++step7(void)
++{
++	say("step 7: VBIF, CP thresholds, secure TSB");
++	gwr(A5_VBIF_RR_QOS_ARB, 0x3);
++	gwr(A5_VBIF_GATE_WRREQ, 0x9);
++	gwr(A5_CP_MEQ_THRESH, 0x40);
++	gwr(A5_CP_MERCIU_SIZE, 0x400);
++	gwr(A5_CP_ROQ_THRESH_2, 0x80000060);
++	gwr(A5_CP_ROQ_THRESH_1, 0x40201b16);
++	gwr(A5_SECVID_TSB_CNTL, 0);
++	printf("WHYRED GPU: vbif qos %#x gate %#x, meq %#x merciu %#x roq %#x/%#x, status %#x\n", grd(A5_VBIF_RR_QOS_ARB),
++	    grd(A5_VBIF_GATE_WRREQ), grd(A5_CP_MEQ_THRESH), grd(A5_CP_MERCIU_SIZE), grd(A5_CP_ROQ_THRESH_1),
++	    grd(A5_CP_ROQ_THRESH_2), grd(A5_RBBM_STATUS));
++	return true;
++}
++
++/* copy a firmware file without its first word into GPU memory with 32-bit writes (device memory) */
++static bool
++load_ucode(const char *path, uint32_t off, uint32_t *ver)
++{
++	void *data = NULL;
++	size_t size = 0;
++	int err = topaz_fw_read(path, &data, &size);
++	if (err || size < 8 || (size & 3) || size - 4 > 0x10000) {
++		printf("WHYRED GPU: %s: error %d, %u bytes\n", path, err, (unsigned)size);
++		topaz_fw_free(data, size);
++		return false;
++	}
++	const uint32_t *w = (const uint32_t *)data;
++	for (size_t i = 1; i < size / 4; i++) {
++		*gmw(off + 4 * (uint32_t)(i - 1)) = w[i];
++	}
++	*ver = size > 12 ? w[2] : 0;
++	printf("WHYRED GPU: %s: %u bytes at %#x, words %#x %#x %#x\n", path, (unsigned)size, GMEM_PA + off, w[0], w[1], w[2]);
++	topaz_fw_free(data, size);
++	return true;
++}
++
++static bool
++step8(void)
++{
++	for (int i = 0; i < 600 && !topaz_root_mounted(); i++) {
++		gpu_ms(100);
++	}
++	say("step 8: microcode and ring");
++	if (!load_ucode("/usr/share/firmware/whyred/a530_pfp.fw", PFP_OFF, &pfp_ver) ||
++	    !load_ucode("/usr/share/firmware/whyred/a530_pm4.fw", PM4_OFF, &pm4_ver)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < 0x2000; i += 4) {
++		*gmw(FENCE_OFF + i) = 0;
++	}
++	for (uint32_t i = 0; i < RING_DW; i++) {
++		*gmw(RING_OFF + 4 * i) = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr(A5_CP_PFP_INSTR_LO, GMEM_PA + PFP_OFF);
++	gwr(A5_CP_PFP_INSTR_HI, 0);
++	gwr(A5_CP_PM4_INSTR_LO, GMEM_PA + PM4_OFF);
++	gwr(A5_CP_PM4_INSTR_HI, 0);
++	gwr(A5_CP_RB_RPTR_ADDR, GMEM_PA + FENCE_OFF);
++	gwr(A5_CP_RB_RPTR_ADDR_HI, 0);
++	gwr(A5_CP_RB_CNTL, (2u << 8) | 12u);   /* block size 4, ring 4096 quadwords */
++	gwr(A5_CP_RB_BASE, GMEM_PA + RING_OFF);
++	gwr(A5_CP_RB_BASE_HI, 0);
++	ring_w = 0;
++	printf("WHYRED GPU: pfp base %#x pm4 base %#x rb base %#x cntl %#x rptr %u wptr %u me_cntl %#x\n",
++	    grd(A5_CP_PFP_INSTR_LO), grd(A5_CP_PM4_INSTR_LO), grd(A5_CP_RB_BASE), grd(A5_CP_RB_CNTL), grd(A5_CP_RB_RPTR),
++	    grd(A5_CP_RB_WPTR), grd(A5_CP_ME_CNTL));
++	return true;
++}
++
++struct z_ehdr { uint8_t ident[16]; uint16_t type, machine; uint32_t version, entry, phoff, shoff, flags;
++	        uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx; };
++struct z_phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; };
++
++static bool
++step9(void)
++{
++	void *mdt = NULL, *seg = NULL;
++	size_t mdt_size = 0, seg_size = 0;
++	uint64_t st, res = 0;
++	bool ok = false;
++	say("step 9: zap shader through TrustZone (PAS 13)");
++	if (topaz_fw_read("/usr/share/firmware/whyred/a512_zap.mdt", &mdt, &mdt_size) || mdt_size < sizeof(struct z_ehdr)) {
++		printf("WHYRED GPU: a512_zap.mdt not readable\n");
++		goto out;
++	}
++	const struct z_ehdr *eh = (const struct z_ehdr *)mdt;
++	const struct z_phdr *ph = (const struct z_phdr *)((const uint8_t *)mdt + eh->phoff);
++	uint32_t hash = ~0u, load = ~0u;
++	for (uint32_t i = 0; i < eh->phnum && i < 8; i++) {
++		printf("WHYRED GPU: zap phdr %u type %u off %#x paddr %#x filesz %#x memsz %#x flags %#x\n", i, ph[i].type,
++		    ph[i].offset, ph[i].paddr, ph[i].filesz, ph[i].memsz, ph[i].flags);
++		if (((ph[i].flags >> 24) & 7) == 2) {
++			hash = i;
++		}
++		if (ph[i].type == 1 && ph[i].memsz != 0) {
++			load = i;
++		}
++	}
++	if (hash == ~0u || load == ~0u || ph[load].memsz > META_OFF - ZAP_OFF) {
++		printf("WHYRED GPU: zap: hash %u load %u, not usable\n", hash, load);
++		goto out;
++	}
++	uint32_t hsz = eh->phoff + (uint32_t)eh->phnum * sizeof(struct z_phdr);
++	if (ph[hash].offset + ph[hash].filesz > mdt_size || hsz + ph[hash].filesz > 0x10000) {
++		printf("WHYRED GPU: zap: hash segment outside the .mdt\n");
++		goto out;
++	}
++	const uint8_t *m = (const uint8_t *)mdt;
++	for (uint32_t i = 0; i < hsz; i += 4) {
++		*gmw(META_OFF + i) = *(const uint32_t *)(m + i);
++	}
++	for (uint32_t i = 0; i < ph[hash].filesz; i += 4) {
++		*gmw(META_OFF + hsz + i) = *(const uint32_t *)(m + ph[hash].offset + i);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	st = topaz_scm(0x42000201u, 2 | (2u << 6), 13, GMEM_PA + META_OFF, 0, &res);   /* PIL INIT_IMAGE, arg 2 RW */
++	printf("WHYRED GPU: PAS 13 init_image: ret %#llx res %#llx\n", st, res);
++	if (st != 0 || res != 0) {
++		goto out;
++	}
++	st = topaz_scm(0x42000202u, 3, 13, GMEM_PA + ZAP_OFF, (ph[load].memsz + 0xfff) & ~0xfffu, &res);   /* MEM_SETUP */
++	printf("WHYRED GPU: PAS 13 mem_setup %#x+%#x: ret %#llx res %#llx\n", GMEM_PA + ZAP_OFF, ph[load].memsz, st, res);
++	if (st != 0 || res != 0) {
++		goto shutdown;
++	}
++	if (topaz_fw_read("/usr/share/firmware/whyred/a512_zap.b02", &seg, &seg_size) || seg_size != ph[load].filesz) {
++		printf("WHYRED GPU: a512_zap.b02 not readable or %u bytes (want %#x)\n", (unsigned)seg_size, ph[load].filesz);
++		goto shutdown;
++	}
++	for (uint32_t i = 0; i < ph[load].memsz; i += 4) {
++		*gmw(ZAP_OFF + i) = i + 4 <= seg_size ? *(const uint32_t *)((const uint8_t *)seg + i) : 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	st = topaz_scm(0x42000205u, 1, 13, 0, 0, &res);         /* AUTH_AND_RESET */
++	printf("WHYRED GPU: PAS 13 auth_and_reset: ret %#llx res %#llx\n", st, res);
++	ok = st == 0 && res == 0;
++	if (ok) {
++		goto out;
++	}
++shutdown:
++	st = topaz_scm(0x42000206u, 1, 13, 0, 0, &res);         /* SHUTDOWN */
++	printf("WHYRED GPU: PAS 13 shutdown after failure: ret %#llx res %#llx\n", st, res);
++out:
++	topaz_fw_free(mdt, mdt_size);
++	topaz_fw_free(seg, seg_size);
++	zap_ok = ok;
++	printf("WHYRED GPU: zap %s, secvid trust cntl %#x\n", ok ? "loaded" : "NOT loaded", grd(A5_SECVID_TRUST_CNTL));
++	return true;                            /* step 10 falls back to the register without a zap */
++}
++
++static bool
++step10(void)
++{
++	say("step 10: CP start, CP_ME_INIT");
++	gwr(A5_CP_ME_CNTL, 0);
++	ring_put(pkt7(PKT_ME_INIT, 8));
++	ring_put(0x2f);
++	ring_put(0x3);
++	ring_put(0x20000000);
++	for (int i = 0; i < 5; i++) {
++		ring_put(0);
++	}
++	if (!ring_kick("CP_ME_INIT", 2000)) {
++		return false;
++	}
++	if (zap_ok) {
++		ring_put(pkt7(PKT_SET_SECURE_MODE, 1));
++		ring_put(0);
++		if (!ring_kick("CP_SET_SECURE_MODE 0", 2000)) {
++			return false;
++		}
++	} else {
++		say("step 10: no zap, writing SECVID_TRUST_CNTL 0");
++		gwr(A5_SECVID_TRUST_CNTL, 0);
++	}
++	printf("WHYRED GPU: secvid trust cntl %#x\n", grd(A5_SECVID_TRUST_CNTL));
++	return true;
++}
++
++static bool
++step11(void)
++{
++	say("step 11: job test (indirect buffer with CP_MEM_WRITE, then CACHE_FLUSH_TS)");
++	uint32_t test_pa = GMEM_PA + FENCE_OFF + 0x80, fence_pa = GMEM_PA + FENCE_OFF + 0x40;
++	*gmw(FENCE_OFF + 0x80) = 0;
++	*gmw(FENCE_OFF + 0x40) = 0;
++	uint32_t ib = 0;
++	*gmw(IB_OFF + 4 * ib++) = pkt7(PKT_MEM_WRITE, 3);
++	*gmw(IB_OFF + 4 * ib++) = test_pa;
++	*gmw(IB_OFF + 4 * ib++) = 0;
++	*gmw(IB_OFF + 4 * ib++) = 0xc0ffee09u;
++	ring_put(pkt7(PKT_IB_PFE, 3));
++	ring_put(GMEM_PA + IB_OFF);
++	ring_put(0);
++	ring_put(ib);
++	ring_put(pkt7(PKT_WAIT_FOR_IDLE, 0));
++	ring_put(pkt7(PKT_EVENT_WRITE, 4));
++	ring_put(EV_CACHE_FLUSH_TS);
++	ring_put(fence_pa);
++	ring_put(0);
++	ring_put(1);
++	bool idle = ring_kick("job", 2000);
++	uint32_t t = *gmw(FENCE_OFF + 0x80), f = *gmw(FENCE_OFF + 0x40), sh = *gmw(FENCE_OFF);
++	printf("WHYRED GPU: job: test word %#x (want 0xc0ffee09), fence %u (want 1), rptr shadow %u\n", t, f, sh);
++	if (!idle || t != 0xc0ffee09u || f != 1) {
++		return false;
++	}
++	/* time 100 more jobs */
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t n = 2; n <= 101; n++) {
++		ring_put(pkt7(PKT_EVENT_WRITE, 4));
++		ring_put(EV_CACHE_FLUSH_TS);
++		ring_put(fence_pa);
++		ring_put(0);
++		ring_put(n);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		gwr(A5_CP_RB_WPTR, ring_w % RING_DW);
++		for (int i = 0; i < 100000 && *gmw(FENCE_OFF + 0x40) != n; i++) {
++			delay(1);
++		}
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("WHYRED GPU: 100 fences: last %u, %llu us total\n", *gmw(FENCE_OFF + 0x40), ns / 1000);
++	return *gmw(FENCE_OFF + 0x40) == 101;
++}
++
+ static void
+ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+@@ -306,8 +729,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
+ 	gpu_ms((unsigned)wait * 1000u);
+ 	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
+-	bool (*steps[])(void) = { step1, step2, step3, step4 };
+-	int n = gpu_steps > 4 ? 4 : gpu_steps;
++	bool (*steps[])(void) = { step1, step2, step3, step4, step5, step6, step7, step8, step9, step10, step11 };
++	int n = gpu_steps > 11 ? 11 : gpu_steps;
+ 	for (int i = 0; i < n; i++) {
+ 		if (!steps[i]()) {
+ 			printf("WHYRED GPU: step %d FAILED, stopping\n", i + 1);
+@@ -329,7 +752,9 @@ whyred_gpu_init(void)
+ 	cc = (volatile uint8_t *)ml_io_map(GPUCC_PA, 0x2000);
+ 	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, 0x40000);
+ 	qf = (volatile uint8_t *)ml_io_map(QFPROM_PA, 0x1000);
+-	if (!gcc || !gccp || !cc || !gpu || !qf) {
++	smmu = (volatile uint8_t *)ml_io_map(SMMU_PA, 0x10000);
++	gm = (volatile uint8_t *)ml_io_map(GMEM_PA, GMEM_SIZE);
++	if (!gcc || !gccp || !cc || !gpu || !qf || !smmu || !gm) {
+ 		printf("WHYRED GPU: MMIO mapping failed\n");
+ 		return;
+ 	}
