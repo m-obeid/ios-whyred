@@ -905,6 +905,20 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   com.apple.mobileslideshow.plist (original /var/root/mobileslideshow.plist.orig). Write the plist and restart
   cfprefsd in one step; never SIGSTOP cfprefsd (every preference read then hangs, ssh included).
 
+## GPU stage 1, steps 1-4 (patch 1030, 2026-11-27)
+
+- bsd/dev/whyred_gpu.c, boot-arg whyredgpu=N (steps 1..N, started from sweet_thermal_init, 20 s delay). Plan:
+  whyred/research/gpu-stage1.md. CI 45910244543, image whyred/out/xnu-ios-1030g4.img (default args + whyredgpu=4).
+- As ABL leaves it: gcc gpu_cfg_ahb 0x20008001 (on), gpu_bimc_gfx 0x1, bimc_gfx 0x80000000 (off), gpu_gpll0 0x4.
+  gpucc: PLL0 off (l 0x3d), PLL1 off (l 0x21), gfx3d RCG off (cbcr 0x80008620), rbbmtimer off, cxo on, rbcpr off,
+  CX and GX GDSC collapsed (0x222001), GX domain clamp 0x1. Speed bin 0x5a (qfprom 0x7841a0 = 0xb580100): DT caps
+  this bin at 430 MHz.
+- Steps 2-4 all passed on the first boot: RPM rwcx/rwmx 384 acked, bimc_gfx on, CX GDSC 0xa0222000 (hwctrl
+  0x80001fe0), gfx3d/rbbmtimer RCG at XO, GX GDSC 0xa0222000 (domain 0x3c0000), gfx3d cbcr 0x20008621.
+- First GPU reads: VBIF version 0x20110000, RBBM status 0x1, status3 0, int0 0, AHB error 0, CP_HW_FAULT 0,
+  SECVID_TRUST_CNTL 0x1 (secure until the zap shader), always-on counter running (211718 ticks in a 10 ms sleep).
+  iOS boots normally with it.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
