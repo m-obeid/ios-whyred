@@ -138,7 +138,7 @@ index 0000000..3afcdb4
 +}
 +
 +static void
-+msleep(unsigned ms)
++gpu_ms(unsigned ms)
 +{
 +	delay_for_interval(ms, NSEC_PER_MSEC);
 +}
@@ -148,7 +148,7 @@ index 0000000..3afcdb4
 +say(const char *what)
 +{
 +	printf("WHYRED GPU: %s\n", what);
-+	msleep(300);
++	gpu_ms(300);
 +}
 +
 +/* enable a branch, wait up to 1 ms for "clock off" to clear */
@@ -325,7 +325,7 @@ index 0000000..3afcdb4
 +	    grd(A5_RBBM_CLOCK_CNTL), grd(A5_CP_HW_FAULT));
 +	printf("WHYRED GPU: secvid trust cntl %#x\n", grd(A5_SECVID_TRUST_CNTL));
 +	uint32_t a = grd(A5_RBBM_ALWAYSON_LO);
-+	msleep(10);
++	gpu_ms(10);
 +	uint32_t b = grd(A5_RBBM_ALWAYSON_LO);
 +	printf("WHYRED GPU: always-on counter %#x -> %#x in 10 ms (%d ticks, 192000 expected at 19.2 MHz)\n",
 +	    a, b, (int)(b - a));
@@ -337,7 +337,7 @@ index 0000000..3afcdb4
 +{
 +	int wait = 20;
 +	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
-+	msleep((unsigned)wait * 1000u);
++	gpu_ms((unsigned)wait * 1000u);
 +	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
 +	bool (*steps[])(void) = { step1, step2, step3, step4 };
 +	int n = gpu_steps > 4 ? 4 : gpu_steps;
