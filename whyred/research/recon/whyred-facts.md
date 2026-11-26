@@ -913,7 +913,16 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - pm660l_l7 (RPM ldob 7, 3.088 V) is the mic bias supply and also vdda33 of both QUSB2 PHYs. Voting it off drops
   USB for the rest of the boot (1021, 1022). 1023 leaves it on.
 - 1022 result: every ADSP command returns 0 and data flows in real time (first data after 380 ms). Digital and
-  analog register readback matches the Linux trace. The samples are all zero. Cause not known yet. The next step
-  is the LPI pin readback (1023 logs it) and live pokes with sysctl kern.whyred_codec.
+  analog register readback matches the Linux trace. The samples are all zero.
+- 1024: buffers filled with 0x5a5a before each READ come back overwritten with zeros (the ADSP writes, no SMMU
+  fault). With the DEC1 HPF bypassed (0x28c = 0x08) the output is a flat 32678 that no pad, mux or PDM change
+  moves: the analog codec sent nothing.
+- Cause: PMIC_ANALOG_MASTER_BIAS_CTL (0xf146) read 0 on iOS and 0x30 on Linux. Linux writes it at MBHC init,
+  before any trace. Setting it live gave noise (rms 4.5) and a laptop 1 kHz tone at amplitude 109. 1025 writes it
+  at mic start.
+- whyred/tools/cdcdump: read-only Linux module (build against src/kernel-lineage-21 with build/kernel-out in the
+  whyred-kernel-build image, cp -a the out dir) that dumps the digital codec, LPI pads and analog codec (regmap
+  of the anlg-cdc platform device) while arecord runs. Other analog differences left: f147, f150-f159 (MBHC),
+  f058 RX_CTL1.
 - ADSP COPP ids come back as 0xb08f0009: mask with 0xffff.
 - 1023 root watchdog: no rootvnode 120 s after boot -> PSCI reset (boots Linux).
