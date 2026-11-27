@@ -1,0 +1,502 @@
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -23,6 +23,5 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+-iokit/Kernel/arm/TopazAdreno.cpp                                 optional iokitcpp
+-iokit/Kernel/arm/TopazAdrenoFw.cpp                               optional iokitcpp
++iokit/Kernel/arm/WhyredAdreno.cpp                                optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index 5cc7847..e73489f 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -24,6 +24,10 @@
+  *  12  gfx3d at 300 MHz: GPLL0 (600 MHz, gcc_gpu_gpll0 branch) divided by 2 in the RCG, as topaz;
+  *      covered by the CX level 384 vote of step 2. Then the 100 fences again, timed.
+  *
++ * After step 12 the GPU is kept for RedwoodGPU.cpp (msm DRM for Mesa) through WhyredAdreno.cpp: boot-arg
++ * gpu=1 (all the display changes topaz's gpu=1 makes) or whyredgpusvc=1 (only the service, for tests).
++ * Either one makes whyredgpu default to 12.
++ *
+  * GPU memory is the free RAM below the XNU base (0xa1400000, 4 MiB here), mapped uncached, so CPU
+  * writes and GPU writes need no cache maintenance.
+  *
+@@ -161,6 +165,9 @@ void topaz_fw_free(void *data, size_t size);
+ int topaz_root_mounted(void);
+ uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
+ static int gpu_steps;
++static bool gpu_up, gpu_svc;
++static uint32_t gpu_seq;
++void RedwoodGPUStart(void);    /* RedwoodGPU.cpp */
+ 
+ static inline uint32_t
+ rd(volatile uint8_t *b, uint32_t o)
+@@ -819,12 +826,131 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ 		printf("WHYRED GPU: step %d done\n", i + 1);
+ 	}
+ 	printf("WHYRED GPU: all %d steps done\n", n);
++	if (n == 12 && gpu_svc) {
++		gpu_seq = *gmw(FENCE_OFF + 0x40);
++		gpu_up = true;
++		RedwoodGPUStart();
++		printf("WHYRED GPU: RedwoodGPU published (fence %u)\n", gpu_seq);
++	}
++}
++
++/*
++ * The interface WhyredAdreno.cpp gives RedwoodGPU.cpp. The caller serialises submissions (its own lock).
++ */
++bool whyred_gpu_up(void);
++uint32_t whyred_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++uint32_t whyred_gpu_fence(void);
++uint32_t whyred_gpu_last(void);
++uint64_t whyred_gpu_timestamp(void);
++void whyred_gpu_report(const char *why);
++void whyred_gpu_stop(void);
++
++bool
++whyred_gpu_up(void)
++{
++	return gpu_up;
++}
++
++static uint32_t
++ring_space(void)
++{
++	uint32_t used = (ring_w - grd(A5_CP_RB_RPTR)) % RING_DW;
++	return RING_DW - 1 - used;
++}
++
++/* one CP_INDIRECT_BUFFER_PFE per command buffer, then CACHE_FLUSH_TS of the fence. 0: ring full or not up. */
++uint32_t
++whyred_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	uint32_t need = 4 * count + 5;
++	if (!gpu_up || need >= RING_DW / 2) {
++		return 0;
++	}
++	for (int spin = 0; ring_space() < need && spin < 20000; spin++) {
++		delay(100);
++	}
++	if (ring_space() < need) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		ring_put(pkt7(PKT_IB_PFE, 3));
++		ring_put((uint32_t)addresses[i]);
++		ring_put((uint32_t)(addresses[i] >> 32));
++		ring_put(words[i]);
++	}
++	if (++gpu_seq == 0) {
++		gpu_seq = 1;
++	}
++	ring_put(pkt7(PKT_EVENT_WRITE, 4));
++	ring_put(EV_CACHE_FLUSH_TS);
++	ring_put(GMEM_PA + FENCE_OFF + 0x40);
++	ring_put(0);
++	ring_put(gpu_seq);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr(A5_CP_RB_WPTR, ring_w % RING_DW);
++	return gpu_seq;
++}
++
++uint32_t
++whyred_gpu_fence(void)
++{
++	return gm != NULL ? *gmw(FENCE_OFF + 0x40) : 0;
++}
++
++uint32_t
++whyred_gpu_last(void)
++{
++	return gpu_seq;
++}
++
++uint64_t
++whyred_gpu_timestamp(void)
++{
++	if (!gpu_up) {
++		return 0;
++	}
++	uint32_t hi, lo;
++	do {
++		hi = grd(A5_RBBM_ALWAYSON_LO + 1);
++		lo = grd(A5_RBBM_ALWAYSON_LO);
++	} while (hi != grd(A5_RBBM_ALWAYSON_LO + 1));
++	return (uint64_t)hi << 32 | lo;
++}
++
++void
++whyred_gpu_report(const char *why)
++{
++	printf("WHYRED GPU: %s: fence %u done %u rptr %u wptr %u status %#x status3 %#x int0 %#x cp_int %#x hw_fault %#x ahb_err %#x\n",
++	    why, gpu_seq, whyred_gpu_fence(), grd(A5_CP_RB_RPTR), ring_w % RING_DW, grd(A5_RBBM_STATUS),
++	    grd(A5_RBBM_STATUS3), grd(A5_RBBM_INT_0_STATUS), grd(A5_CP_INT_STATUS), grd(A5_CP_HW_FAULT),
++	    grd(A5_RBBM_AHB_ERROR));
++	if (smmu != NULL) {
++		volatile uint8_t *cb = smmu + smmu_npage * smmu_psize;
++		printf("WHYRED GPU: smmu CB0 FSR %#x FAR %#x:%#x FSYNR0 %#x\n", rd(cb, 0x58), rd(cb, 0x64), rd(cb, 0x60),
++		    rd(cb, 0x68));
++	}
++}
++
++void
++whyred_gpu_stop(void)
++{
++	if (gpu_up) {
++		gwr(A5_CP_ME_CNTL, 0x303);      /* halt ME and PFP */
++	}
++	gpu_up = false;
+ }
+ 
+ void
+ whyred_gpu_init(void)
+ {
+-	if (!PE_parse_boot_argn("whyredgpu", &gpu_steps, sizeof(gpu_steps)) || gpu_steps <= 0) {
++	uint32_t g = 0, svc = 0;
++	(void)PE_parse_boot_argn("gpu", &g, sizeof(g));
++	(void)PE_parse_boot_argn("whyredgpusvc", &svc, sizeof(svc));
++	gpu_svc = g != 0 || svc != 0;
++	if (!PE_parse_boot_argn("whyredgpu", &gpu_steps, sizeof(gpu_steps))) {
++		gpu_steps = gpu_svc ? 12 : 0;
++	}
++	if (gpu_steps <= 0) {
+ 		return;
+ 	}
+ 	gcc = (volatile uint8_t *)ml_io_map(GCC_GPU_PA, 0x1000);
+diff --git a/iokit/Kernel/arm/WhyredAdreno.cpp b/iokit/Kernel/arm/WhyredAdreno.cpp
+new file mode 100644
+index 0000000..25b64fc
+--- /dev/null
++++ b/iokit/Kernel/arm/WhyredAdreno.cpp
+@@ -0,0 +1,327 @@
++/*
++ * whyred: the Adreno 509 behind RedwoodGPU.cpp (the msm DRM user client Mesa talks to). Takes the place of topaz's
++ * TopazAdreno.cpp (Adreno 610) with the same exports. The hardware is bsd/dev/whyred_gpu.c (stage 1 steps 1-12,
++ * whyred/research/gpu-stage1.md); this file is the GPU memory pool and the glue.
++ *
++ * The SMMU passes addresses through (identity context bank, step 6): GPU address = physical address, so every
++ * buffer is contiguous. They come from a pool of RAM the kernel does not manage, 0xa2000000 + 256 MiB, between the
++ * GPU's own memory (0xa1400000) and the XNU base (0xb2000000, whyred/tools/mkadt_whyred.py), mapped write-combined.
++ * Boot-arg gpu=1 or whyredgpusvc=1 starts it (whyred_gpu.c).
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: clean + invalidate */
++bool whyred_gpu_up(void);                                       /* bsd/dev/whyred_gpu.c */
++uint32_t whyred_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++uint32_t whyred_gpu_fence(void);
++uint32_t whyred_gpu_last(void);
++uint64_t whyred_gpu_timestamp(void);
++void whyred_gpu_report(const char *why);
++void whyred_gpu_stop(void);
++
++void topaz_adreno_init(void);
++bool redwood_gpu_ready(void);
++bool redwood_gpu_identity(void);
++bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t redwood_gpu_address(uint64_t size);
++void redwood_gpu_address_free(uint64_t address, uint64_t size);
++bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void redwood_gpu_mapped(void);
++void redwood_gpu_unmap(uint64_t address, uint64_t size);
++void redwood_gpu_to_memory(void *start, uint64_t size);
++uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool redwood_gpu_done(uint32_t fence);
++uint32_t redwood_gpu_last(void);
++void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void redwood_gpu_report(const char *why);
++void redwood_gpu_stop(void);
++void redwood_tl(const char *format, ...) __printflike(1, 2);
++IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++bool topaz_gpu_midmem(void);
++uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
++uint32_t gpu_log;
++}
++
++#define GPU_POOL_BASE       0xa2000000ull
++#define GPU_POOL_SIZE       0x10000000ull       /* 256 MiB */
++#define GPU_POOL_UNIT       0x10000ull          /* 64 KiB */
++#define GPU_POOL_CHUNK      0x4000000ull        /* 64 MiB, each mapped on first use */
++#define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
++
++#define A509_GMEM_SIZE      0x44000             /* 256 + 16 KiB */
++#define A509_GMEM_BASE      0x100000
++#define A509_MHZ            300                 /* GPLL0 / 2, step 12 */
++
++static IOLock *pool_lock, *submit_lock;
++static uint8_t *chunk_va[GPU_POOL_CHUNKS];
++static bool pool_ready;
++static struct range { uint64_t start, size; } pool_free[1024];
++static unsigned pool_free_count;
++static uint64_t pool_used, pool_peak;
++
++static void
++range_free(uint64_t address, uint64_t size)
++{
++	struct range *f = pool_free;
++	unsigned at;
++
++	for (at = 0; at < pool_free_count && f[at].start < address; at++) {
++	}
++	if (at > 0 && f[at - 1].start + f[at - 1].size == address) {
++		f[at - 1].size += size;
++		if (at < pool_free_count && address + size == f[at].start) {
++			f[at - 1].size += f[at].size;
++			memmove(&f[at], &f[at + 1], (--pool_free_count - at) * sizeof(f[0]));
++		}
++	} else if (at < pool_free_count && address + size == f[at].start) {
++		f[at].start = address;
++		f[at].size += size;
++	} else if (pool_free_count < sizeof(pool_free) / sizeof(pool_free[0])) {
++		memmove(&f[at + 1], &f[at], (pool_free_count - at) * sizeof(f[0]));
++		pool_free_count++;
++		f[at].start = address;
++		f[at].size = size;
++	}
++}
++
++static uint64_t
++range_alloc(uint64_t size)
++{
++	struct range *f = pool_free;
++
++	for (unsigned i = 0; i < pool_free_count; i++) {
++		if (f[i].size >= size) {
++			uint64_t address = f[i].start;
++			f[i].start += size;
++			f[i].size -= size;
++			if (f[i].size == 0) {
++				memmove(&f[i], &f[i + 1], (--pool_free_count - i) * sizeof(f[0]));
++			}
++			return address;
++		}
++	}
++	return 0;
++}
++
++/* The cache mode goes into the descriptor: user mappings of RAM the kernel does not manage are Device memory otherwise */
++IOMemoryDescriptor *
++topaz_gpu_pool_md(uint64_t pa, uint64_t size)
++{
++	return IOMemoryDescriptor::withAddressRange(pa, size,
++	           kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
++}
++
++bool
++topaz_gpu_midmem(void)
++{
++	return false;
++}
++
++uint64_t
++topaz_gpu_pool_alloc(uint64_t size, void **va)
++{
++	uint64_t pa;
++
++	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
++	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT || pool_lock == NULL) {
++		return 0;
++	}
++	IOLockLock(pool_lock);
++	if (!pool_ready) {
++		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
++		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
++			range_free(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
++		}
++		pool_ready = true;
++	}
++	pa = range_alloc(size);
++	if (pa == 0) {
++		IOLockUnlock(pool_lock);
++		IOLog("WhyredAdreno: pool full: %llu bytes asked, %llu MiB in use\n", size, pool_used >> 20);
++		return 0;
++	}
++	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
++	if (chunk_va[c] == NULL) {
++		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
++		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++		if (map != NULL) {
++			chunk_va[c] = (uint8_t *)map->getVirtualAddress();     /* kept for good, with md */
++		}
++		if (chunk_va[c] == NULL) {
++			OSSafeReleaseNULL(map);
++			OSSafeReleaseNULL(md);
++			range_free(pa, size);
++			IOLockUnlock(pool_lock);
++			IOLog("WhyredAdreno: pool chunk %u cannot be mapped\n", c);
++			return 0;
++		}
++		IOLog("WhyredAdreno: pool chunk %u mapped at %p\n", c, chunk_va[c]);
++	}
++	pool_used += size;
++	if (pool_used > pool_peak) {
++		pool_peak = pool_used;
++		if ((pool_peak >> 24) != ((pool_peak - size) >> 24)) {
++			IOLog("WhyredAdreno: pool peak %llu MiB of %llu\n", pool_peak >> 20, GPU_POOL_SIZE >> 20);
++		}
++	}
++	IOLockUnlock(pool_lock);
++	if (va != NULL) {
++		*va = chunk_va[c] + (pa - GPU_POOL_BASE - c * GPU_POOL_CHUNK);
++	}
++	return pa;
++}
++
++void
++topaz_gpu_pool_free(uint64_t pa, uint64_t size)
++{
++	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
++	if (pool_lock == NULL || pa < GPU_POOL_BASE || pa + size > GPU_POOL_BASE + GPU_POOL_SIZE) {
++		return;
++	}
++	IOLockLock(pool_lock);
++	range_free(pa, size);
++	pool_used -= size;
++	IOLockUnlock(pool_lock);
++}
++
++/* whyred_gpu.c starts the hardware itself (sweet_thermal_init); here only the locks */
++void
++topaz_adreno_init(void)
++{
++	if (pool_lock == NULL) {
++		pool_lock = IOLockAlloc();
++		submit_lock = IOLockAlloc();
++	}
++}
++
++bool
++redwood_gpu_ready(void)
++{
++	return whyred_gpu_up();
++}
++
++bool
++redwood_gpu_identity(void)
++{
++	return true;
++}
++
++bool
++redwood_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01: *value = 509; return true;                           /* GPU_ID */
++	case 0x02: *value = A509_GMEM_SIZE; return true;                /* GMEM_SIZE */
++	case 0x03: *value = 0x05000900; return true;                    /* CHIP_ID */
++	case 0x04: *value = A509_MHZ * 1000000ull; return true;         /* MAX_FREQ */
++	case 0x05: *value = whyred_gpu_timestamp(); return true;        /* TIMESTAMP: RBBM always-on counter */
++	case 0x06: *value = A509_GMEM_BASE; return true;                /* GMEM_BASE */
++	case 0x07: *value = 1; return true;                             /* PRIORITIES */
++	case 0x08: case 0x09: case 0x0a: case 0x11:                     /* PP_PGTABLE FAULTS SUSPENDS RAYTRACING */
++		*value = 0;
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* identity: no GPU address space of its own; freeing an address gives the pool memory back */
++uint64_t
++redwood_gpu_address(uint64_t size)
++{
++	(void)size;
++	return 0;
++}
++
++void
++redwood_gpu_address_free(uint64_t address, uint64_t size)
++{
++	topaz_gpu_pool_free(address, size);
++}
++
++bool
++redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	(void)address;
++	(void)phys;
++	(void)read_only;
++	return true;
++}
++
++void
++redwood_gpu_mapped(void)
++{
++}
++
++void
++redwood_gpu_unmap(uint64_t address, uint64_t size)
++{
++	(void)address;
++	(void)size;
++}
++
++void
++redwood_gpu_to_memory(void *start, uint64_t size)
++{
++	if (start != NULL && size != 0) {
++		sweet_dcache_flush((vm_offset_t)start, (unsigned)size);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++uint32_t
++redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	if (submit_lock == NULL) {
++		return 0;
++	}
++	IOLockLock(submit_lock);
++	uint32_t fence = whyred_gpu_submit(addresses, words, count);
++	IOLockUnlock(submit_lock);
++	return fence;
++}
++
++bool
++redwood_gpu_done(uint32_t fence)
++{
++	return (int32_t)(whyred_gpu_fence() - fence) >= 0;
++}
++
++uint32_t
++redwood_gpu_last(void)
++{
++	return whyred_gpu_last();
++}
++
++void
++redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	*microseconds = 0;
++	*submissions = 0;
++	bzero(by, 7 * sizeof(uint32_t));
++}
++
++void
++redwood_gpu_report(const char *why)
++{
++	whyred_gpu_report(why);
++	IOLog("WhyredAdreno: pool %llu MiB in use, peak %llu MiB\n", pool_used >> 20, pool_peak >> 20);
++}
++
++void
++redwood_gpu_stop(void)
++{
++	whyred_gpu_stop();
++}
++
++void
++redwood_tl(const char *format, ...)
++{
++	(void)format;
++}

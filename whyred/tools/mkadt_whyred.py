@@ -17,8 +17,15 @@ import mkadt  # noqa: E402
 
 # Kernel RAM: every fixed carve-out sits below 0xa0400000 and the two DDR banks are adjacent,
 # so 0xa0400000-0x17e4bffff is free. mkpayload needs a 32 MB aligned base.
-mkadt.HIGH_PHYS_BASE = 0xa2000000
-mkadt.HIGH_MEM_SIZE = 0xdc000000	# up to 0x17e000000
+# Below the base, RAM the kernel does not manage: 0xa0400000 + 16 MiB modem pool (TopazModem.cpp),
+# 0xa1400000 + 4 MiB GPU ring and firmware (whyred_gpu.c), 0xa2000000 + 256 MiB GPU pool
+# (WhyredAdreno.cpp, patch 1033). WHYRED_GPU_POOL=0 gives the 256 MiB back (base 0xa2000000).
+if os.environ.get('WHYRED_GPU_POOL', '1') != '0':
+    mkadt.HIGH_PHYS_BASE = 0xb2000000
+    mkadt.HIGH_MEM_SIZE = 0xcc000000	# up to 0x17e000000
+else:
+    mkadt.HIGH_PHYS_BASE = 0xa2000000
+    mkadt.HIGH_MEM_SIZE = 0xdc000000
 
 # interrupt-controller@17a00000, redistributors 0x17b00000 (stride 0x20000)
 mkadt.GICD, mkadt.GICD_SIZE = 0x17a00000, 0x10000
