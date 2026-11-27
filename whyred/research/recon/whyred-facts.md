@@ -1053,7 +1053,15 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   cached ones). Pool addresses sit below 4 GiB, mapped 1:1, so the existing address_free and unmap already
   route them to the pool. Log: "translation works", "buffers from the GPU pool", 0 KB cleaned a submission.
   GL work about 7.5 ms a frame, same as 1040 (1041vm: 17.8 ms). No GPU fault seen in the first minutes.
-- Next: share A8, LA and RGBA (non-BGRA) surfaces through the window: kernel check in surfaceBuffer
+- 1042vm long run (2026-11-27, about 35 min): backboardd died after 13 min with signal 11 in eagl tex_luminance
+  (read past an IOSurface's end, from surface_to_texture). Fixed in a9f347b (userland CI 46028313233, not yet
+  installed on the phone). The user saw growing artifacts, then a freeze. Kernel wired pages climb steadily
+  (about 20k at start, 120k+ after 20 min) and drop when backboardd exits. Wired memory also climbs on CPU-only
+  boots (b1031, b1033), so the leak is older than the GPU path. At 120k wired, SpringBoard and Safari IOSurface
+  creates failed with 0xe00002bd (no memory, 37 times). At 16:50 the WLAN firmware restarted, then the log
+  stopped: hard hang, gone from USB, screen black (no panic reset).
+- Next: find what backboardd holds wired (IOSurface lookups or mappings not dropped?). Then share A8, LA and
+  RGBA (non-BGRA) surfaces through the window: kernel check in surfaceBuffer
   (bytesPerElement != 4), eagl surface_shared ("not BGRA"), gl_osmesa import format.
 
 ## Not yet known
