@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
-index a2118e3..6a8efa8 100644
+index a2118e3..286fe24 100644
 --- a/bsd/dev/whyred_gpu.c
 +++ b/bsd/dev/whyred_gpu.c
 @@ -12,6 +12,18 @@
@@ -29,7 +29,7 @@ index a2118e3..6a8efa8 100644
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
  #include <stdbool.h>
-@@ -77,11 +90,61 @@ void whyred_gpu_init(void);
+@@ -77,11 +90,74 @@ void whyred_gpu_init(void);
  #define A5_VBIF_VERSION      0x3000
  #define A5_SECVID_TRUST_CNTL 0xf400
  
@@ -53,6 +53,19 @@ index a2118e3..6a8efa8 100644
 +#define A5_VBIF_RR_QOS_ARB   0x3049
 +#define A5_VBIF_GATE_WRREQ   0x302a
 +#define A5_SECVID_TSB_CNTL   0xf803
++#define A5_RBBM_AHB_CNTL0    0x093
++#define A5_RBBM_HANG_INT_CNTL 0x02f
++#define A5_RBBM_PERF_BUSY_MASKED 0x46f
++#define A5_RBBM_PERFCTR_CNTL 0x464
++#define A5_UCHE_WT_BASE_LO   0xe87
++#define A5_UCHE_WT_BASE_HI   0xe88
++#define A5_UCHE_TRAP_BASE_LO 0xe89
++#define A5_UCHE_TRAP_BASE_HI 0xe8a
++#define A5_UCHE_GMEM_MIN_LO  0xe8b
++#define A5_UCHE_GMEM_MIN_HI  0xe8c
++#define A5_UCHE_GMEM_MAX_LO  0xe8d
++#define A5_UCHE_GMEM_MAX_HI  0xe8e
++#define A5_UCHE_CACHE_WAYS   0xe96
 +
 +#define PKT_ME_INIT          0x48
 +#define PKT_SET_SECURE_MODE  0x66
@@ -92,7 +105,7 @@ index a2118e3..6a8efa8 100644
  static int gpu_steps;
  
  static inline uint32_t
-@@ -299,6 +362,376 @@ step4(void)
+@@ -299,6 +375,397 @@ step4(void)
  	return true;
  }
  
@@ -144,6 +157,11 @@ index a2118e3..6a8efa8 100644
 +		st = grd(A5_RBBM_STATUS);
 +		if (rptr == ring_w % RING_DW && (st & ~1u) == 0) {
 +			printf("WHYRED GPU: %s: idle, rptr %u, rbbm status %#x\n", what, rptr, st);
++			return true;
++		}
++		/* RBBM_STATUS read 0x800001c1 from step 7 on, before the CP ran: a consumed ring counts */
++		if (rptr == ring_w % RING_DW && i >= 1000) {
++			printf("WHYRED GPU: %s: ring consumed (rptr %u) but rbbm status %#x after 100 ms, going on\n", what, rptr, st);
 +			return true;
 +		}
 +		delay(100);
@@ -236,9 +254,25 @@ index a2118e3..6a8efa8 100644
 +static bool
 +step7(void)
 +{
-+	say("step 7: VBIF, CP thresholds, secure TSB");
++	say("step 7: VBIF, RBBM, UCHE, CP thresholds, secure TSB (Linux a5xx_start order)");
++	printf("WHYRED GPU: rbbm status before %#x\n", grd(A5_RBBM_STATUS));
 +	gwr(A5_VBIF_RR_QOS_ARB, 0x3);
 +	gwr(A5_VBIF_GATE_WRREQ, 0x9);
++	printf("WHYRED GPU: rbbm status after VBIF %#x\n", grd(A5_RBBM_STATUS));
++	gwr(A5_RBBM_PERF_BUSY_MASKED, 0xffffffffu);
++	gwr(A5_RBBM_AHB_CNTL0, 0x1);
++	gwr(A5_RBBM_HANG_INT_CNTL, (1u << 30) | 0x3ffff);
++	gwr(A5_RBBM_PERFCTR_CNTL, 0x1);
++	gwr(A5_UCHE_CACHE_WAYS, 0x2);
++	gwr(A5_UCHE_TRAP_BASE_LO, 0xffff0000u);
++	gwr(A5_UCHE_TRAP_BASE_HI, 0x0001ffffu);
++	gwr(A5_UCHE_WT_BASE_LO, 0xffff0000u);
++	gwr(A5_UCHE_WT_BASE_HI, 0x0001ffffu);
++	gwr(A5_UCHE_GMEM_MIN_LO, 0x100000);    /* GMEM at 1 MiB, 256 + 16 KiB */
++	gwr(A5_UCHE_GMEM_MIN_HI, 0);
++	gwr(A5_UCHE_GMEM_MAX_LO, 0x100000 + 0x44000 - 1);
++	gwr(A5_UCHE_GMEM_MAX_HI, 0);
++	printf("WHYRED GPU: rbbm status after RBBM/UCHE %#x\n", grd(A5_RBBM_STATUS));
 +	gwr(A5_CP_MEQ_THRESH, 0x40);
 +	gwr(A5_CP_MERCIU_SIZE, 0x400);
 +	gwr(A5_CP_ROQ_THRESH_2, 0x80000060);
@@ -469,7 +503,7 @@ index a2118e3..6a8efa8 100644
  static void
  gpu_thread(__unused void *arg, __unused wait_result_t wr_)
  {
-@@ -306,8 +739,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -306,8 +773,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
  	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
  	gpu_ms((unsigned)wait * 1000u);
  	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
@@ -480,7 +514,7 @@ index a2118e3..6a8efa8 100644
  	for (int i = 0; i < n; i++) {
  		if (!steps[i]()) {
  			printf("WHYRED GPU: step %d FAILED, stopping\n", i + 1);
-@@ -329,7 +762,9 @@ whyred_gpu_init(void)
+@@ -329,7 +796,9 @@ whyred_gpu_init(void)
  	cc = (volatile uint8_t *)ml_io_map(GPUCC_PA, 0x2000);
  	gpu = (volatile uint8_t *)ml_io_map(GPU_PA, 0x40000);
  	qf = (volatile uint8_t *)ml_io_map(QFPROM_PA, 0x1000);
