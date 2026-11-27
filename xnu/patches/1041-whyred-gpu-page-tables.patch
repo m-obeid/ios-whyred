@@ -1,0 +1,400 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index 01bea10..8a923d9 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -837,6 +837,7 @@ step12(void)
+  * mode, the write went to 0x71714000 and the phone reset).
+  */
+ uint64_t whyred_high_page(volatile uint32_t **va);     /* WhyredAdreno.cpp */
++void whyred_gpu_vm_start(void);
+ void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: clean + invalidate */
+ void whyred_high_page_free(void);
+ 
+@@ -900,6 +901,11 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	if (n == 12 && gpu_64) {
+ 		high_test();
+ 	}
++	uint32_t vm = 0;
++	(void)PE_parse_boot_argn("whyredgpuvm", &vm, sizeof(vm));
++	if (n == 12 && gpu_64 && vm != 0) {
++		whyred_gpu_vm_start();          /* WhyredAdreno.cpp: page tables, then identity off if they work */
++	}
+ 	if (n == 12 && gpu_svc) {
+ 		gpu_seq = *gmw(FENCE_OFF + 0x40);
+ 		gpu_up = true;
+@@ -932,6 +938,113 @@ whyred_gpu_reach(void)
+ 	return gpu_reach;
+ }
+ 
++/*
++ * GPU page tables (patch 1041, boot-arg whyredgpuvm=1): context bank 0 translates with a table WhyredAdreno.cpp
++ * builds. Stage 1, AArch64 descriptors (CBA2R VA64 from step 6), 36-bit addresses, 4 KiB granule, table walks
++ * non-cacheable (the tables are write-combined pool memory). Faults terminate the access (SCTLR CFCFG 0).
++ */
++#define CB_SCTLR        0x0
++#define CB_TCR2         0x10
++#define CB_TTBR0        0x20
++#define CB_TCR          0x30
++#define CB_CONTEXTIDR   0x34
++#define CB_MAIR0        0x38
++#define CB_MAIR1        0x3c
++#define CB_FSR          0x58
++#define CB_TLBIALL      0x618
++#define CB_TLBSYNC      0x7f0
++#define CB_TLBSTATUS    0x7f4
++
++bool whyred_gpu_vm_enable(uint64_t ttbr);
++void whyred_gpu_vm_disable(void);
++void whyred_gpu_tlb_flush(void);
++bool whyred_gpu_vm_write_test(uint64_t address, volatile uint32_t *cpu, uint32_t word);
++
++static volatile uint8_t *
++cb0p(void)
++{
++	return smmu + smmu_npage * smmu_psize;
++}
++
++void
++whyred_gpu_tlb_flush(void)
++{
++	volatile uint8_t *cb = cb0p();
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(cb, CB_TLBIALL, 0);
++	wr(cb, CB_TLBSYNC, 0);
++	for (int i = 0; i < 10000 && (rd(cb, CB_TLBSTATUS) & 1u); i++) {
++		delay(1);
++	}
++}
++
++bool
++whyred_gpu_vm_enable(uint64_t ttbr)
++{
++	volatile uint8_t *cb = cb0p();
++	const uint32_t tcr = 28u | (2u << 12) | (1u << 23);    /* T0SZ 28 (36 bits), walks NC, SH0 outer, TG0 4K, EPD1 */
++	const uint32_t tcr2 = 1u | (7u << 15);                  /* PASIZE 36 bits, SEP upstream */
++	printf("WHYRED GPU: vm: CB0 TTBR0 %#llx TCR %#x TCR2 %#x, GPU fence %u\n", ttbr, tcr, tcr2, whyred_gpu_fence());
++	wr(cb, CB_SCTLR, 0x60);                                 /* translation off while the bank changes */
++	wr(cb, CB_FSR, 0xffffffffu);
++	wr(cb, CB_TCR2, tcr2);
++	wr(cb, CB_TCR, tcr);
++	wr(cb, CB_TTBR0, (uint32_t)ttbr);
++	wr(cb, CB_TTBR0 + 4, (uint32_t)(ttbr >> 32));
++	wr(cb, CB_CONTEXTIDR, 0);
++	wr(cb, CB_MAIR0, 0x44);                                 /* attr 0: normal, non-cacheable */
++	wr(cb, CB_MAIR1, 0);
++	whyred_gpu_tlb_flush();
++	wr(cb, CB_SCTLR, 0x60 | 0x7);                           /* CFIE CFRE, AFE TRE M */
++	whyred_gpu_tlb_flush();
++	printf("WHYRED GPU: vm: CB0 SCTLR %#x TCR %#x TTBR0 %#x:%#x FSR %#x\n", rd(cb, CB_SCTLR), rd(cb, CB_TCR),
++	    rd(cb, CB_TTBR0 + 4), rd(cb, CB_TTBR0), rd(cb, CB_FSR));
++	/* the kernel's own buffers through the 1:1 blocks */
++	uint32_t f = whyred_gpu_fence();
++	return fence_run(f + 1, f + 100);
++}
++
++void
++whyred_gpu_vm_disable(void)
++{
++	volatile uint8_t *cb = cb0p();
++	wr(cb, CB_SCTLR, 0xe0);                                 /* as step 6 left it */
++	whyred_gpu_tlb_flush();
++	printf("WHYRED GPU: vm: translation off again, FSR %#x FAR %#x:%#x\n", rd(cb, CB_FSR), rd(cb, 0x64), rd(cb, 0x60));
++	wr(cb, CB_FSR, 0xffffffffu);
++}
++
++/* CP_MEM_WRITE of `word` to GPU `address`, then a fence; the caller looks at `cpu` (uncached for it) */
++bool
++whyred_gpu_vm_write_test(uint64_t address, volatile uint32_t *cpu, uint32_t word)
++{
++	uint32_t fence = whyred_gpu_fence() + 1;
++	cpu[0] = 0;
++	sweet_dcache_flush((vm_offset_t)cpu, 64);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ring_put(pkt7(PKT_MEM_WRITE, 3));
++	ring_put((uint32_t)address);
++	ring_put((uint32_t)(address >> 32));
++	ring_put(word);
++	ring_put(pkt7(PKT_WAIT_FOR_IDLE, 0));
++	ring_put(pkt7(PKT_EVENT_WRITE, 4));
++	ring_put(EV_CACHE_FLUSH_TS);
++	ring_put(GMEM_PA + FENCE_OFF + 0x40);
++	ring_put(0);
++	ring_put(fence);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr(A5_CP_RB_WPTR, ring_w % RING_DW);
++	for (int i = 0; i < 100000 && whyred_gpu_fence() != fence; i++) {
++		delay(1);
++	}
++	sweet_dcache_flush((vm_offset_t)cpu, 64);
++	uint32_t got = cpu[0];
++	volatile uint8_t *cb = cb0p();
++	printf("WHYRED GPU: vm: write to %#llx: word %#x (want %#x), fence %u (want %u), FSR %#x\n", address, got, word,
++	    whyred_gpu_fence(), fence, rd(cb, CB_FSR));
++	return got == word && whyred_gpu_fence() == fence;
++}
++
+ static uint32_t
+ ring_space(void)
+ {
+diff --git a/iokit/Kernel/arm/WhyredAdreno.cpp b/iokit/Kernel/arm/WhyredAdreno.cpp
+index ecc9459..05a43b8 100644
+--- a/iokit/Kernel/arm/WhyredAdreno.cpp
++++ b/iokit/Kernel/arm/WhyredAdreno.cpp
+@@ -30,6 +30,11 @@ uint64_t whyred_gpu_reach(void);
+ uint64_t whyred_high_page(volatile uint32_t **va);
+ void whyred_high_page_free(void);
+ uint64_t redwood_gpu_reach(void);
++bool whyred_gpu_vm_enable(uint64_t ttbr);               /* bsd/dev/whyred_gpu.c */
++void whyred_gpu_vm_disable(void);
++void whyred_gpu_tlb_flush(void);
++bool whyred_gpu_vm_write_test(uint64_t address, volatile uint32_t *cpu, uint32_t word);
++void whyred_gpu_vm_start(void);
+ 
+ void topaz_adreno_init(void);
+ bool redwood_gpu_ready(void);
+@@ -240,10 +245,161 @@ redwood_gpu_ready(void)
+ 	return whyred_gpu_up();
+ }
+ 
++/*
++ * GPU page tables (patch 1041, boot-arg whyredgpuvm=1). Without them the SMMU passes addresses through and the
++ * GPU only takes physically contiguous memory: every other IOSurface was copied by the CPU each time it changed
++ * (3623 copies against 77 shared in one session). With them RedwoodGPU's translated path runs: buffers are
++ * ordinary cached kernel memory and every 4 KiB page is entered into the table.
++ *
++ * One table for everything, 36-bit addresses, 4 KiB granule. GPU 0-4 GiB maps 1:1 in four 1 GiB blocks (the
++ * kernel's ring, firmware and fence page at 0xa1400000, the pool). GPU 4-8 GiB is the window RedwoodGPU's
++ * buffers get addresses in: four level 2 tables and 2048 level 3 tables, all made up front (8 MiB of pool).
++ * Each buffer gets one unmapped 4 KiB page behind it: a GPU overrun faults instead of writing the next buffer.
++ */
++#define VM_WINDOW           0x100000000ull      /* GPU 4 GiB */
++#define VM_WINDOW_SIZE      0x100000000ull      /* 4 GiB */
++#define VM_PAGE             0x1000ull
++#define VM_TABLES_SIZE      (0x1000ull + 4 * 0x1000ull + 2048 * 0x1000ull)
++#define PTE_AF              (1ull << 10)
++#define PTE_SH_OUTER        (2ull << 8)
++#define PTE_AP_UNPRIV       (1ull << 6)
++#define PTE_AP_RDONLY       (1ull << 7)
++#define PTE_ATTRS           (PTE_AF | PTE_SH_OUTER | PTE_AP_UNPRIV)     /* AttrIndx 0: MAIR0 attr 0, normal NC */
++
++static bool vm_on;
++static uint64_t vm_tables_pa;
++static volatile uint64_t *vm_l1, *vm_l3;                /* vm_l3: 2048 tables back to back, page n of the window at [n] */
++static struct range vm_free[1024];
++static unsigned vm_free_count;
++static IOLock *vm_lock;
++
++static void
++vm_range_free(uint64_t address, uint64_t size)
++{
++	struct range *f = vm_free;
++	unsigned at;
++
++	for (at = 0; at < vm_free_count && f[at].start < address; at++) {
++	}
++	if (at > 0 && f[at - 1].start + f[at - 1].size == address) {
++		f[at - 1].size += size;
++		if (at < vm_free_count && address + size == f[at].start) {
++			f[at - 1].size += f[at].size;
++			memmove(&f[at], &f[at + 1], (--vm_free_count - at) * sizeof(f[0]));
++		}
++	} else if (at < vm_free_count && address + size == f[at].start) {
++		f[at].start = address;
++		f[at].size += size;
++	} else if (vm_free_count < sizeof(vm_free) / sizeof(vm_free[0])) {
++		memmove(&f[at + 1], &f[at], (vm_free_count - at) * sizeof(f[0]));
++		vm_free_count++;
++		f[at].start = address;
++		f[at].size = size;
++	}
++}
++
++static uint64_t
++vm_range_alloc(uint64_t size)
++{
++	struct range *f = vm_free;
++
++	for (unsigned i = 0; i < vm_free_count; i++) {
++		if (f[i].size >= size) {
++			uint64_t address = f[i].start;
++			f[i].start += size;
++			f[i].size -= size;
++			if (f[i].size == 0) {
++				memmove(&f[i], &f[i + 1], (--vm_free_count - i) * sizeof(f[0]));
++			}
++			return address;
++		}
++	}
++	return 0;
++}
++
++static inline volatile uint64_t *
++vm_pte(uint64_t address)
++{
++	return &vm_l3[(address - VM_WINDOW) / VM_PAGE];
++}
++
++/* The table, from the pool (write-combined: what is written is in memory after a barrier). */
++static bool
++vm_build(void)
++{
++	void *va = NULL;
++	vm_tables_pa = topaz_gpu_pool_alloc(VM_TABLES_SIZE, &va);
++	if (vm_tables_pa == 0) {
++		IOLog("WhyredAdreno: vm: no %llu KiB of pool for the tables\n", VM_TABLES_SIZE >> 10);
++		return false;
++	}
++	bzero(va, (size_t)VM_TABLES_SIZE);
++	vm_l1 = (volatile uint64_t *)va;
++	volatile uint64_t *l2 = vm_l1 + 512;
++	vm_l3 = l2 + 4 * 512;
++	uint64_t l2_pa = vm_tables_pa + 0x1000, l3_pa = l2_pa + 4 * 0x1000;
++	for (uint64_t g = 0; g < 4; g++) {
++		vm_l1[g] = (g << 30) | PTE_ATTRS | 1;                           /* 1 GiB block, 1:1 */
++		vm_l1[4 + g] = (l2_pa + g * 0x1000) | 3;                        /* table */
++	}
++	for (uint64_t i = 0; i < 4 * 512; i++) {
++		l2[i] = (l3_pa + i * 0x1000) | 3;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	vm_lock = IOLockAlloc();
++	vm_free_count = 0;
++	vm_range_free(VM_WINDOW, VM_WINDOW_SIZE);
++	IOLog("WhyredAdreno: vm: tables at %#llx (L1, 4 L2, 2048 L3), window %#llx + %llu MiB\n", vm_tables_pa, VM_WINDOW,
++	    VM_WINDOW_SIZE >> 20);
++	return true;
++}
++
++/*
++ * From whyred_gpu.c before RedwoodGPU is published: build the table, turn translation on (fences through the 1:1
++ * part checked there), then map one kernel page into the window and let the GPU write to it. Any failure turns
++ * translation off again: the identity path stays.
++ */
++void
++whyred_gpu_vm_start(void)
++{
++	if (!vm_build()) {
++		return;
++	}
++	if (!whyred_gpu_vm_enable(vm_tables_pa)) {
++		whyred_gpu_vm_disable();
++		IOLog("WhyredAdreno: vm: fences failed with translation on, staying 1:1\n");
++		return;
++	}
++	IOBufferMemoryDescriptor *page = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, 16384, 16384);
++	uint64_t pa = page != NULL ? page->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++	uint64_t gva = vm_range_alloc(0x8000);
++	bool ok = pa != 0 && gva != 0;
++	if (ok) {
++		for (uint64_t o = 0; o < 0x4000; o += VM_PAGE) {
++			*vm_pte(gva + o) = (pa + o) | PTE_ATTRS | 3;
++		}
++		whyred_gpu_tlb_flush();
++		volatile uint32_t *cpu = (volatile uint32_t *)((uint8_t *)page->getBytesNoCopy() + 0x1230);
++		ok = whyred_gpu_vm_write_test(gva + 0x1230, cpu, 0x76a10041u);
++		for (uint64_t o = 0; o < 0x4000; o += VM_PAGE) {
++			*vm_pte(gva + o) = 0;
++		}
++		whyred_gpu_tlb_flush();
++		vm_range_free(gva, 0x8000);
++	}
++	IOLog("WhyredAdreno: vm: test page at %#llx as GPU %#llx: %s\n", pa, gva, ok ? "translation works" : "FAILED");
++	OSSafeReleaseNULL(page);
++	if (!ok) {
++		whyred_gpu_vm_disable();
++		return;
++	}
++	vm_on = true;
++}
++
+ bool
+ redwood_gpu_identity(void)
+ {
+-	return true;
++	return !vm_on;
+ }
+ 
+ bool
+@@ -265,39 +421,73 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ 	}
+ }
+ 
+-/* identity: no GPU address space of its own; freeing an address gives the pool memory back */
++/*
++ * Identity: no GPU address space of its own, freeing an address gives the pool memory back.
++ * Page tables: addresses in the window, a guard page behind each buffer.
++ */
+ uint64_t
+ redwood_gpu_address(uint64_t size)
+ {
+-	(void)size;
+-	return 0;
++	if (!vm_on) {
++		return 0;
++	}
++	size = (size + VM_PAGE - 1) & ~(VM_PAGE - 1);
++	IOLockLock(vm_lock);
++	uint64_t address = vm_range_alloc(size + VM_PAGE);
++	IOLockUnlock(vm_lock);
++	if (address == 0) {
++		IOLog("WhyredAdreno: vm: window full (%llu bytes asked)\n", size);
++	}
++	return address;
+ }
+ 
+ void
+ redwood_gpu_address_free(uint64_t address, uint64_t size)
+ {
+-	topaz_gpu_pool_free(address, size);
++	if (!vm_on || address < VM_WINDOW) {
++		topaz_gpu_pool_free(address, size);
++		return;
++	}
++	size = (size + VM_PAGE - 1) & ~(VM_PAGE - 1);
++	IOLockLock(vm_lock);
++	vm_range_free(address, size + VM_PAGE);
++	IOLockUnlock(vm_lock);
+ }
+ 
+ bool
+ redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ {
+-	(void)address;
+-	(void)phys;
+-	(void)read_only;
++	if (!vm_on) {
++		return true;
++	}
++	if (address < VM_WINDOW || address >= VM_WINDOW + VM_WINDOW_SIZE || (phys & (VM_PAGE - 1)) != 0 ||
++	    phys >= (1ull << 36)) {
++		return false;
++	}
++	*vm_pte(address) = phys | PTE_ATTRS | (read_only ? PTE_AP_RDONLY : 0) | 3;
+ 	return true;
+ }
+ 
++/* new entries: the walker reads memory, and an entry it saw invalid may be cached */
+ void
+ redwood_gpu_mapped(void)
+ {
++	if (vm_on) {
++		whyred_gpu_tlb_flush();
++	}
+ }
+ 
+ void
+ redwood_gpu_unmap(uint64_t address, uint64_t size)
+ {
+-	(void)address;
+-	(void)size;
++	if (!vm_on || address < VM_WINDOW) {
++		return;
++	}
++	size = (size + VM_PAGE - 1) & ~(VM_PAGE - 1);
++	for (uint64_t o = 0; o < size && address + o < VM_WINDOW + VM_WINDOW_SIZE; o += VM_PAGE) {
++		*vm_pte(address + o) = 0;
++	}
++	whyred_gpu_tlb_flush();
+ }
+ 
+ void
