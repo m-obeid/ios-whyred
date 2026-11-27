@@ -1,0 +1,146 @@
+diff --git a/iokit/Kernel/arm/WhyredAdreno.cpp b/iokit/Kernel/arm/WhyredAdreno.cpp
+index 0bf1bea..ecc9459 100644
+--- a/iokit/Kernel/arm/WhyredAdreno.cpp
++++ b/iokit/Kernel/arm/WhyredAdreno.cpp
+@@ -4,8 +4,8 @@
+  * whyred/research/gpu-stage1.md); this file is the GPU memory pool and the glue.
+  *
+  * The SMMU passes addresses through (identity context bank, step 6): GPU address = physical address, so every
+- * buffer is contiguous. They come from a pool of RAM the kernel does not manage, 0xa2000000 + 256 MiB, between the
+- * GPU's own memory (0xa1400000) and the XNU base (0xb2000000, whyred/tools/mkadt_whyred.py), mapped write-combined.
++ * buffer is contiguous. They come from a pool of RAM the kernel does not manage, from 0xa2000000 up to the XNU base
++ * (boot_args physBase, set by whyred/tools/mkadt_whyred.py: 1 GiB by default), mapped write-combined in 64 MiB chunks.
+  * Boot-arg gpu=1 or whyredgpusvc=1 starts it (whyred_gpu.c).
+  */
+ #include <IOKit/IOLib.h>
+@@ -14,6 +14,8 @@
+ #include <IOKit/IOLocks.h>
+ #include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/boot.h>
++#include <kern/clock.h>
+ 
+ extern "C" {
+ void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: clean + invalidate */
+@@ -54,10 +56,10 @@ uint32_t gpu_log;
+ }
+ 
+ #define GPU_POOL_BASE       0xa2000000ull
+-#define GPU_POOL_SIZE       0x10000000ull       /* 256 MiB */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KiB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MiB, each mapped on first use */
+-#define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
++#define GPU_POOL_CHUNKS     32                  /* at most 2 GiB */
++static uint64_t gpu_pool_size;                  /* XNU base - GPU_POOL_BASE, whole chunks (topaz_adreno_init) */
+ 
+ #define A509_GMEM_SIZE      0x44000             /* 256 + 16 KiB */
+ #define A509_GMEM_BASE      0x100000
+@@ -68,7 +70,7 @@ static uint8_t *chunk_va[GPU_POOL_CHUNKS];
+ static bool pool_ready;
+ static struct range { uint64_t start, size; } pool_free[1024];
+ static unsigned pool_free_count;
+-static uint64_t pool_used, pool_peak;
++static uint64_t pool_used, pool_peak, pool_told_at, pool_told_used;
+ 
+ static void
+ range_free(uint64_t address, uint64_t size)
+@@ -114,6 +116,21 @@ range_alloc(uint64_t size)
+ 	return 0;
+ }
+ 
++/* (pool_lock held) every 30 s, when the use moved by 8 MiB or more: a leak shows as a line that only climbs */
++static void
++pool_tell(void)
++{
++	uint64_t now = mach_absolute_time(), ns;
++	absolutetime_to_nanoseconds(now - pool_told_at, &ns);
++	uint64_t moved = pool_used > pool_told_used ? pool_used - pool_told_used : pool_told_used - pool_used;
++	if (ns >= 30ull * NSEC_PER_SEC && moved >= (8ull << 20)) {
++		pool_told_at = now;
++		pool_told_used = pool_used;
++		IOLog("WhyredAdreno: pool %llu MiB in use (peak %llu of %llu), %u free ranges\n", pool_used >> 20, pool_peak >> 20,
++		    gpu_pool_size >> 20, pool_free_count);
++	}
++}
++
+ /* The cache mode goes into the descriptor: user mappings of RAM the kernel does not manage are Device memory otherwise */
+ IOMemoryDescriptor *
+ topaz_gpu_pool_md(uint64_t pa, uint64_t size)
+@@ -134,13 +151,13 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	uint64_t pa;
+ 
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT || pool_lock == NULL) {
++	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT || pool_lock == NULL || gpu_pool_size == 0) {
+ 		return 0;
+ 	}
+ 	IOLockLock(pool_lock);
+ 	if (!pool_ready) {
+ 		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+-		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
++		for (uint64_t c = 0; c < gpu_pool_size / GPU_POOL_CHUNK; c++) {
+ 			range_free(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
+ 		}
+ 		pool_ready = true;
+@@ -148,7 +165,10 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	pa = range_alloc(size);
+ 	if (pa == 0) {
+ 		IOLockUnlock(pool_lock);
+-		IOLog("WhyredAdreno: pool full: %llu bytes asked, %llu MiB in use\n", size, pool_used >> 20);
++		static unsigned full_told;
++		if (full_told++ < 8) {
++			IOLog("WhyredAdreno: pool full: %llu bytes asked, %llu MiB in use\n", size, pool_used >> 20);
++		}
+ 		return 0;
+ 	}
+ 	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
+@@ -172,9 +192,10 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	if (pool_used > pool_peak) {
+ 		pool_peak = pool_used;
+ 		if ((pool_peak >> 24) != ((pool_peak - size) >> 24)) {
+-			IOLog("WhyredAdreno: pool peak %llu MiB of %llu\n", pool_peak >> 20, GPU_POOL_SIZE >> 20);
++			IOLog("WhyredAdreno: pool peak %llu MiB of %llu\n", pool_peak >> 20, gpu_pool_size >> 20);
+ 		}
+ 	}
++	pool_tell();
+ 	IOLockUnlock(pool_lock);
+ 	if (va != NULL) {
+ 		*va = chunk_va[c] + (pa - GPU_POOL_BASE - c * GPU_POOL_CHUNK);
+@@ -186,12 +207,13 @@ void
+ topaz_gpu_pool_free(uint64_t pa, uint64_t size)
+ {
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (pool_lock == NULL || pa < GPU_POOL_BASE || pa + size > GPU_POOL_BASE + GPU_POOL_SIZE) {
++	if (pool_lock == NULL || pa < GPU_POOL_BASE || pa + size > GPU_POOL_BASE + gpu_pool_size) {
+ 		return;
+ 	}
+ 	IOLockLock(pool_lock);
+ 	range_free(pa, size);
+ 	pool_used -= size;
++	pool_tell();
+ 	IOLockUnlock(pool_lock);
+ }
+ 
+@@ -200,6 +222,13 @@ void
+ topaz_adreno_init(void)
+ {
+ 	if (pool_lock == NULL) {
++		boot_args *ba = (boot_args *)PE_state.bootArgs;
++		uint64_t top = ba != NULL ? ba->physBase : 0;
++		gpu_pool_size = top > GPU_POOL_BASE ? ((top - GPU_POOL_BASE) & ~(GPU_POOL_CHUNK - 1)) : 0;
++		if (gpu_pool_size > GPU_POOL_CHUNKS * GPU_POOL_CHUNK) {
++			gpu_pool_size = GPU_POOL_CHUNKS * GPU_POOL_CHUNK;
++		}
++		IOLog("WhyredAdreno: GPU pool %#llx + %llu MiB (XNU base %#llx)\n", GPU_POOL_BASE, gpu_pool_size >> 20, top);
+ 		pool_lock = IOLockAlloc();
+ 		submit_lock = IOLockAlloc();
+ 	}
+@@ -316,7 +345,7 @@ void
+ redwood_gpu_report(const char *why)
+ {
+ 	whyred_gpu_report(why);
+-	IOLog("WhyredAdreno: pool %llu MiB in use, peak %llu MiB\n", pool_used >> 20, pool_peak >> 20);
++	IOLog("WhyredAdreno: pool %llu MiB in use, peak %llu MiB of %llu\n", pool_used >> 20, pool_peak >> 20, gpu_pool_size >> 20);
+ }
+ 
+ void
