@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index bf017e9..d899d32 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -184,6 +184,7 @@ struct redwood_show {
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+ static bool gGPUReported;
+ static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
++static bool gGPUPool;                           /* buffers from the GPU pool (pass-through, or boot-arg gpu_pool=1 translated) */
+ 
+ /* What the last seconds' submissions were and cost here, for the log. */
+ static struct {
+@@ -327,9 +328,20 @@ RedwoodGPUStart(void)
+ 
+ 	/* topaz: buffers are ordinary cached memory by default (gpu_cached=0 asks for write-combined,
+ 	 * which IOBMD makes contiguous, from the lower DDR bank the kernel cannot map back) */
+-	cached = redwood_gpu_identity() ? 0 : 1;        /* pool memory is write-combined already */
++	/*
++	 * whyred: translated too, buffers come from the pool by default (boot-arg gpu_pool=0: kernel
++	 * memory, cached). Pool addresses below 4 GiB are the GPU's 1:1 there, so nothing is entered in
++	 * the page table, and the pool is write-combined: no buffer leaves the cache at a submission
++	 * (cached ones cost 7 MB and about 3 ms each).
++	 */
++	uint32_t pool = 1;
++	(void)PE_parse_boot_argn("gpu_pool", &pool, sizeof(pool));
++	gGPUPool = redwood_gpu_identity() || pool != 0;
++	cached = gGPUPool ? 0 : 1;                      /* pool memory is write-combined already */
+ 	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
+ 	gGPUCached = cached != 0;
++	IOLog("RedwoodGPU: buffers from %s\n", gGPUPool ? "the GPU pool" : gGPUCached ? "kernel memory, cached" :
++	    "kernel memory, write-combined");
+ 	gGPULock = IOLockAlloc();
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+ 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+@@ -425,7 +437,8 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	uint64_t                fKeptBytes;
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+-	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
++	    uint64_t pool = 0);
+ 	void freeBuffer(struct gpu_buffer * b);
+ 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
+ 	void dropKept(struct gpu_kept * k);
+@@ -620,7 +633,8 @@ RedwoodGPUUserClient::buffer(uint32_t handle)
+  * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
+  */
+ struct gpu_buffer *
+-RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
++RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
++    uint64_t pool)
+ {
+ 	struct gpu_buffer * b = NULL;
+ 	bool mapped = true;
+@@ -635,7 +649,9 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 			break;
+ 		}
+ 	}
+-	if (b != NULL && redwood_gpu_identity()) {
++	if (b != NULL && pool != 0) {
++		b->address = pool;                      /* whyred: pool memory, below 4 GiB: the GPU's address in both modes */
++	} else if (b != NULL && redwood_gpu_identity()) {
+ 		/* topaz: the SMMU passes addresses through: the GPU's address is the physical one */
+ 		IOByteCount length = 0;
+ 		addr64_t phys = memory->getPhysicalSegment(from, &length, kIOMemoryMapperNone);
+@@ -651,7 +667,7 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+ 		return NULL;
+ 	}
+-	for (uint64_t offset = 0; offset < size && mapped && !redwood_gpu_identity(); offset += 4096) {
++	for (uint64_t offset = 0; offset < size && mapped && !redwood_gpu_identity() && pool == 0; offset += 4096) {
+ 		IOByteCount length = 0;
+ 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+ 
+@@ -782,9 +798,9 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+-	if (redwood_gpu_identity()) {
++	if (gGPUPool) {
+ 		/* topaz: kernel memory below 4 GiB, contiguous (ADT --midmem gives the kernel such RAM) */
+-		IOBufferMemoryDescriptor * low = !topaz_gpu_midmem() ? NULL : IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		IOBufferMemoryDescriptor * low = !topaz_gpu_midmem() || !redwood_gpu_identity() ? NULL : IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
+ 		    (vm_size_t) size, 0x00000000fffff000ull);
+ 		if (low != NULL) {
+@@ -813,7 +829,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		bzero(va, (size_t) size);
+ 		IOMemoryDescriptor * pm = topaz_gpu_pool_md(pa, size);
+ 		IOLockLock(gGPULock);
+-		b = pm != NULL ? newBuffer(pm, 0, size, request->flags, &request->handle) : NULL;
++		b = pm != NULL ? newBuffer(pm, 0, size, request->flags, &request->handle, pa) : NULL;
+ 		if (b != NULL) {
+ 			b->memory = pm;
+ 			b->kernel = (uint8_t *) va;
+@@ -1209,7 +1225,7 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 		b->seen = true;
+ 		*memory = b->memory;
+ 		/* topaz: pool memory is not the kernel's: mapped write-combined, not as a device */
+-		*options = (redwood_gpu_identity() && OSDynamicCast(IOBufferMemoryDescriptor, b->memory) == NULL) ?
++		*options = ((redwood_gpu_identity() || b->surface == NULL) && OSDynamicCast(IOBufferMemoryDescriptor, b->memory) == NULL) ?
+ 		    kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
