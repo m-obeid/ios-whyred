@@ -1,16 +1,28 @@
 diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
-index 286fe24..fac172b 100644
+index 286fe24..5cc7847 100644
 --- a/bsd/dev/whyred_gpu.c
 +++ b/bsd/dev/whyred_gpu.c
-@@ -21,6 +21,8 @@
+@@ -21,8 +21,10 @@
   *   9  zap shader a512_zap.mdt/.b02 through TrustZone (PAS 13: init image, mem setup, auth and reset)
   *  10  CP start (ME_CNTL 0), CP_ME_INIT, CP_SET_SECURE_MODE 0 (or SECVID_TRUST_CNTL 0 without a zap)
   *  11  job test: an indirect buffer with CP_MEM_WRITE, then CACHE_FLUSH_TS into the fence page
 + *  12  gfx3d at 300 MHz: GPLL0 (600 MHz, gcc_gpu_gpll0 branch) divided by 2 in the RCG, as topaz;
 + *      covered by the CX level 384 vote of step 2. Then the 100 fences again, timed.
   *
-  * GPU memory is the free RAM below the XNU base (0xa0800000, 4 MiB here), mapped uncached, so CPU
+- * GPU memory is the free RAM below the XNU base (0xa0800000, 4 MiB here), mapped uncached, so CPU
++ * GPU memory is the free RAM below the XNU base (0xa1400000, 4 MiB here), mapped uncached, so CPU
   * writes and GPU writes need no cache maintenance.
+  *
+  * Each step logs before it touches hardware and after. A check that fails ends the run.
+@@ -133,7 +135,7 @@ void whyred_gpu_init(void);
+ #define EV_CACHE_FLUSH_TS    4
+ 
+ /* GPU memory layout in the free RAM below the XNU base */
+-#define GMEM_PA      0xa0800000u
++#define GMEM_PA      0xa1400000u          /* above the modem pool 0xa0400000 + 16 MiB (TopazModem.cpp), below XNU 0xa2000000 */
+ #define GMEM_SIZE    0x400000u
+ #define ZAP_OFF      0x000000u          /* 1 MiB, the zap segment */
+ #define META_OFF     0x100000u          /* zap metadata */
 @@ -718,6 +720,8 @@ step10(void)
  	return true;
  }
