@@ -649,10 +649,19 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
-	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
-	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	const char *why = !share_surfaces ? "glcopy" : image->invert ? "inverted" : image->alpha_first ? "opacity first" :
+	    image->format != GL_BGRA ? "not BGRA" : image->type != GL_UNSIGNED_BYTE ? "not bytes" : image->plane != 0 ? "a plane" :
+	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface) ?
+	    "part of it" : !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface)) ? "the library refused" : NULL;
+	if (why != NULL) {
+		static unsigned told;
+		if (told++ < 48) {
+			uint32_t pf = IOSurfaceGetPixelFormat(surface);
+			say("redwood-gl: IOSurface %u copied, %s: '%.4s' %zu x %zu, %zu bytes a row, format %#x type %#x%s\n",
+			    IOSurfaceGetID(surface), why, (const char *)&(uint32_t){ __builtin_bswap32(pf) }, IOSurfaceGetWidth(surface),
+			    IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface), image->format, image->type,
+			    image->wrapped ? ", client memory" : "");
+		}
 		e->refused++;
 		return false;
 	}
