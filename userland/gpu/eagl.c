@@ -3739,12 +3739,24 @@ install(void)
 	};
 	Class class = objc_getClass("EAGLContext");
 	unsigned replaced = 0;
-	char arguments[1024] = "";
-	size_t size = sizeof(arguments) - 1;
+	char arguments[2048] = "";
+	size_t size, used = 0;
 	const char *argument;
 
-	/* the kernel's boot-args are where a run is told things */
-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+	/*
+	 * whyred: /var/root/glargs first (the first match wins), so a switch is tried with a restart of backboardd
+	 * instead of a reboot. Then the kernel's boot-args, where a run is told things.
+	 */
+	FILE *extra = fopen("/var/root/glargs", "r");
+	if (extra != NULL) {
+		used = fread(arguments, 1, 1000, extra);
+		fclose(extra);
+		arguments[used++] = ' ';
+		arguments[used] = 0;
+		say("redwood-gl: switches from /var/root/glargs: %s\n", arguments);
+	}
+	size = sizeof(arguments) - used - 1;
+	if (sysctlbyname("kern.bootargs", arguments + used, &size, NULL, 0) == 0 || used != 0) {
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
 			if (*argument == '-') {
