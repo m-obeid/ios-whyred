@@ -971,6 +971,19 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Next (stage 2b): Mesa freedreno a5xx for iOS (userland/mesa/mk-mesa-mac.sh, needs a macOS CI job) and the
   eagl layer (userland/gpu/eagl.c needs HackiOS mkeagl.py + eagl_slots.txt), then CoreAnimation with gpu=1.
 
+## GPU stage 2b: Mesa draws on the A509 (2026-11-27)
+
+- .github/workflows/userland.yml job gpu (macos-15-intel, first try): Mesa 25.0.7 (userland/mesa/mk-mesa-mac.sh,
+  freedreno + softpipe, freedreno-darwin and osmesa-es-profile patches, redwood-drm), libtopaz-gl.dylib (eagl.c +
+  gl_osmesa.c, table from HackiOS mkeagl.py + eagl_slots.txt), libtopaz-inject.dylib, gltest. Run 45928949907,
+  artifact topaz-gl (whyred/out/topaz-gl-45928949907). On the phone: /topaz/lib/{libOSMesa.8,libtopaz-gl,
+  libtopaz-inject}.dylib, /var/root/gltest. Mesa's libraries are not in git.
+- gltest on xnu-ios-1033svc (whyredgpusvc=1): GL_RENDERER FD509, GL_VERSION OpenGL ES 3.1 Mesa 25.0.7, one
+  triangle at 256x256: centre ff0080ff (orange), corner ffff0000 (blue), no GL error; 100 frames of clear +
+  triangle + glFinish in 200669 us (about 2 ms each). Mesa prints a harmless os_same_file_description warning.
+- Next: CoreAnimation on the GPU (gpu=1, libtopaz-inject.dylib in backboardd, as topaz). Needs a person to look
+  at the screen.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
