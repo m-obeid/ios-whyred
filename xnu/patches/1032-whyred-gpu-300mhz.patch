@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index 286fe24..fac172b 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -21,6 +21,8 @@
+  *   9  zap shader a512_zap.mdt/.b02 through TrustZone (PAS 13: init image, mem setup, auth and reset)
+  *  10  CP start (ME_CNTL 0), CP_ME_INIT, CP_SET_SECURE_MODE 0 (or SECVID_TRUST_CNTL 0 without a zap)
+  *  11  job test: an indirect buffer with CP_MEM_WRITE, then CACHE_FLUSH_TS into the fence page
++ *  12  gfx3d at 300 MHz: GPLL0 (600 MHz, gcc_gpu_gpll0 branch) divided by 2 in the RCG, as topaz;
++ *      covered by the CX level 384 vote of step 2. Then the 100 fences again, timed.
+  *
+  * GPU memory is the free RAM below the XNU base (0xa0800000, 4 MiB here), mapped uncached, so CPU
+  * writes and GPU writes need no cache maintenance.
+@@ -718,6 +720,8 @@ step10(void)
+ 	return true;
+ }
+ 
++static bool fence_run(uint32_t first, uint32_t last);
++
+ static bool
+ step11(void)
+ {
+@@ -746,9 +750,16 @@ step11(void)
+ 	if (!idle || t != 0xc0ffee09u || f != 1) {
+ 		return false;
+ 	}
+-	/* time 100 more jobs */
++	return fence_run(2, 101);
++}
++
++/* fences first..last, each waited for, timed */
++static bool
++fence_run(uint32_t first, uint32_t last)
++{
++	uint32_t fence_pa = GMEM_PA + FENCE_OFF + 0x40;
+ 	uint64_t t0 = mach_absolute_time();
+-	for (uint32_t n = 2; n <= 101; n++) {
++	for (uint32_t n = first; n <= last; n++) {
+ 		ring_put(pkt7(PKT_EVENT_WRITE, 4));
+ 		ring_put(EV_CACHE_FLUSH_TS);
+ 		ring_put(fence_pa);
+@@ -762,8 +773,33 @@ step11(void)
+ 	}
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-	printf("WHYRED GPU: 100 fences: last %u, %llu us total\n", *gmw(FENCE_OFF + 0x40), ns / 1000);
+-	return *gmw(FENCE_OFF + 0x40) == 101;
++	printf("WHYRED GPU: %u fences: last %u (want %u), %llu us total\n", last - first + 1, *gmw(FENCE_OFF + 0x40), last,
++	    ns / 1000);
++	return *gmw(FENCE_OFF + 0x40) == last;
++}
++
++static bool
++step12(void)
++{
++	say("step 12: gcc_gpu_gpll0 on, gfx3d RCG to GPLL0 / 2 (300 MHz)");
++	wr(gccp, GCC_GPU_GPLL0, rd(gccp, GCC_GPU_GPLL0) | (1u << 4));
++	delay(10);
++	wr(cc, CC_GFX3D_CMD + 4, (5u << 8) | 3u);  /* CFG: source 5 (GPLL0), divider 2 (field 2 * 2 - 1) */
++	wr(cc, CC_GFX3D_CMD, rd(cc, CC_GFX3D_CMD) | 1u);
++	uint32_t v = 0;
++	for (int i = 0; i < 1000; i++) {
++		v = rd(cc, CC_GFX3D_CMD);
++		if (!(v & 1u)) {
++			break;
++		}
++		delay(1);
++	}
++	printf("WHYRED GPU: gpu_gpll0 %#x, gfx3d cmd %#x cfg %#x cbcr %#x %s\n", rd(gccp, GCC_GPU_GPLL0), v,
++	    rd(cc, CC_GFX3D_CMD + 4), rd(cc, CC_GFX3D_CBCR), (v & 1u) ? "UPDATE STUCK" : "ok");
++	if (v & 1u) {
++		return false;
++	}
++	return fence_run(102, 201) && fence_run(202, 1201);
+ }
+ 
+ static void
+@@ -773,8 +809,8 @@ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
+ 	gpu_ms((unsigned)wait * 1000u);
+ 	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
+-	bool (*steps[])(void) = { step1, step2, step3, step4, step5, step6, step7, step8, step9, step10, step11 };
+-	int n = gpu_steps > 11 ? 11 : gpu_steps;
++	bool (*steps[])(void) = { step1, step2, step3, step4, step5, step6, step7, step8, step9, step10, step11, step12 };
++	int n = gpu_steps > 12 ? 12 : gpu_steps;
+ 	for (int i = 0; i < n; i++) {
+ 		if (!steps[i]()) {
+ 			printf("WHYRED GPU: step %d FAILED, stopping\n", i + 1);
