@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index edda546..8d30390 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -48,6 +48,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ bool whyred_rpm_vote(uint32_t type, uint32_t id, const uint32_t *kv, unsigned pairs);   /* TopazModem.cpp */
++bool whyred_rpm_ready(void);
+ void whyred_gpu_init(void);
+ 
+ #define GCC_GPU_PA      0x00171000      /* GCC 0x100000 + 0x71000 */
+@@ -302,9 +303,16 @@ step2(void)
+ {
+ 	static const uint32_t lvl[] = { RPM_VLVL, 384 };
+ 	say("step 2: RPM rwcx and rwmx at level 384");
++	/* the modem driver opens the RPM channel: a fast start (gpu=1) gets here first, so wait up to 60 s for it */
++	unsigned waited = 0;
++	while (!whyred_rpm_ready() && waited < 60000) {
++		gpu_ms(250);
++		waited += 250;
++	}
+ 	bool cx = whyred_rpm_vote(RPM_RWCX, 0, lvl, 1);
+ 	bool mx = whyred_rpm_vote(RPM_RWMX, 0, lvl, 1);
+-	printf("WHYRED GPU: rpm rwcx %s rwmx %s\n", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED");
++	printf("WHYRED GPU: rpm rwcx %s rwmx %s (waited %u ms for the channel)\n", cx ? "ok" : "FAILED",
++	    mx ? "ok" : "FAILED", waited);
+ 	if (!cx || !mx) {
+ 		return false;
+ 	}
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 1c76648..03c566c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7720,7 +7720,15 @@ whyred_rpm_vote(uint32_t type, uint32_t id, const uint32_t *kv, unsigned pairs)
+ 	return a && b;
+ }
+ 
++/* For whyred_gpu.c: true once the modem driver has opened the RPM channel (a vote before races its handshake) */
++extern "C" bool
++whyred_rpm_ready(void)
++{
++	return rpm_up;
++}
++
+ #else
+ extern "C" void topaz_modem_init(void) {}
++extern "C" bool whyred_rpm_ready(void) { return false; }
+ extern "C" bool whyred_rpm_vote(uint32_t, uint32_t, const uint32_t *, unsigned) { return false; }
+ #endif
