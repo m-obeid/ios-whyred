@@ -1027,6 +1027,24 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   /dev/video0, phone propped in front, landscape, top to the left), taps and swipes (kern.whyred_touch) on a
   calibrated camera view or a touch pad, buttons (kern.whyred_key), kernel log tail.
 
+## GPU stage 2d: GPU page tables (patch 1041, 2026-11-27)
+
+- 1041 (CI 46000196958, commit 856c709, boot-arg whyredgpuvm=1): SMMU context bank 0 stage 1 translation.
+  Table from the pool: 0-4 GiB maps 1:1 in 1 GiB blocks, 4-8 GiB is a window of 4 KiB pages with a guard page
+  per buffer. A self-test maps a kernel page and has the GPU write to it, else back to 1:1.
+- xnu-ios-1041vm.img (gpu=1 whyredgpuvm=1, 60 Hz): self-test passed ("translation works"), UI ran. Slower than
+  1040: RedwoodGPU buffers are cached, each submission cleans about 7 MB out of the cache (about 3 ms).
+  glFlush 12 ms a frame, frames 17.8 ms on average. Surfaces: 31 shared against 346 copied, every copy for
+  "not BGRA" (A008 text masks, LA08 96x96, RGhA 256x1 half float, a 600x600 RGBA surface in client memory).
+- xnu-ios-1041wc.img (same + gpu_cached=0, write-combined RedwoodGPU buffers): hung during boot about the
+  time backboardd started (last line "MiniIONetworkStack: opened by configd"), white console text on screen,
+  gone from USB. A long power press brought back Linux. Topaz notes WC IOBMD allocations are contiguous and
+  come from memory the kernel cannot map back. Do not use gpu_cached=0.
+- Phone back on xnu-ios-1040gpu60.img afterwards (first fastboot boot after the hang reset into Linux within
+  minutes with no log, the second one ran).
+- Next: GEM buffers from the write-combined pool, mapped through the page table (no cache cleaning). Needs
+  RedwoodGPU release, reap, dropKept and keep to free pool memory. Then share A8, LA and RGBA surfaces too.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
