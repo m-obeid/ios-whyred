@@ -703,6 +703,69 @@ surface_changed(struct eagl *e, struct image *image)
 	return true;
 }
 
+/*
+ * whyred (Adreno 509, Mesa freedreno a5xx): luminance and luminance + opacity textures came out wrong, the
+ * folder icons' backdrop solid green (a 256 x 1 luminance + opacity curve among the textures it is drawn with).
+ * Such uploads go to the library as the RGBA they stand for: L L L 1, L L L A. A shader reads the same either
+ * way. Boot-arg glla=0: handed on as they are.
+ */
+static int expand_luminance = 1;
+
+static bool
+is_luminance(GLenum format, GLenum type)
+{
+	return expand_luminance && type == GL_UNSIGNED_BYTE && (format == 0x1909 || format == 0x190a);
+}
+
+/* `stride`: bytes from one row to the next in `pixels`. The unpack state is left as it was. */
+static void
+tex_luminance(bool sub, GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
+    const void *pixels, size_t stride)
+{
+	static unsigned told;
+	uint8_t *rgba = NULL;
+	GLint row_length = 0, alignment = 4;
+
+	if (pixels != NULL && width > 0 && height > 0 && (rgba = malloc((size_t)width * (size_t)height * 4)) != NULL) {
+		const unsigned in = format == 0x190a ? 2 : 1;
+		for (GLsizei r = 0; r < height; r++) {
+			const uint8_t *from = (const uint8_t *)pixels + stride * (size_t)r;
+			uint8_t *to = rgba + (size_t)r * (size_t)width * 4;
+			for (GLsizei c = 0; c < width; c++) {
+				to[4 * c] = to[4 * c + 1] = to[4 * c + 2] = from[in * c];
+				to[4 * c + 3] = in == 2 ? from[2 * c + 1] : 0xff;
+			}
+		}
+	}
+	if (told++ < 8) {
+		say("redwood-gl: %s %d x %d of %s as RGBA\n", sub ? "part" : "texture", width, height,
+		    format == 0x190a ? "luminance + opacity" : "luminance");
+	}
+	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	if (sub) {
+		glTexSubImage2D(target, level, x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+	} else {
+		glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+	}
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+	free(rgba);
+}
+
+/* the row stride of client pixels under the current unpack state */
+static size_t
+unpack_stride(GLsizei width, unsigned pixel)
+{
+	GLint row_length = 0, alignment = 4;
+	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+	size_t bytes = (size_t)(row_length > 0 ? row_length : width) * pixel;
+	return alignment > 1 ? (bytes + (size_t)alignment - 1) / (size_t)alignment * (size_t)alignment : bytes;
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -742,6 +805,12 @@ surface_to_texture(struct eagl *e, struct image *image)
 			}
 		}
 		base = flipped;
+	}
+	if (!planar && is_luminance(image->format, image->type)) {
+		tex_luminance(false, image->to, 0, 0, 0, image->width, image->height, image->format, base, row);
+		free(flipped);
+		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+		return;
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
@@ -3053,7 +3122,12 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		group_forget(e, e->bound[e->unit]);
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
-	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	if (is_luminance(format, type) && border == 0) {
+		tex_luminance(false, target, level, 0, 0, width, height, format, pixels, unpack_stride(width, format == 0x190a ? 2 : 1));
+	} else {
+		glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type,
+		    pixels);
+	}
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
 		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
@@ -3079,7 +3153,11 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		group_read(e, e->bound[e->unit]);
 		group_forget(e, e->bound[e->unit]);
 	}
-	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	if (is_luminance(format, type)) {
+		tex_luminance(true, target, level, x, y, width, height, format, pixels, unpack_stride(width, format == 0x190a ? 2 : 1));
+	} else {
+		glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	}
 	EAGL_LEAVE(e, 0x9a0);
 }
 
@@ -3708,6 +3786,7 @@ install(void)
 		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
+		expand_luminance = strstr(arguments, "glla=0") == NULL;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
