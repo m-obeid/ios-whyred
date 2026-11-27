@@ -27,7 +27,7 @@ KEYS = {"power": 0, "volup": 1, "voldown": 2, "home": 3}
 
 frame_lock = threading.Condition()
 frame = {"jpg": b"", "n": 0, "t": 0.0}
-cam = {"dev": "/dev/video0", "exp": 150, "gain": 2, "fps": 10, "proc": None}
+cam = {"dev": "/dev/video0", "exp": 400, "gain": 6, "fps": 10, "proc": None}
 
 
 def phone(cmd, timeout=10):
