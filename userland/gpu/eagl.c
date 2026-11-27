@@ -726,21 +726,32 @@ is_luminance(GLenum format, GLenum type)
 	return expand_luminance && type == GL_UNSIGNED_BYTE && (format == 0x1909 || format == 0x190a);
 }
 
-/* `stride`: bytes from one row to the next in `pixels`. The unpack state is left as it was. */
+/*
+ * `stride`: bytes from one row to the next in `pixels`, `have`: bytes there are from `pixels` on (an
+ * IOSurface's may be fewer than width x height asks for: what is missing stays 0). The unpack state is left
+ * as it was.
+ */
 static void
 tex_luminance(bool sub, GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
-    const void *pixels, size_t stride)
+    const void *pixels, size_t stride, size_t have)
 {
 	static unsigned told;
 	uint8_t *rgba = NULL;
 	GLint row_length = 0, alignment = 4;
 
-	if (pixels != NULL && width > 0 && height > 0 && (rgba = malloc((size_t)width * (size_t)height * 4)) != NULL) {
+	if (pixels != NULL && width > 0 && height > 0 && (rgba = calloc((size_t)width * (size_t)height, 4)) != NULL) {
 		const unsigned in = format == 0x190a ? 2 : 1;
-		for (GLsizei r = 0; r < height; r++) {
+		for (GLsizei r = 0; r < height && stride * (size_t)r < have; r++) {
 			const uint8_t *from = (const uint8_t *)pixels + stride * (size_t)r;
 			uint8_t *to = rgba + (size_t)r * (size_t)width * 4;
-			for (GLsizei c = 0; c < width; c++) {
+			size_t left = have - stride * (size_t)r, n = (size_t)width;
+			if (n * in > left) {
+				n = left / in;          /* (backboardd died here reading past a surface's end) */
+			}
+			if (stride > 0 && n * in > stride && r + 1 < height) {
+				n = stride / in;
+			}
+			for (size_t c = 0; c < n; c++) {
 				to[4 * c] = to[4 * c + 1] = to[4 * c + 2] = from[in * c];
 				to[4 * c + 3] = in == 2 ? from[2 * c + 1] : 0xff;
 			}
@@ -816,7 +827,9 @@ surface_to_texture(struct eagl *e, struct image *image)
 		base = flipped;
 	}
 	if (!planar && is_luminance(image->format, image->type)) {
-		tex_luminance(false, image->to, 0, 0, 0, image->width, image->height, image->format, base, row);
+		tex_luminance(false, image->to, 0, 0, 0, image->width, image->height, image->format, base, row,
+		    flipped != NULL ? row * (size_t)image->height : IOSurfaceGetAllocSize(surface) -
+		    (size_t)(base - (uint8_t *)IOSurfaceGetBaseAddress(surface)));
 		free(flipped);
 		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 		return;
@@ -3132,7 +3145,8 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
 	if (is_luminance(format, type) && border == 0) {
-		tex_luminance(false, target, level, 0, 0, width, height, format, pixels, unpack_stride(width, format == 0x190a ? 2 : 1));
+		tex_luminance(false, target, level, 0, 0, width, height, format, pixels, unpack_stride(width, format == 0x190a ? 2 : 1),
+		    SIZE_MAX);
 	} else {
 		glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type,
 		    pixels);
@@ -3163,7 +3177,8 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		group_forget(e, e->bound[e->unit]);
 	}
 	if (is_luminance(format, type)) {
-		tex_luminance(true, target, level, x, y, width, height, format, pixels, unpack_stride(width, format == 0x190a ? 2 : 1));
+		tex_luminance(true, target, level, x, y, width, height, format, pixels, unpack_stride(width, format == 0x190a ? 2 : 1),
+		    SIZE_MAX);
 	} else {
 		glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
 	}
