@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>whyred remote</title>
+<style>
+:root { --bg: #111; --fg: #ddd; --dim: #888; --line: #333; --btn: #222; --acc: #4a9eff; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; }
+main { display: flex; flex-wrap: wrap; gap: 12px; padding: 12px 16px; }
+#viewbox { flex: 1 1 420px; min-width: 0; }
+#side { flex: 0 1 300px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+canvas { display: block; width: 100%; background: #000; border: 1px solid var(--line); touch-action: none; }
+#pad { width: 100%; max-width: 220px; aspect-ratio: 1 / 2; border: 1px solid var(--line); border-radius: 18px;
+  background: #1a1a1a; position: relative; touch-action: none; align-self: center; }
+#pad .dot { position: absolute; width: 14px; height: 14px; margin: -7px; border-radius: 50%; background: var(--acc); pointer-events: none; }
+.row { display: flex; gap: 6px; flex-wrap: wrap; }
+button, select, input { background: var(--btn); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit; }
+button { cursor: pointer; flex: 1 1 auto; }
+button:active { background: var(--acc); }
+button.on { border-color: var(--acc); color: var(--acc); }
+label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+input[type=range] { flex: 1; padding: 0; }
+#status { color: var(--dim); font-size: 12px; min-height: 1.2em; }
+#log { white-space: pre-wrap; word-break: break-all; font: 11px ui-monospace, monospace; color: #9c9; background: #000;
+  border: 1px solid var(--line); padding: 6px; height: 260px; overflow: auto; margin: 0 16px 16px; }
+h2 { font-size: 12px; color: var(--dim); margin: 0; font-weight: normal; text-transform: uppercase; letter-spacing: .05em; }
+</style>
+</head>
+<body>
+<main>
+  <div id="viewbox">
+    <canvas id="view" width="960" height="540"></canvas>
+    <div id="status">connecting</div>
+  </div>
+  <div id="side">
+    <h2>Buttons</h2>
+    <div class="row">
+      <button data-key="power">Power</button>
+      <button data-key="home">Home</button>
+      <button data-key="volup">Vol +</button>
+      <button data-key="voldown">Vol -</button>
+    </div>
+    <div class="row">
+      <button id="unlock">Swipe up (unlock / home)</button>
+      <button id="hold" title="Next tap on the view or pad is a 800 ms hold">Long press</button>
+    </div>
+    <h2>Touch pad (phone screen, 1080 x 2160)</h2>
+    <div id="pad"></div>
+    <h2>Camera view</h2>
+    <div class="row">
+      <button id="rot">Rotate</button>
+      <button id="cal">Calibrate corners</button>
+      <button id="fit">Zoom to phone</button>
+    </div>
+    <label>Exposure <input id="exp" type="range" min="10" max="1000" step="10"></label>
+    <label>Gain <input id="gain" type="range" min="0" max="100" step="1"></label>
+  </div>
+</main>
+<h2 style="margin: 0 16px 4px">Kernel log</h2>
+<pre id="log"></pre>
+<script>
+const W = 1080, H = 2160;
+const $ = (id) => document.getElementById(id);
+const status = (t) => { $('status').textContent = t; };
+let store = {};
+try { store = JSON.parse(localStorage.getItem('whyred-remote') || '{}'); } catch (e) {}
+const save = () => { try { localStorage.setItem('whyred-remote', JSON.stringify(store)); } catch (e) {} };
+store.rot = store.rot || 0;            // quarter turns
+store.corners = store.corners || null; // source image px: TL, TR, BR, BL of the phone screen
+store.fit = !!store.fit;
+
+async function post(path) {
+  const t0 = performance.now();
+  try {
+    const r = await fetch(path, { method: 'POST' });
+    const txt = await r.text();
+    status(`${path.split('?')[0]} ${r.ok ? 'ok' : 'failed: ' + txt} (${Math.round(performance.now() - t0)} ms)`);
+  } catch (e) { status('request failed: ' + e); }
+}
+const touch = (x1, y1, x2, y2, ms) =>
+  post(`/touch?x1=${x1 | 0}&y1=${y1 | 0}&x2=${x2 | 0}&y2=${y2 | 0}&ms=${ms | 0}`);
+
+// -- homography: source image px <-> phone px (from the 4 calibrated corners)
+function solve(A, b) {
+  const n = b.length;
+  for (let i = 0; i < n; i++) {
+    let p = i;
+    for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+    [A[i], A[p]] = [A[p], A[i]]; [b[i], b[p]] = [b[p], b[i]];
+    for (let r = i + 1; r < n; r++) {
+      const f = A[r][i] / A[i][i];
+      for (let c = i; c < n; c++) A[r][c] -= f * A[i][c];
+      b[r] -= f * b[i];
+    }
+  }
+  const x = new Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let c = i + 1; c < n; c++) s -= A[i][c] * x[c];
+    x[i] = s / A[i][i];
+  }
+  return x;
+}
+function homography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  const h = solve(A, b);
+  return (x, y) => {
+    const d = h[6] * x + h[7] * y + 1;
+    return [(h[0] * x + h[1] * y + h[2]) / d, (h[3] * x + h[4] * y + h[5]) / d];
+  };
+}
+let toPhone = null;
+function setCorners(c) {
+  store.corners = c; save();
+  toPhone = c ? homography(c, [[0, 0], [W, 0], [W, H], [0, H]]) : null;
+}
+setCorners(store.corners);
+
+// -- camera view: MJPEG drawn into the canvas, rotated and optionally cropped to the phone
+const img = new Image();
+const view = $('view'), ctx = view.getContext('2d');
+let crop = null; // source rect
+function sourceRect() {
+  if (store.fit && store.corners) {
+    const xs = store.corners.map(p => p[0]), ys = store.corners.map(p => p[1]);
+    const m = 40, x0 = Math.max(0, Math.min(...xs) - m), y0 = Math.max(0, Math.min(...ys) - m);
+    return [x0, y0, Math.min(img.naturalWidth, Math.max(...xs) + m) - x0, Math.min(img.naturalHeight, Math.max(...ys) + m) - y0];
+  }
+  return [0, 0, img.naturalWidth || 1920, img.naturalHeight || 1080];
+}
+function draw() {
+  if (img.naturalWidth) {
+    crop = sourceRect();
+    const [sx, sy, sw, sh] = crop;
+    const q = ((store.rot % 4) + 4) % 4;
+    const cw = q % 2 ? sh : sw, ch = q % 2 ? sw : sh;
+    const scale = Math.min(1, 1400 / Math.max(cw, ch));
+    const vw = Math.round(cw * scale), vh = Math.round(ch * scale);
+    if (view.width !== vw || view.height !== vh) { view.width = vw; view.height = vh; }
+    ctx.save();
+    ctx.translate(vw / 2, vh / 2);
+    ctx.rotate(q * Math.PI / 2);
+    ctx.drawImage(img, sx, sy, sw, sh, -sw * scale / 2, -sh * scale / 2, sw * scale, sh * scale);
+    ctx.restore();
+    if (calPts) {
+      ctx.fillStyle = '#4a9eff';
+      for (const p of calPts) { const [x, y] = srcToView(p[0], p[1]); ctx.beginPath(); ctx.arc(x, y, 6, 0, 7); ctx.fill(); }
+    }
+  }
+  requestAnimationFrame(draw);
+}
+function viewToSrc(px, py) { // canvas css px -> source image px
+  const r = view.getBoundingClientRect();
+  const x = (px - r.left) * view.width / r.width, y = (py - r.top) * view.height / r.height;
+  const [sx, sy, sw, sh] = crop;
+  const q = ((store.rot % 4) + 4) % 4, s = view.width / (q % 2 ? sh : sw);
+  let dx = (x - view.width / 2) / s, dy = (y - view.height / 2) / s, ux, uy;
+  if (q === 0) { ux = dx; uy = dy; } else if (q === 1) { ux = dy; uy = -dx; }
+  else if (q === 2) { ux = -dx; uy = -dy; } else { ux = -dy; uy = dx; }
+  return [sx + sw / 2 + ux, sy + sh / 2 + uy];
+}
+function srcToView(x, y) {
+  const [sx, sy, sw, sh] = crop;
+  const q = ((store.rot % 4) + 4) % 4, s = view.width / (q % 2 ? sh : sw);
+  const ux = x - sx - sw / 2, uy = y - sy - sh / 2;
+  let dx, dy;
+  if (q === 0) { dx = ux; dy = uy; } else if (q === 1) { dx = -uy; dy = ux; }
+  else if (q === 2) { dx = -ux; dy = -uy; } else { dx = uy; dy = -ux; }
+  return [view.width / 2 + dx * s, view.height / 2 + dy * s];
+}
+function startStream() {
+  img.onerror = () => { status('camera stream lost, retrying'); setTimeout(startStream, 2000); };
+  img.src = '/stream?' + Date.now();
+}
+startStream();
+requestAnimationFrame(draw);
+
+// -- gestures (shared by the view and the pad)
+let holdNext = false;
+function gesture(el, map) {
+  let start = null;
+  el.addEventListener('pointerdown', (e) => {
+    const p = map(e.clientX, e.clientY);
+    if (!p) return;
+    el.setPointerCapture(e.pointerId);
+    start = { p, t: performance.now() };
+  });
+  el.addEventListener('pointerup', (e) => {
+    if (!start) return;
+    const p = map(e.clientX, e.clientY) || start.p, dt = performance.now() - start.t;
+    const dist = Math.hypot(p[0] - start.p[0], p[1] - start.p[1]);
+    if (holdNext) { holdNext = false; $('hold').classList.remove('on'); touch(start.p[0], start.p[1], start.p[0], start.p[1], 800); }
+    else if (dist < 30) touch(start.p[0], start.p[1], start.p[0], start.p[1], dt > 450 ? Math.min(dt, 3000) : 60);
+    else touch(start.p[0], start.p[1], p[0], p[1], Math.max(120, Math.min(dt, 1500)));
+    start = null;
+  });
+  el.addEventListener('pointercancel', () => { start = null; });
+}
+const pad = $('pad');
+gesture(pad, (cx, cy) => {
+  const r = pad.getBoundingClientRect();
+  return [(cx - r.left) / r.width * W, (cy - r.top) / r.height * H];
+});
+let calPts = null;
+gesture(view, (cx, cy) => {
+  if (calPts) return null;
+  if (!toPhone || !crop) { status('calibrate the corners first, or use the touch pad'); return null; }
+  const [x, y] = toPhone(...viewToSrc(cx, cy));
+  if (x < -40 || y < -40 || x > W + 40 || y > H + 40) return null;
+  return [x, y];
+});
+view.addEventListener('click', (e) => {
+  if (!calPts) return;
+  calPts.push(viewToSrc(e.clientX, e.clientY));
+  const names = ['top left', 'top right', 'bottom right', 'bottom left'];
+  if (calPts.length < 4) { status(`tap the screen's ${names[calPts.length]} corner`); return; }
+  setCorners(calPts); calPts = null; $('cal').classList.remove('on');
+  status('calibrated: taps on the camera view now go to the phone');
+});
+$('cal').onclick = () => {
+  calPts = []; $('cal').classList.add('on');
+  status("calibrating: tap the phone screen's top left corner (top = the earpiece end) on the camera view");
+};
+
+// -- buttons
+document.querySelectorAll('[data-key]').forEach(b => b.onclick = () => post(`/key?k=${b.dataset.key}&ms=80`));
+$('unlock').onclick = () => touch(540, 2150, 540, 700, 250);
+$('hold').onclick = () => { holdNext = !holdNext; $('hold').classList.toggle('on', holdNext); };
+$('rot').onclick = () => { store.rot = (store.rot + 1) % 4; save(); };
+$('fit').onclick = () => { store.fit = !store.fit; save(); $('fit').classList.toggle('on', store.fit); };
+$('fit').classList.toggle('on', store.fit);
+
+// -- camera controls and state
+let camTimer = null;
+function camSet() {
+  clearTimeout(camTimer);
+  camTimer = setTimeout(() => post(`/camera?exp=${$('exp').value}&gain=${$('gain').value}`), 250);
+}
+$('exp').oninput = camSet; $('gain').oninput = camSet;
+fetch('/state').then(r => r.json()).then(s => {
+  $('exp').value = s.exp; $('gain').value = s.gain;
+  status(`phone ${s.phone ? 'reachable' : 'NOT reachable over SSH'}, camera frame ${s.frame_age} s old`);
+}).catch(() => status('state request failed'));
+
+// -- kernel log
+async function pollLog() {
+  try {
+    const r = await fetch('/log?n=80');
+    const t = await r.text(), el = $('log');
+    const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    if (el.textContent !== t) { el.textContent = t; if (atEnd) el.scrollTop = el.scrollHeight; }
+  } catch (e) {}
+  setTimeout(pollLog, 2000);
+}
+pollLog();
+</script>
+</body>
+</html>
