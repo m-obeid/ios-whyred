@@ -1007,6 +1007,22 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   whyred_gpu_reach(): 4 GiB, 64 GiB once the test passed (boot-arg whyredgpu64=0 skips the mode). First boot:
   "64-bit addressing on", but 32 one-page allocations found no page above 4 GiB, so the GPU stays below 4 GiB.
   Surfaces above it fall back to the CPU copy (slow frames, no crash). The test needs a better page source.
+- 1039 (CI 45989179045, xnu-ios-1039gpu60.img = gpu=1 sweetfb_hz=60): high test page from a 16 MiB buffer.
+  Still "no page above 4 GiB" (the allocator hands out low pages first): GPU stays below 4 GiB. Profile
+  before: 7.9 ms a frame of GPU work on average, 3623 surface textures copied by the CPU against 77 shared.
+- 256 MiB pool filled within minutes (Mail, folders): "pool full", then Mesa crashed backboardd (signal 11 in
+  libOSMesa) and the UI restarted. Folders drawn meanwhile had no backdrop at all.
+- 1040 (CI 45991487122, xnu-ios-1040gpu60.img): pool from 0xa2000000 to the XNU base (boot_args physBase),
+  mkadt_whyred.py WHYRED_GPU_POOL=MiB, default 1024 (XNU base 0xe2000000). Use logged every 30 s. Peak 236 MiB,
+  back to 9-19 MiB after a backboardd restart: no leak seen.
+- Green/yellow folder icons (also App Library folders, wiggle-mode minus buttons): the second Utilities folder
+  icon on home page 2 flips between a right grey gradient and solid green or yellow from frame to frame. The
+  colours match nearby icons (Messages green, Tips yellow): likely a texture that is sampled but not drawn into,
+  showing old pool memory. Not the cause (tested with /var/root/glargs and a backboardd restart): glgroup=0,
+  glplain=0, glfetch=0 (closing platter looks more natural), FD_MESA_DEBUG=sysmem. eagl now hands luminance
+  textures to Mesa as RGBA (glla=0 turns it off): did not cure it. A gltrace attempt traced nothing; at that
+  point the wallpaper had gone black (maybe dark mode at 4 AM phone time) and the icon stayed grey.
+- eagl reads /var/root/glargs before the boot-args (first match wins). Test script: scratchpad foldertest.sh.
 - Remote use: whyred/tools/remote/remote.py --bind <tailscale IP> serves port 8765: webcam stream (laptop
   /dev/video0, phone propped in front, landscape, top to the left), taps and swipes (kern.whyred_touch) on a
   calibrated camera view or a touch pad, buttons (kern.whyred_key), kernel log tail.
