@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index c94fb8b..daf0d98 100644
+index d342a46..5b2cc61 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -50,6 +50,7 @@
@@ -23,16 +23,25 @@ index c94fb8b..daf0d98 100644
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
  
  /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
-@@ -1029,7 +1036,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -1126,13 +1133,19 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  			 * pages came next. (The descriptor keeps them: RedwoodGPU gives them to the GPU.)
  			 */
  			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
--			if (gpu_low && take <= (16u << 20)) {
+-			if (gpu_low) {
 +			/*
-+			 * whyred: with the page table on (whyredgpuvm=1) the GPU reads any pages. Contiguous runs cost a
-+			 * scan of all RAM once memory filled (vm_page_find_contiguous, mostly in vain): unlocking took seconds.
++			 * whyred: with the page table on (whyredgpuvm=1) the GPU reads any pages: no reserve, no contiguous
++			 * runs. Those cost a scan of all RAM once memory filled (vm_page_find_contiguous, mostly in vain):
++			 * unlocking took seconds. The guard rows stay (RedwoodGPU maps them).
 +			 */
-+			if (gpu_low && take <= (16u << 20) && redwood_gpu_identity()) {
++			bool contiguous = gpu_low && redwood_gpu_identity();
++			if (contiguous) {
+ 				sweet_res_fill();
+ 				if (s->width >= 1000 && s->height >= 2000 && s->bytesPerElement == 4) {
+ 					mem = sweet_res_take(take);
+ 				}
+ 			}
+-			if (mem == NULL && gpu_low && take <= (16u << 20)) {
++			if (mem == NULL && contiguous && take <= (16u << 20)) {
  				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
  				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
  				    0x0000000FFFFFC000ull);
