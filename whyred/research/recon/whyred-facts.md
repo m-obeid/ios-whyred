@@ -943,6 +943,14 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - CP_ME_INIT and CP_SET_SECURE_MODE 0 consumed; SECVID_TRUST_CNTL 0x1 -> 0 (out of secure mode). Job test: an IB
   with CP_MEM_WRITE wrote 0xc0ffee09, CACHE_FLUSH_TS fence 1. 100 more fences in 1980 us (about 20 us each, GPU
   at 19.2 MHz XO).
+- 0xa0800000 (the first GPU memory) lay inside TopazModem's pool 0xa0400000 + 16 MiB (rmtfs, CE rings, WMI,
+  ADSP buffers). 1032 moves GPU memory to 0xa1400000 (12 MiB free up to the XNU base 0xa2000000).
+- 1032 step 12: gcc_gpu_gpll0 (0x15200c bit 4) on, gfx3d RCG CFG 0x503 (GPLL0 / 2 = 300 MHz), update ok. Fence
+  round trip 21 us at XO -> 10 us at 300 MHz (100 in 1026 us, 1000 in 10987 us, all in order). CI 45920839113,
+  image whyred/out/xnu-ios-1032g12.img (default args + whyredgpu=12).
+- Stage 2 needs a GPU pool far larger than 12 MiB (topaz: 1 GiB): RAM has to come from XNU (raise
+  HIGH_PHYS_BASE in whyred/tools/mkadt_whyred.py). The RedwoodGPU service needs no a6xx changes; a new a5xx
+  backend replaces TopazAdreno.cpp's exports (redwood_gpu_*, topaz_gpu_pool_*, topaz_adreno_init).
 - Next: GPU clock from the PLL (266 MHz, corner within the CX 384 vote), then stage 2 (RedwoodGPU service for
   Mesa, a5xx GET_PARAM values, freedreno a5xx).
 
