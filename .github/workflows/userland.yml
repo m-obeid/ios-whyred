@@ -1,7 +1,9 @@
 name: userland
 
 # iOS userland pieces that need Apple's iOS SDK (the Linux build of whyred/userland has none):
-# RedwoodAudio.driver, the HAL plug-in that gives mediaserverd the speaker (userland/audio).
+# RedwoodAudio.driver, the HAL plug-in that gives mediaserverd the speaker (userland/audio);
+# job gpu: Mesa 25.0.7 (freedreno + softpipe, userland/mesa) and the OpenGL ES layer behind CoreAnimation
+# (userland/gpu: libtopaz-gl.dylib = eagl.c + gl_osmesa.c, libtopaz-inject.dylib) plus gltest.
 on:
   workflow_dispatch:
     inputs:
@@ -12,6 +14,8 @@ on:
     branches: [whyred]
     paths:
       - "userland/audio/**"
+      - "userland/gpu/**"
+      - "userland/mesa/**"
       - ".github/workflows/userland.yml"
 
 jobs:
@@ -39,4 +43,41 @@ jobs:
           name: redwood-audio-driver
           path: |
             out/RedwoodAudio.driver
+            out/SHA256SUMS
+
+  gpu:
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools
+        run: brew install bison flex || true
+      - name: Mesa
+        run: |
+          set -euo pipefail
+          bash userland/mesa/mk-mesa-mac.sh || { tail -60 userland/mesa/build-mesa/meson-setup.log userland/mesa/build-mesa/ninja.log 2>/dev/null; exit 1; }
+      - name: libtopaz-gl, libtopaz-inject, gltest
+        run: |
+          set -euo pipefail
+          M=userland/mesa/build-mesa
+          INC=$M/mesa-25.0.7/include
+          mkdir -p out/topaz/lib out/gen out/bin
+          python3 userland/gpu/mkeagl.py userland/gpu/eagl_slots.txt $M/out/gl.xml $M/out/exported-gl.txt userland/gpu/eagl.c > out/gen/eagl_gen.h
+          CC="xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2"
+          cp $M/out/libOSMesa.8.dylib out/topaz/lib/
+          $CC -dynamiclib -install_name /topaz/lib/libtopaz-gl.dylib -I out/gen -I userland/gpu -I $INC \
+            -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc out/topaz/lib/libOSMesa.8.dylib \
+            -o out/topaz/lib/libtopaz-gl.dylib userland/gpu/eagl.c userland/gpu/gl_osmesa.c
+          $CC -dynamiclib -install_name /topaz/lib/libtopaz-inject.dylib -framework CoreFoundation -framework IOKit -lobjc \
+            -o out/topaz/lib/libtopaz-inject.dylib userland/gpu/topaz_inject.c
+          $CC -I $INC -o out/bin/gltest userland/gpu/gltest.c out/topaz/lib/libOSMesa.8.dylib
+          for f in out/topaz/lib/*.dylib out/bin/gltest; do codesign -f -s - $f; done
+          file out/topaz/lib/* out/bin/*
+          (cd out && shasum -a 256 topaz/lib/* bin/* > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: topaz-gl
+          path: |
+            out/topaz
+            out/bin
             out/SHA256SUMS

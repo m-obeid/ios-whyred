@@ -24,7 +24,7 @@ APSL 2.0; every patch records what we changed in its commit message.
 
 ### User space derived from HackiOS (MIT)
 
-`userland/gpu/eagl.c`, `userland/gpu/gl_osmesa.c`, `userland/gpu/inject.c`,
+`userland/gpu/eagl.c`, `userland/gpu/gl_osmesa.c`, `userland/gpu/inject.c`, `userland/gpu/mkeagl.py`, `userland/gpu/eagl_slots.txt`,
 `userland/mesa/*` (freedreno Darwin patches, `redwood-drm`) and `userland/audio/*`
 (the RedwoodAudio HAL plug-in) are based on HackiOS user space:
 

@@ -20,3 +20,4 @@ whyred/backup/
 whyred/ipsw/
 whyred/tools/osmdump/*.ko
 whyred/firmware/
+userland/mesa/build-mesa/
