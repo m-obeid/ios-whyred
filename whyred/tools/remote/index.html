@@ -124,19 +124,19 @@ function setCorners(c) {
 setCorners(store.corners);
 
 // -- camera view: MJPEG drawn into the canvas, rotated and optionally cropped to the phone
-const img = new Image();
+let img = null; // the latest camera frame (ImageBitmap)
 const view = $('view'), ctx = view.getContext('2d');
 let crop = null; // source rect
 function sourceRect() {
   if (store.fit && store.corners) {
     const xs = store.corners.map(p => p[0]), ys = store.corners.map(p => p[1]);
     const m = 40, x0 = Math.max(0, Math.min(...xs) - m), y0 = Math.max(0, Math.min(...ys) - m);
-    return [x0, y0, Math.min(img.naturalWidth, Math.max(...xs) + m) - x0, Math.min(img.naturalHeight, Math.max(...ys) + m) - y0];
+    return [x0, y0, Math.min(img.width, Math.max(...xs) + m) - x0, Math.min(img.height, Math.max(...ys) + m) - y0];
   }
-  return [0, 0, img.naturalWidth || 1920, img.naturalHeight || 1080];
+  return [0, 0, img ? img.width : 1920, img ? img.height : 1080];
 }
 function draw() {
-  if (img.naturalWidth) {
+  if (img) {
     crop = sourceRect();
     const [sx, sy, sw, sh] = crop;
     const q = ((store.rot % 4) + 4) % 4;
@@ -175,11 +175,22 @@ function srcToView(x, y) {
   else if (q === 2) { dx = -ux; dy = -uy; } else { dx = uy; dy = -ux; }
   return [view.width / 2 + dx * s, view.height / 2 + dy * s];
 }
-function startStream() {
-  img.onerror = () => { status('camera stream lost, retrying'); setTimeout(startStream, 2000); };
-  img.src = '/stream?' + Date.now();
+// Chrome draws only the first frame of a multipart MJPEG image into a canvas: fetch single frames instead
+async function pollFrames() {
+  for (;;) {
+    try {
+      const r = await fetch('/snap.jpg?' + Date.now(), { cache: 'no-store' });
+      const bmp = await createImageBitmap(await r.blob());
+      if (img) img.close();
+      img = bmp;
+    } catch (e) {
+      status('camera frame failed, retrying');
+      await new Promise(res => setTimeout(res, 2000));
+    }
+    await new Promise(res => setTimeout(res, document.hidden ? 1000 : 80));
+  }
 }
-startStream();
+pollFrames();
 requestAnimationFrame(draw);
 
 // -- gestures (shared by the view and the pad)
