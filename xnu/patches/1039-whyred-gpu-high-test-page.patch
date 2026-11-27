@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index c50b94b..01bea10 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -837,6 +837,7 @@ step12(void)
+  * mode, the write went to 0x71714000 and the phone reset).
+  */
+ uint64_t whyred_high_page(volatile uint32_t **va);     /* WhyredAdreno.cpp */
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: clean + invalidate */
+ void whyred_high_page_free(void);
+ 
+ static void
+@@ -851,6 +852,7 @@ high_test(void)
+ 	}
+ 	uint32_t fence = *gmw(FENCE_OFF + 0x40) + 1;
+ 	va[0] = 0;
++	sweet_dcache_flush((vm_offset_t)va, 64);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	ring_put(pkt7(PKT_MEM_WRITE, 3));
+ 	ring_put((uint32_t)pa);
+@@ -867,6 +869,7 @@ high_test(void)
+ 	for (int i = 0; i < 100000 && *gmw(FENCE_OFF + 0x40) != fence; i++) {
+ 		delay(1);
+ 	}
++	sweet_dcache_flush((vm_offset_t)va, 64);
+ 	uint32_t got = va[0];
+ 	bool ok = *gmw(FENCE_OFF + 0x40) == fence && got == 0x6464abcdu;
+ 	if (ok) {
+diff --git a/iokit/Kernel/arm/WhyredAdreno.cpp b/iokit/Kernel/arm/WhyredAdreno.cpp
+index 8d5afd9..0bf1bea 100644
+--- a/iokit/Kernel/arm/WhyredAdreno.cpp
++++ b/iokit/Kernel/arm/WhyredAdreno.cpp
+@@ -333,38 +333,32 @@ redwood_gpu_reach(void)
+ }
+ 
+ /*
+- * For whyred_gpu.c's high test: one write-combined page above 4 GiB. Pages are taken until one lies there
+- * (XNU's RAM is 0xb2000000 + 0xcc000000, most of it above 4 GiB); the others go back.
++ * For whyred_gpu.c's high test: one page above 4 GiB. One-page allocations all came from below 4 GiB (1038), so a
++ * 16 MiB buffer of loose pages is taken and the first of its pages above 4 GiB used. Cached memory: the caller
++ * cleans the page before the GPU writes and invalidates it before reading (sweet_dcache_flush).
+  */
+ static IOBufferMemoryDescriptor *high_page;
+ 
+ uint64_t
+ whyred_high_page(volatile uint32_t **va)
+ {
+-	IOBufferMemoryDescriptor *tried[32];
+-	unsigned n = 0;
+-	uint64_t pa = 0;
++	const vm_size_t size = 16u << 20;
+ 
+ 	*va = NULL;
+-	while (n < 32) {
+-		IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, 4096, 0x0000000ffffff000ull);
+-		if (m == NULL) {
+-			break;
+-		}
+-		uint64_t p = m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	high_page = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, size, 4096);
++	if (high_page == NULL) {
++		return 0;
++	}
++	uint8_t *base = (uint8_t *)high_page->getBytesNoCopy();
++	for (vm_size_t off = 0; off < size; off += 4096) {
++		IOByteCount len = 0;
++		uint64_t p = high_page->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
+ 		if (p >= (1ull << 32)) {
+-			high_page = m;
+-			pa = p;
+-			*va = (volatile uint32_t *)m->getBytesNoCopy();
+-			break;
++			*va = (volatile uint32_t *)(base + off);
++			return p;
+ 		}
+-		tried[n++] = m;
+ 	}
+-	for (unsigned i = 0; i < n; i++) {
+-		tried[i]->release();
+-	}
+-	return pa;
++	return 0;
+ }
+ 
+ void
