@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+index e73489f..edda546 100644
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -166,6 +166,7 @@ int topaz_root_mounted(void);
+ uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
+ static int gpu_steps;
+ static bool gpu_up, gpu_svc;
++static bool gpu_fast;           /* gpu=1 without whyredgpu=N: no start delay, no log pauses (step 6 keeps its own) */
+ static uint32_t gpu_seq;
+ void RedwoodGPUStart(void);    /* RedwoodGPU.cpp */
+ 
+@@ -200,7 +201,9 @@ static void
+ say(const char *what)
+ {
+ 	printf("WHYRED GPU: %s\n", what);
+-	gpu_ms(300);
++	if (!gpu_fast) {
++		gpu_ms(300);
++	}
+ }
+ 
+ /* enable a branch, wait up to 1 ms for "clock off" to clear */
+@@ -812,7 +815,7 @@ step12(void)
+ static void
+ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+-	int wait = 20;
++	int wait = gpu_fast ? 0 : 20;
+ 	(void)PE_parse_boot_argn("whyredgpudelay", &wait, sizeof(wait));
+ 	gpu_ms((unsigned)wait * 1000u);
+ 	printf("WHYRED GPU: stage 1, steps 1..%d\n", gpu_steps);
+@@ -949,6 +952,7 @@ whyred_gpu_init(void)
+ 	gpu_svc = g != 0 || svc != 0;
+ 	if (!PE_parse_boot_argn("whyredgpu", &gpu_steps, sizeof(gpu_steps))) {
+ 		gpu_steps = gpu_svc ? 12 : 0;
++		gpu_fast = g != 0;
+ 	}
+ 	if (gpu_steps <= 0) {
+ 		return;

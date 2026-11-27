@@ -1273,11 +1273,63 @@ sounder(void *unused)
 	return NULL;
 }
 
+/*
+ * GPU (boot-arg gpu=1, kernel patch 1033): CoreAnimation's window server picks its renderer once, at start. Wait
+ * here, inside backboardd's constructors, for the RedwoodGPU service (whyred_gpu.c publishes it after stage 1),
+ * then load topaz's libtopaz-inject.dylib, whose constructor loads the OpenGL ES library behind EAGLContext
+ * (/topaz/lib/libtopaz-gl.dylib on Mesa). Without the service or the library: CoreAnimation's software renderer.
+ */
+extern int usleep(unsigned int us);
+
+static int
+has_word(const char *s, const char *w)
+{
+	for (; *s; s++) {
+		int i = 0;
+		while (w[i] && s[i] == w[i]) {
+			i++;
+		}
+		if (w[i] == 0 && (s[i] == ' ' || s[i] == 0)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+gl_load(void)
+{
+	char args[1024];
+	unsigned long n = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &n, 0, 0) != 0) {
+		return;
+	}
+	args[n < sizeof(args) ? n : sizeof(args) - 1] = 0;
+	if (!has_word(args, " gpu=1")) {
+		return;
+	}
+	io_object_t svc = 0;
+	for (int i = 0; i < 300 && svc == 0; i++) {
+		svc = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
+		if (svc == 0) {
+			usleep(100000);
+		}
+	}
+	if (svc == 0) {
+		say("gpu: no RedwoodGPU after 30 s, software renderer", "");
+		return;
+	}
+	IOObjectRelease(svc);
+	void *h = dlopen("/topaz/lib/libtopaz-inject.dylib", 2);
+	say("gpu: libtopaz-inject.dylib ", h ? "loaded" : "NOT loaded");
+}
+
 __attribute__((constructor)) static void
 whyred_ui_init(void)
 {
 	if (same_text(getprogname(), "backboardd")) {
 		long t;
+		gl_load();
 		pthread_create(&t, NULL, bk_hook_thread, NULL);
 		return;
 	}
