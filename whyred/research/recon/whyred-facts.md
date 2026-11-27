@@ -919,6 +919,33 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   SECVID_TRUST_CNTL 0x1 (secure until the zap shader), always-on counter running (211718 ticks in a 10 ms sleep).
   iOS boots normally with it.
 
+## GPU stage 1 complete: first job on the Adreno 509 (patch 1031, 2026-11-27)
+
+- 1031 adds steps 5-11 to whyred_gpu.c. CI 45916516909, image whyred/out/xnu-ios-1031g11.img (default args +
+  whyredgpu=11). Firmware on the iOS root in /usr/share/firmware/whyred/ (a512_zap.mdt/.b00-.b02, a530_pfp.fw,
+  a530_pm4.fw from the vendor image /firmware; not in git). GPU memory: 0xa0800000 + 4 MiB below the XNU base,
+  mapped uncached.
+- SMMU 0x5040000: sCR0 0x200626 (unmatched streams fault), ID0 0x48016603, ID1 0x20008005: 3 SMRs, 5 CBs, 4 KiB
+  pages x8 (banks at +0x8000). All SMRs invalid, S2CR 0x200ff (fault), CB0/CB1 empty after boot.
+  A read of CB2 stalled the bus and left a CPU core stuck (iOS kept running, but the display never woke after the
+  next lock): banks 2 and up belong to TrustZone. Read only CB0-1.
+- Identity bank: CB0 CBA2R 1, CBAR 0x1f000, SCTLR 0xe0 (M = 0), S2CR0 0 (translate to CB0), SMR0 0x80000000
+  (stream 0). The first try stalled somewhere in these writes; with a log line and 150 ms before each write all
+  twelve landed and read back. Cause of the first stall unknown.
+- Zap shader: the split .mdt keeps the hash segment right behind the headers (offset 0x94), not at its p_offset
+  0x1000. One LOAD segment, paddr 0x5000, 0x1334 bytes, relocatable. PAS 13 init_image / mem_setup 0xa0800000 /
+  auth_and_reset all return 0.
+- Microcode: a530_pfp.fw 17108 bytes (version word 0x5ff11a), a530_pm4.fw 19652 bytes (0x5ff066), loaded minus
+  the first word; CP_RB_CNTL 0x20c, ring 32 KiB.
+- RBBM_STATUS reads 0x1 until the RBBM/UCHE writes of a5xx_start, then 0xc0000101 / 0x800001c1 and never goes
+  idle by the Linux test, though the CP consumes every packet. Probably the perf counter or hang detect setup,
+  not real work (guess). The driver accepts a consumed ring.
+- CP_ME_INIT and CP_SET_SECURE_MODE 0 consumed; SECVID_TRUST_CNTL 0x1 -> 0 (out of secure mode). Job test: an IB
+  with CP_MEM_WRITE wrote 0xc0ffee09, CACHE_FLUSH_TS fence 1. 100 more fences in 1980 us (about 20 us each, GPU
+  at 19.2 MHz XO).
+- Next: GPU clock from the PLL (266 MHz, corner within the CX 384 vote), then stage 2 (RedwoodGPU service for
+  Mesa, a5xx GET_PARAM values, freedreno a5xx).
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
