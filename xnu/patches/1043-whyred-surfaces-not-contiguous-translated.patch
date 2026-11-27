@@ -1,0 +1,74 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c94fb8b..daf0d98 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -50,6 +50,7 @@
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++extern "C" bool redwood_gpu_identity(void);         /* WhyredAdreno.cpp: false once the GPU's page table is on */
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -112,6 +113,12 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++
++extern "C" uint64_t
++sweet_surface_wired_bytes(void)
++{
++	return sweet_surface_wired;
++}
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+@@ -1029,7 +1036,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			 * pages came next. (The descriptor keeps them: RedwoodGPU gives them to the GPU.)
+ 			 */
+ 			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
+-			if (gpu_low && take <= (16u << 20)) {
++			/*
++			 * whyred: with the page table on (whyredgpuvm=1) the GPU reads any pages. Contiguous runs cost a
++			 * scan of all RAM once memory filled (vm_page_find_contiguous, mostly in vain): unlocking took seconds.
++			 */
++			if (gpu_low && take <= (16u << 20) && redwood_gpu_identity()) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+ 				    0x0000000FFFFFC000ull);
+diff --git a/iokit/Kernel/arm/WhyredAdreno.cpp b/iokit/Kernel/arm/WhyredAdreno.cpp
+index 05a43b8..38d8a07 100644
+--- a/iokit/Kernel/arm/WhyredAdreno.cpp
++++ b/iokit/Kernel/arm/WhyredAdreno.cpp
+@@ -121,18 +121,26 @@ range_alloc(uint64_t size)
+ 	return 0;
+ }
+ 
+-/* (pool_lock held) every 30 s, when the use moved by 8 MiB or more: a leak shows as a line that only climbs */
++extern "C" uint64_t sweet_surface_wired_bytes(void);        /* SweetSurface.cpp */
++static uint64_t surf_told;
++
++/*
++ * (pool_lock held) every 30 s, when the pool's use moved by 8 MiB or the surfaces' by 32 MiB or more: a leak shows
++ * as a line that only climbs. Surfaces: IOSurface memory in kernel RAM (wired, up to 1536 MiB).
++ */
+ static void
+ pool_tell(void)
+ {
+-	uint64_t now = mach_absolute_time(), ns;
++	uint64_t now = mach_absolute_time(), ns, surf = sweet_surface_wired_bytes();
+ 	absolutetime_to_nanoseconds(now - pool_told_at, &ns);
+ 	uint64_t moved = pool_used > pool_told_used ? pool_used - pool_told_used : pool_told_used - pool_used;
+-	if (ns >= 30ull * NSEC_PER_SEC && moved >= (8ull << 20)) {
++	uint64_t smoved = surf > surf_told ? surf - surf_told : surf_told - surf;
++	if (ns >= 30ull * NSEC_PER_SEC && (moved >= (8ull << 20) || smoved >= (32ull << 20))) {
+ 		pool_told_at = now;
+ 		pool_told_used = pool_used;
+-		IOLog("WhyredAdreno: pool %llu MiB in use (peak %llu of %llu), %u free ranges\n", pool_used >> 20, pool_peak >> 20,
+-		    gpu_pool_size >> 20, pool_free_count);
++		surf_told = surf;
++		IOLog("WhyredAdreno: pool %llu MiB in use (peak %llu of %llu), %u free ranges; surfaces %llu MiB\n",
++		    pool_used >> 20, pool_peak >> 20, gpu_pool_size >> 20, pool_free_count, surf >> 20);
+ 	}
+ }
+ 
