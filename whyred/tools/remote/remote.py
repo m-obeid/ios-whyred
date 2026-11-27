@@ -8,6 +8,7 @@ The page has no password: bind it to the Tailscale address or localhost only.
 """
 import argparse
 import glob
+import io
 import http.server
 import json
 import os
@@ -90,6 +91,27 @@ def cam_thread():
         time.sleep(2)
 
 
+def shrink(jpg, q):
+    """Crop (c=x,y,w,h in camera pixels) and scale (s) a frame, re-encoded at quality q: less to send."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return jpg
+    try:
+        im = Image.open(io.BytesIO(jpg))
+        if "c" in q:
+            x, y, w, h = (int(float(v)) for v in q["c"].split(","))
+            im = im.crop((max(0, x), max(0, y), min(im.width, x + w), min(im.height, y + h)))
+        s = min(1.0, max(0.05, float(q.get("s", 1))))
+        if s < 1:
+            im = im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))), Image.BILINEAR)
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=max(20, min(int(q.get("q", 60)), 95)))
+        return out.getvalue()
+    except (ValueError, OSError):
+        return jpg
+
+
 def log_tail(n):
     files = sorted(glob.glob("/tmp/claude-1000/*/*/scratchpad/b*.log") + glob.glob(os.path.join(HERE, "*.log")),
                    key=os.path.getmtime)
@@ -125,7 +147,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, f.read(), "text/html; charset=utf-8")
         if u.path == "/snap.jpg":
             with frame_lock:
-                return self.send(200, frame["jpg"], "image/jpeg")
+                jpg = frame["jpg"]
+            if "c" in q or "s" in q:
+                jpg = shrink(jpg, q)
+            return self.send(200, jpg, "image/jpeg")
         if u.path == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=f")

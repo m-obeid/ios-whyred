@@ -124,20 +124,21 @@ function setCorners(c) {
 setCorners(store.corners);
 
 // -- camera view: MJPEG drawn into the canvas, rotated and optionally cropped to the phone
-let img = null; // the latest camera frame (ImageBitmap)
+const CAM_W = 1920, CAM_H = 1080;
+let img = null, imgRect = null; // the latest camera frame (ImageBitmap) and the source rect it shows
 const view = $('view'), ctx = view.getContext('2d');
 let crop = null; // source rect
 function sourceRect() {
   if (store.fit && store.corners) {
     const xs = store.corners.map(p => p[0]), ys = store.corners.map(p => p[1]);
     const m = 40, x0 = Math.max(0, Math.min(...xs) - m), y0 = Math.max(0, Math.min(...ys) - m);
-    return [x0, y0, Math.min(img.width, Math.max(...xs) + m) - x0, Math.min(img.height, Math.max(...ys) + m) - y0];
+    return [x0, y0, Math.min(CAM_W, Math.max(...xs) + m) - x0, Math.min(CAM_H, Math.max(...ys) + m) - y0];
   }
-  return [0, 0, img ? img.width : 1920, img ? img.height : 1080];
+  return [0, 0, CAM_W, CAM_H];
 }
 function draw() {
   if (img) {
-    crop = sourceRect();
+    crop = imgRect;
     const [sx, sy, sw, sh] = crop;
     const q = ((store.rot % 4) + 4) % 4;
     const cw = q % 2 ? sh : sw, ch = q % 2 ? sw : sh;
@@ -147,7 +148,7 @@ function draw() {
     ctx.save();
     ctx.translate(vw / 2, vh / 2);
     ctx.rotate(q * Math.PI / 2);
-    ctx.drawImage(img, sx, sy, sw, sh, -sw * scale / 2, -sh * scale / 2, sw * scale, sh * scale);
+    ctx.drawImage(img, 0, 0, img.width, img.height, -sw * scale / 2, -sh * scale / 2, sw * scale, sh * scale);
     ctx.restore();
     if (calPts) {
       ctx.fillStyle = '#4a9eff';
@@ -179,10 +180,16 @@ function srcToView(x, y) {
 async function pollFrames() {
   for (;;) {
     try {
-      const r = await fetch('/snap.jpg?' + Date.now(), { cache: 'no-store' });
+      // the server crops and scales: only the pixels the screen shows travel
+      const rect = sourceRect().map(Math.round);
+      const q = ((store.rot % 4) + 4) % 4, across = q % 2 ? rect[3] : rect[2];
+      const want = Math.max(240, (view.clientWidth || 800) * (window.devicePixelRatio || 1));
+      const sc = Math.min(1, want / across).toFixed(3);
+      const r = await fetch(`/snap.jpg?c=${rect.join(',')}&s=${sc}&q=60&t=${Date.now()}`, { cache: 'no-store' });
       const bmp = await createImageBitmap(await r.blob());
       if (img) img.close();
       img = bmp;
+      imgRect = rect;
     } catch (e) {
       status('camera frame failed, retrying');
       await new Promise(res => setTimeout(res, 2000));
