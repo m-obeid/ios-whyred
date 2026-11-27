@@ -1048,8 +1048,13 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   known). A CacheExtra entry in the MobileGestalt cache did not help. Fix: mkadt_whyred.py adds synthetic
   /chosen mac-address-wifi0 and mac-address-bluetooth0. xnu-ios-1040mac.img (1040 kernel, gpu=1, 60 Hz, new
   ADT): no wifid crash, joined Hotel_Galeria at 30 s.
-- Next: GEM buffers from the write-combined pool, mapped through the page table (no cache cleaning). Needs
-  RedwoodGPU release, reap, dropKept and keep to free pool memory. Then share A8, LA and RGBA surfaces too.
+- 1042 (CI 46021051020, commit 1e4d7c2, xnu-ios-1042vm.img = gpu=1 whyredgpuvm=1, 60 Hz, ADT with WiFi MAC):
+  RedwoodGPU takes buffers from the pool in translated mode too (gGPUPool, boot-arg gpu_pool=0 for the old
+  cached ones). Pool addresses sit below 4 GiB, mapped 1:1, so the existing address_free and unmap already
+  route them to the pool. Log: "translation works", "buffers from the GPU pool", 0 KB cleaned a submission.
+  GL work about 7.5 ms a frame, same as 1040 (1041vm: 17.8 ms). No GPU fault seen in the first minutes.
+- Next: share A8, LA and RGBA (non-BGRA) surfaces through the window: kernel check in surfaceBuffer
+  (bytesPerElement != 4), eagl surface_shared ("not BGRA"), gl_osmesa import format.
 
 ## Not yet known
 
