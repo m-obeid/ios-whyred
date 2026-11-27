@@ -954,6 +954,23 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Next: GPU clock from the PLL (266 MHz, corner within the CX 384 vote), then stage 2 (RedwoodGPU service for
   Mesa, a5xx GET_PARAM values, freedreno a5xx).
 
+## GPU stage 2a: RedwoodGPU service on the A509 (patch 1033, 2026-11-27)
+
+- iokit/Kernel/arm/WhyredAdreno.cpp replaces TopazAdreno.cpp/TopazAdrenoFw.cpp in iokit/conf/files.arm64 and gives
+  RedwoodGPU.cpp (unchanged) the same exports: 256 MiB pool at 0xa2000000 (64 MiB chunks mapped write-combined on
+  first use, peak use logged), identity addresses, A509 GET_PARAM values (GPU_ID 509, CHIP_ID 0x05000900, GMEM
+  0x44000 at 0x100000, MAX_FREQ 300 MHz, TIMESTAMP = RBBM always-on counter), submit/fence through whyred_gpu.c.
+- whyred/tools/mkadt_whyred.py: XNU RAM now 0xb2000000 + 0xcc000000 (was 0xa2000000 + 0xdc000000) for the pool.
+  WHYRED_GPU_POOL=0 builds the old layout. iOS boots normally with it.
+- Boot-arg whyredgpusvc=1 publishes RedwoodGPU after step 12 without topaz's gpu=1 display changes (gpu=1 also
+  publishes it). Either one makes whyredgpu default to 12. CI 45927260587, image whyred/out/xnu-ios-1033svc.img.
+- whyred/userland/tools/gputest.c (built by whyred/userland/build.sh, on the phone as /var/root/gputest): the msm
+  calls without Mesa. Result: parameters as above, GEM_NEW 64 KiB at 0xa2000000, mapped in the process, a
+  CP_MEM_WRITE command buffer through SUBMIT + WAIT_FENCE wrote 0x5a5a1234; 200 more submissions, 0 bad, about
+  58 us per submit + wait round trip.
+- Next (stage 2b): Mesa freedreno a5xx for iOS (userland/mesa/mk-mesa-mac.sh, needs a macOS CI job) and the
+  eagl layer (userland/gpu/eagl.c needs HackiOS mkeagl.py + eagl_slots.txt), then CoreAnimation with gpu=1.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
