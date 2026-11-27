@@ -984,6 +984,33 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
 - Next: CoreAnimation on the GPU (gpu=1, libtopaz-inject.dylib in backboardd, as topaz). Needs a person to look
   at the screen.
 
+## GPU stage 2c: CoreAnimation on the A509 (patches 1034-1038, 2026-11-27)
+
+- 1034 (CI 45929575858): gpu=1 starts the GPU at once. Its step 2 RPM vote failed: the modem driver had not
+  opened the RPM channel yet. 1035 (CI 45969705419) waits for it (whyred_rpm_ready, 250 ms in practice).
+- whyred_ui.dylib (on the phone) loads /topaz/lib/libtopaz-inject.dylib in backboardd when boot-args hold
+  gpu=1. CoreAnimation gets an OpenGL ES 3.1 context on FD509. First boot (1035): the UI showed, the user saw
+  it slower than the CPU and flickering.
+- Cause: CoreAnimation draws into two screen surfaces in turn. The default one (kernel surface 1, the panel
+  memory 0x9d400000) has 4320-byte rows, no a5xx render pitch (64-byte units), so eagl drew elsewhere and read
+  each frame back (128 ms). And present skipped surface 1 as already in place while the MDP scanned the other
+  one: every second frame stale (flicker).
+- 1036 (CI 45975327903): with gpu=1 GetLayerDefaultSurface hands out a GPU pool surface (4352-byte rows, 64
+  guard rows). Both surfaces are drawn in place and scanned directly. Frames 1-4 ms of GPU work. The user:
+  "waay better".
+- 1037 (CI 45976951241): kern.whyred_key = key | ms << 8 (0 power, 1 vol up, 2 vol down, 3 home). Verified:
+  an injected power press turned the display off.
+- 1037 reset the phone after some minutes (boots Linux). Last log line: RedwoodGPU shared surface 196 at
+  0x171714000. The GPU ran in 32-bit address mode (no ADDR_MODE_CNTL writes), the write went to 0x71714000.
+- 1038 (CI 45980191062, whyred/out/xnu-ios-1038gpu.img = default args + gpu=1): Linux a5xx_enable_64bit writes
+  (12 registers), then a GPU write test into a page above 4 GiB. RedwoodGPU shares surfaces only up to
+  whyred_gpu_reach(): 4 GiB, 64 GiB once the test passed (boot-arg whyredgpu64=0 skips the mode). First boot:
+  "64-bit addressing on", but 32 one-page allocations found no page above 4 GiB, so the GPU stays below 4 GiB.
+  Surfaces above it fall back to the CPU copy (slow frames, no crash). The test needs a better page source.
+- Remote use: whyred/tools/remote/remote.py --bind <tailscale IP> serves port 8765: webcam stream (laptop
+  /dev/video0, phone propped in front, landscape, top to the left), taps and swipes (kern.whyred_touch) on a
+  calibrated camera view or a touch pad, buttons (kern.whyred_key), kernel log tail.
+
 ## Not yet known
 
 - Whether ABL accepts an uncompressed Image in a v0 boot image or needs gzip.
