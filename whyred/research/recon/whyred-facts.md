@@ -1042,6 +1042,12 @@ stackshot; symbolicate 509 frames as 0x180000000 + offset with `ipsw dyld a2s`).
   come from memory the kernel cannot map back. Do not use gpu_cached=0.
 - Phone back on xnu-ios-1040gpu60.img afterwards (first fastboot boot after the hang reset into Linux within
   minutes with no log, the second one ran).
+- WiFi list empty from 1034 on: wifid aborted after every scan (uncaught NSException, setObject:forKey: nil
+  for PRIVATE_MAC_ADDRESS_VALUE, wifid +0x93178). The value is MGCopyAnswer("WifiAddressData"), nil because
+  the ADT had no /chosen mac-address-wifi0. 1033 joined before the scan path ran (cause of the change not
+  known). A CacheExtra entry in the MobileGestalt cache did not help. Fix: mkadt_whyred.py adds synthetic
+  /chosen mac-address-wifi0 and mac-address-bluetooth0. xnu-ios-1040mac.img (1040 kernel, gpu=1, 60 Hz, new
+  ADT): no wifid crash, joined Hotel_Galeria at 30 s.
 - Next: GEM buffers from the write-combined pool, mapped through the page table (no cache cleaning). Needs
   RedwoodGPU release, reap, dropKept and keep to free pool memory. Then share A8, LA and RGBA surfaces too.
 

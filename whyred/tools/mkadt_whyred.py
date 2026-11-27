@@ -77,6 +77,12 @@ def build():
         ext = json.load(open(ext_file))
         props.append(('root-extents', mkadt.u64(*[v for pair in ext for v in pair])))
     root.children.append(mkadt.node('sweet-emmc', props))
+    # MobileGestalt WifiAddressData and BluetoothAddressData come from these (iBoot sets them on iPhones).
+    # wifid aborts after each scan without one (nil PRIVATE_MAC_ADDRESS_VALUE). Synthetic, not the phone's.
+    for c in root.children:
+        if c.name == 'chosen':
+            c.props += [('mac-address-wifi0', 0, bytes([0x02, 0x57, 0x48, 0x59, 0x52, 0x01])),
+                        ('mac-address-bluetooth0', 0, bytes([0x02, 0x57, 0x48, 0x59, 0x52, 0x02]))]
     return root
 
 
