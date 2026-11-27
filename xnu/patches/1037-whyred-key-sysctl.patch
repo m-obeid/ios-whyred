@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/sweet_syna.c b/bsd/dev/sweet_syna.c
+index 57c69b5..a315205 100644
+--- a/bsd/dev/sweet_syna.c
++++ b/bsd/dev/sweet_syna.c
+@@ -24,6 +24,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);         /* SweetHID.cpp: 0 power, 1 volume up, 2 volume down, 3 home */
+ void sweet_syna_init(void);
+ 
+ /* GCC (gcc-sdm660.c) */
+@@ -445,6 +446,32 @@ whyred_touch_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_touch, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     whyred_touch_sysctl, "Q", "inject a one-finger touch: x1 | y1<<12 | x2<<24 | y2<<36 | ms<<48");
+ 
++/*
++ * whyred: synthetic button presses for remote use (whyred/tools/remote): sysctl kern.whyred_key = key | ms << 8.
++ * Keys as sweet_hid_key: 0 power, 1 volume up, 2 volume down, 3 home. Held ms (default 80), then let go.
++ */
++static int
++whyred_key_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error == 0 && req->newptr != USER_ADDR_NULL) {
++		int key = v & 0xff;
++		unsigned ms = ((unsigned)v >> 8) & 0xffff;
++		if (key > 3) {
++			return EINVAL;
++		}
++		printf("WHYRED KEY: injected key %d for %u ms\n", key, ms ? ms : 80);
++		sweet_hid_key(key, 1);
++		sleep_ms(ms ? ms : 80);
++		sweet_hid_key(key, 0);
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_key, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    whyred_key_sysctl, "I", "press a button: key | ms<<8 (0 power, 1 vol up, 2 vol down, 3 home)");
++
+ static void
+ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
